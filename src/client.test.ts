@@ -28,4 +28,21 @@ describe("HindsightClient bank urls", () => {
     await client.reflect("researcher", "q", { budget: "low" });
     expect(fake.requests[0]?.url).toBe("http://hindsight.test/v1/default/banks/researcher/reflect");
   });
+
+  it("refuses redirects on every request so a body cannot follow a 307/308 to plain http", async () => {
+    const fake = createFakeHindsight({
+      "POST /v1/default/banks/dev/memories/recall": () => ({ json: { results: [] } }),
+      "GET /health": () => ({ json: {} }),
+    });
+    const client = new HindsightClient({
+      resolveEndpoint: () => ({ apiUrl: "https://hindsight.test" }),
+      fetch: fake.fetch,
+    });
+    await client.recall("dev", "q", { budget: "low" });
+    await client.healthy();
+    expect(fake.fetch).toHaveBeenCalledTimes(2);
+    for (const [, init] of fake.fetch.mock.calls) {
+      expect(init?.redirect).toBe("error");
+    }
+  });
 });

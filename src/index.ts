@@ -125,12 +125,18 @@ export default definePluginEntry({
       }
     };
 
-    const service = createHindsightService({ config: currentConfig, logger: api.logger });
+    const service = createHindsightService({
+      config: currentConfig,
+      logger: api.logger,
+    });
     const flushDeduper = createFlushDeduper();
     const runStartBySession = new Map<string, string | null>();
 
     const capability: MemoryPluginCapability = {
-      providerRuntime: createHindsightProviderRuntime({ providerId: PLUGIN_ID, service }),
+      providerRuntime: createHindsightProviderRuntime({
+        providerId: PLUGIN_ID,
+        service,
+      }),
       providerFlushPlanResolver: createProviderFlushPlanResolver(currentConfig),
       recallToolNames: RECALL_TOOL_NAMES,
     };
@@ -175,7 +181,10 @@ export default definePluginEntry({
         !config.autoRecall ||
         config.memoryMode === "tools" ||
         isIncognitoSessionKey(sessionKey) ||
-        !sessionUsesMemory(config, { sessionKey, messageProvider: ctx.messageProvider })
+        !sessionUsesMemory(config, {
+          sessionKey,
+          messageProvider: ctx.messageProvider,
+        })
       ) {
         return undefined;
       }
@@ -206,7 +215,9 @@ export default definePluginEntry({
         }
         api.logger.info?.(`memory-hindsight: injecting ${results.length} memories`);
         // Before the user message, outside the system prompt, so the cached prefix stays stable.
-        return { prependContext: buildRecallContext(results, config.recallPromptPreamble) };
+        return {
+          prependContext: buildRecallContext(results, config.recallPromptPreamble),
+        };
       } catch (error) {
         api.logger.warn?.(`memory-hindsight: auto-recall skipped: ${formatErrorMessage(error)}`);
         return undefined;
@@ -228,7 +239,10 @@ export default definePluginEntry({
         !Array.isArray(event.messages) ||
         event.messages.length === 0 ||
         isIncognitoSessionKey(sessionKey) ||
-        !sessionUsesMemory(config, { sessionKey, messageProvider: ctx.messageProvider })
+        !sessionUsesMemory(config, {
+          sessionKey,
+          messageProvider: ctx.messageProvider,
+        })
       ) {
         return;
       }
@@ -309,9 +323,11 @@ export default definePluginEntry({
           api.logger.warn(
             "memory-hindsight: hindsightApiToken not resolved; requests go unauthenticated",
           );
-        } else if (config.apiToken && isPlainHttpRemote(config.apiUrl)) {
+        }
+        // Config parsing already refuses plain remote http without the opt-in; warn only when opted in.
+        if (config.allowInsecureHttp && isPlainHttpRemote(config.apiUrl)) {
           api.logger.warn(
-            "memory-hindsight: hindsightApiUrl is plain http to a non-loopback host; the bearer token is sent unencrypted",
+            "memory-hindsight: allowInsecureHttp is set and hindsightApiUrl is plain http to a non-loopback host; the bearer token (if any) and conversation text are sent unencrypted",
           );
         }
         api.logger.info(`memory-hindsight: initialized (mode: ${currentConfig().memoryMode})`);

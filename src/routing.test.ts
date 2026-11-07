@@ -11,7 +11,11 @@ import {
 describe("routeAudience", () => {
   it("maps owner-private to the per-agent bank used by the third-party plugin", () => {
     const audience: MemoryAudience = { kind: "owner-private", agentId: "dev" };
-    expect(routeAudience("dev", audience)).toEqual({ ok: true, bankId: "dev", audience });
+    expect(routeAudience("dev", audience)).toEqual({
+      ok: true,
+      bankId: "dev",
+      audience,
+    });
   });
 
   it("maps a conversation audience to a separate bank keyed by its root session", () => {
@@ -29,7 +33,10 @@ describe("routeAudience", () => {
     const reset = routeAudience("main", { ...audience, sessionId: "s2" });
     expect(reset.ok && reset.bankId).toBe(bankId);
     // Another conversation gets another bank.
-    const other = routeAudience("main", { ...audience, sessionKey: "agent:main:x" });
+    const other = routeAudience("main", {
+      ...audience,
+      sessionKey: "agent:main:x",
+    });
     expect(other.ok && other.bankId).not.toBe(bankId);
   });
 
@@ -49,6 +56,7 @@ describe("sessionUsesMemory", () => {
   it("skips excluded providers, operational and temp sessions", () => {
     const cfg = hindsightConfigSchema.parse({
       hindsightApiUrl: "http://h",
+      allowInsecureHttp: true,
       excludeProviders: ["heartbeat"],
     });
     expect(sessionUsesMemory(cfg, { messageProvider: "heartbeat" })).toBe(false);
@@ -58,6 +66,7 @@ describe("sessionUsesMemory", () => {
     expect(sessionUsesMemory(cfg, { sessionKey: "agent:dev:main" })).toBe(true);
     const ops = hindsightConfigSchema.parse({
       hindsightApiUrl: "http://h",
+      allowInsecureHttp: true,
       skipOperationalSessions: false,
     });
     expect(sessionUsesMemory(ops, { sessionKey: "agent:dev:subagent:abc" })).toBe(true);
@@ -72,7 +81,10 @@ describe("agentBankMap", () => {
     expect(ownerBankId("WB-DEV", map)).toBe("wb");
     expect(ownerBankId("dev", map)).toBe("dev");
     const owner = { kind: "owner-private" as const, agentId: "troubleshooter" };
-    expect(routeAudience("troubleshooter", owner, map)).toMatchObject({ ok: true, bankId: "main" });
+    expect(routeAudience("troubleshooter", owner, map)).toMatchObject({
+      ok: true,
+      bankId: "main",
+    });
     expect(conversationBankId("wb-dev", "agent:wb-dev:telegram:group:-1", map)).toMatch(
       /^wb::conv::[0-9a-f]{16}$/,
     );

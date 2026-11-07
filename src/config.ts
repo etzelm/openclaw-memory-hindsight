@@ -23,6 +23,8 @@ export type HindsightConfig = {
   skipOperationalSessions: boolean;
   /** Agent id -> owner bank id, so several agents can share one owner-private bank. */
   agentBankMap: Readonly<Record<string, string>>;
+  /** Opt-in for plain http to a non-loopback host (token and conversation text unencrypted). */
+  allowInsecureHttp: boolean;
 };
 
 export const DEFAULT_RECALL_PROMPT_PREAMBLE =
@@ -56,6 +58,7 @@ const CONFIG_KEYS = [
   "excludeProviders",
   "skipOperationalSessions",
   "agentBankMap",
+  "allowInsecureHttp",
 ] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -207,8 +210,15 @@ export const hindsightConfigSchema = {
         : readBool(value, "preferObservations", false);
     const retainMission = readString(value, "retainMission");
     const apiToken = readApiToken(value);
+    const apiUrl = normalizeApiUrl(readString(value, "hindsightApiUrl"));
+    const allowInsecureHttp = readBool(value, "allowInsecureHttp", false);
+    if (isPlainHttpRemote(apiUrl) && !allowInsecureHttp) {
+      throw new Error(
+        "hindsightApiUrl is plain http to a non-loopback host, so the bearer token and conversation text would travel unencrypted; use https or a loopback tunnel, or set allowInsecureHttp: true to accept the risk",
+      );
+    }
     return {
-      apiUrl: normalizeApiUrl(readString(value, "hindsightApiUrl")),
+      apiUrl,
       ...(apiToken ? { apiToken } : {}),
       memoryMode: readEnum(value, "memoryMode", MEMORY_MODES, "hybrid"),
       autoRecall: readBool(value, "autoRecall", true),
@@ -223,6 +233,7 @@ export const hindsightConfigSchema = {
       excludeProviders: readStringList(value, "excludeProviders") ?? [],
       skipOperationalSessions: readBool(value, "skipOperationalSessions", true),
       agentBankMap: readBankMap(value),
+      allowInsecureHttp,
     };
   },
 };

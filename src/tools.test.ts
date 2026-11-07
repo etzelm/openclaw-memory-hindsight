@@ -36,7 +36,9 @@ function harness(overrides: Record<string, unknown> = {}) {
     "POST /v1/default/banks/dev/memories/recall": () => ({
       json: { results: [{ id: "m1", text: "Mitchell prefers TypeScript" }] },
     }),
-    "POST /v1/default/banks/dev/reflect": () => ({ json: { text: "He prefers TypeScript." } }),
+    "POST /v1/default/banks/dev/reflect": () => ({
+      json: { text: "He prefers TypeScript." },
+    }),
   });
   const { service } = createTestService(fake.fetch, {
     retainMission: "Keep durable facts.",
@@ -49,14 +51,20 @@ describe("hindsight tools", () => {
   it("retains to the audience bank after applying the bank mission once", async () => {
     const { fake, service, deduper } = harness();
     const tool = createRetainTool(service, deduper, ownerCtx())!;
-    await tool.execute("c1", { content: "Use pnpm", tags: ["tooling"], occurred_at: "2026-11-01" });
+    await tool.execute("c1", {
+      content: "Use pnpm",
+      tags: ["tooling"],
+      occurred_at: "2026-11-01",
+    });
     await tool.execute("c2", { content: "Use vitest" });
     expect(fake.requests.map((r) => `${r.method} ${new URL(r.url).pathname}`)).toEqual([
       "PUT /v1/default/banks/dev",
       "POST /v1/default/banks/dev/memories",
       "POST /v1/default/banks/dev/memories",
     ]);
-    expect(fake.requests[0]?.body).toEqual({ retain_mission: "Keep durable facts." });
+    expect(fake.requests[0]?.body).toEqual({
+      retain_mission: "Keep durable facts.",
+    });
     expect(fake.requests[1]?.body).toMatchObject({
       async: true,
       items: [
@@ -64,7 +72,11 @@ describe("hindsight tools", () => {
           content: "Use pnpm",
           tags: ["tooling"],
           timestamp: "2026-11-01",
-          metadata: { source: "openclaw", session_key: "agent:dev:main", agent_id: "dev" },
+          metadata: {
+            source: "openclaw",
+            session_key: "agent:dev:main",
+            agent_id: "dev",
+          },
         },
       ],
     });
@@ -77,7 +89,9 @@ describe("hindsight tools", () => {
     expect(
       createRecallTool(
         service,
-        ownerCtx({ memoryAudience: { kind: "owner-private", agentId: "main" } }),
+        ownerCtx({
+          memoryAudience: { kind: "owner-private", agentId: "main" },
+        }),
       ),
     ).toBeNull();
     const context = harness({ memoryMode: "context" });
@@ -85,8 +99,13 @@ describe("hindsight tools", () => {
   });
 
   it("recalls and reflects on the audience bank", async () => {
-    const { fake, service } = harness({ recallTypes: ["observation"], recallBudget: "high" });
-    const recall = await createRecallTool(service, ownerCtx())!.execute("c", { query: "language" });
+    const { fake, service } = harness({
+      recallTypes: ["observation"],
+      recallBudget: "high",
+    });
+    const recall = await createRecallTool(service, ownerCtx())!.execute("c", {
+      query: "language",
+    });
     expect(JSON.stringify(recall)).toContain("1. Mitchell prefers TypeScript");
     expect(fake.requests[0]?.body).toMatchObject({
       query: "language",
@@ -102,7 +121,9 @@ describe("hindsight tools", () => {
   it("treats an unwritten bank as empty", async () => {
     const fake = createFakeHindsight({});
     const { service } = createTestService(fake.fetch);
-    const result = await createRecallTool(service, ownerCtx())!.execute("c", { query: "x y z" });
+    const result = await createRecallTool(service, ownerCtx())!.execute("c", {
+      query: "x y z",
+    });
     expect(JSON.stringify(result)).toContain("No relevant memories found.");
   });
 
@@ -111,7 +132,9 @@ describe("hindsight tools", () => {
     const ctx = ownerCtx({ memoryFlush: { flushId: "flush-1" } });
     const tool = createRetainTool(service, deduper, ctx)!;
     await tool.execute("c1", { content: "Decision: ship native plugin" });
-    const second = await tool.execute("c2", { content: "Decision: ship native plugin" });
+    const second = await tool.execute("c2", {
+      content: "Decision: ship native plugin",
+    });
     expect(JSON.stringify(second)).toContain("already queued");
     const retains = fake.requests.filter((r) => r.url.endsWith("/memories"));
     expect(retains).toHaveLength(1);
@@ -163,7 +186,10 @@ describe("memory capability fields", () => {
   });
 
   it("returns a tools-arm flush plan unless mode is context", () => {
-    let config = hindsightConfigSchema.parse({ hindsightApiUrl: "http://h" });
+    let config = hindsightConfigSchema.parse({
+      hindsightApiUrl: "http://h",
+      allowInsecureHttp: true,
+    });
     const resolve = createProviderFlushPlanResolver(() => config);
     const plan = resolve({});
     expect(plan).toMatchObject({
@@ -171,7 +197,11 @@ describe("memory capability fields", () => {
       lookupToolNames: ["hindsight_recall"],
     });
     expect(plan && "relativePath" in plan).toBe(false);
-    config = hindsightConfigSchema.parse({ hindsightApiUrl: "http://h", memoryMode: "context" });
+    config = hindsightConfigSchema.parse({
+      hindsightApiUrl: "http://h",
+      allowInsecureHttp: true,
+      memoryMode: "context",
+    });
     expect(resolve({})).toBeNull();
   });
 
@@ -181,7 +211,9 @@ describe("memory capability fields", () => {
     expect(build({ availableTools: new Set() })).toEqual([]);
     expect(build({ availableTools: new Set(["hindsight_retain"]) })).toHaveLength(2);
     expect(
-      build({ availableTools: new Set(["hindsight_retain", "hindsight_recall"]) }),
+      build({
+        availableTools: new Set(["hindsight_retain", "hindsight_recall"]),
+      }),
     ).toHaveLength(3);
   });
 

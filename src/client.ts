@@ -102,6 +102,7 @@ export class HindsightClient {
     const response = await this.fetchImpl(url, {
       method: init.method,
       headers: this.headers(hasBody),
+      redirect: "error",
       ...(hasBody ? { body: JSON.stringify(init.body) } : {}),
       ...(init.signal ? { signal: init.signal } : {}),
     });
@@ -211,6 +212,7 @@ export class HindsightClient {
       const response = await this.fetchImpl(`${apiUrl}/health`, {
         method: "GET",
         headers: this.headers(false),
+        redirect: "error",
         signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
       });
       return response.ok;

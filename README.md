@@ -116,6 +116,7 @@ tool conflict.
 | `excludeProviders`          | `[]`              | Message providers that never recall or retain (for example `heartbeat`)                               |
 | `skipOperationalSessions`   | `true`            | Skip cron, heartbeat and subagent sessions                                                            |
 | `agentBankMap`              | `{}`              | Agent id to bank id, so several agents share one owner bank                                           |
+| `allowInsecureHttp`         | `false`           | Allow plain http to a non-loopback `hindsightApiUrl` (token and conversation text unencrypted)        |
 
 Fixed values (not configurable): recall max tokens 1024, query cap 800 characters, recall
 timeout 10 s, retain and reflect timeout 30 s, memory get timeout 10 s (each combined with the
@@ -157,6 +158,15 @@ as of the vendor plugin 1.2.0:
   per flush id with stable document ids.
 
 The vendor plugin has features this one does not port; see [Limitations](#limitations).
+
+## Security
+
+Every request carries the bearer token (if set) and, for recall and retain, conversation text. The
+plugin refuses a plain `http://` `hindsightApiUrl` to any host other than `localhost`, `127.0.0.0/8`
+or `::1`, and config resolution fails with an error that names `allowInsecureHttp`. Prefer `https://`
+or a loopback tunnel. To accept the risk on a trusted network, set `allowInsecureHttp: true`; the
+plugin then warns at service start that the token and conversation text travel unencrypted.
+Redirects are refused, so an https endpoint cannot forward a request body to plain http.
 
 ## Compatibility
 

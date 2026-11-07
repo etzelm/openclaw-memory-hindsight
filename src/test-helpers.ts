@@ -4,7 +4,12 @@ import { createHindsightService } from "./service.js";
 
 type LogFn = (message: string) => void;
 
-export type RecordedRequest = { method: string; url: string; body: unknown; auth?: string };
+export type RecordedRequest = {
+  method: string;
+  url: string;
+  body: unknown;
+  auth?: string;
+};
 
 /** A fake Hindsight API: records requests and answers from a route table. */
 export function createFakeHindsight(
@@ -55,12 +60,17 @@ export function createTestService(
 ) {
   const config: HindsightConfig = hindsightConfigSchema.parse({
     hindsightApiUrl: "http://hindsight.test",
+    allowInsecureHttp: true,
     hindsightApiToken: "test-token",
     ...overrides,
   });
   const service = createHindsightService({
     config: () => config,
-    logger: { warn: vi.fn<LogFn>(), info: vi.fn<LogFn>(), debug: vi.fn<LogFn>() },
+    logger: {
+      warn: vi.fn<LogFn>(),
+      info: vi.fn<LogFn>(),
+      debug: vi.fn<LogFn>(),
+    },
     fetch,
   });
   return { service };

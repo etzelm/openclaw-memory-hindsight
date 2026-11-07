@@ -63,6 +63,7 @@ function setup(extra: Record<string, unknown> = {}) {
   vi.stubGlobal("fetch", fake.fetch);
   const pluginConfig = {
     hindsightApiUrl: "http://hindsight.test",
+    allowInsecureHttp: true,
     hindsightApiToken: "test-token",
     retainMission: "Keep durable facts.",
     ...extra,
@@ -105,7 +106,7 @@ describe("memory-hindsight registration", () => {
     const registerMemoryCapability = vi.fn<AnyFn>();
     const registerLearnContribution = vi.fn<AnyFn>();
     const api = createFakePluginApi({
-      pluginConfig: { hindsightApiUrl: "http://hindsight.test" },
+      pluginConfig: { hindsightApiUrl: "http://hindsight.test", allowInsecureHttp: true },
       registerMemoryCapability,
     });
     Object.assign(api, { registerLearnContribution });
@@ -127,6 +128,23 @@ describe("memory-hindsight registration", () => {
     expect(registerMemoryCapability).not.toHaveBeenCalled();
   });
 
+  it("stays inert and sends no request for remote plain http without allowInsecureHttp", () => {
+    const fetchSpy = vi.fn<AnyFn>();
+    vi.stubGlobal("fetch", fetchSpy);
+    const registerMemoryCapability = vi.fn<AnyFn>();
+    const on = vi.fn<AnyFn>();
+    memoryPlugin.register(
+      createFakePluginApi({
+        pluginConfig: { hindsightApiUrl: "http://studio:8888", hindsightApiToken: "t" },
+        registerMemoryCapability,
+        on,
+      }),
+    );
+    expect(registerMemoryCapability).not.toHaveBeenCalled();
+    expect(on).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("uses the plugin id hindsight-native, distinct from the vendor plugin", () => {
     expect(PLUGIN_ID).toBe("hindsight-native");
     expect(memoryPlugin.id).toBe("hindsight-native");
@@ -135,7 +153,7 @@ describe("memory-hindsight registration", () => {
 
 describe("live config", () => {
   it("reads plugins.entries[id].config from a runtime snapshot", () => {
-    const entry = { hindsightApiUrl: "http://x.test" };
+    const entry = { hindsightApiUrl: "http://x.test", allowInsecureHttp: true };
     expect(
       readPluginConfigEntry(
         { plugins: { entries: { [PLUGIN_ID]: { config: entry } } } },
@@ -153,7 +171,11 @@ describe("live config", () => {
       }),
     });
     vi.stubGlobal("fetch", fake.fetch);
-    const pluginConfig = { hindsightApiUrl: "http://hindsight.test", hindsightApiToken: "t" };
+    const pluginConfig = {
+      hindsightApiUrl: "http://hindsight.test",
+      allowInsecureHttp: true,
+      hindsightApiToken: "t",
+    };
     const config = { plugins: { entries: { [PLUGIN_ID]: { config: { ...pluginConfig } } } } };
     const on = vi.fn<AnyFn>();
     memoryPlugin.register(createFakePluginApi({ pluginConfig, config, on }));
@@ -344,7 +366,7 @@ describe("auto-retain timeout", () => {
     try {
       const on = vi.fn<AnyFn>();
       const api = createFakePluginApi({
-        pluginConfig: { hindsightApiUrl: "http://hindsight.test" },
+        pluginConfig: { hindsightApiUrl: "http://hindsight.test", allowInsecureHttp: true },
         on,
       });
       memoryPlugin.register(api);
@@ -376,7 +398,7 @@ function startWarnings(pluginConfig: Record<string, unknown>) {
 describe("service start warnings", () => {
   it("warns once when the token is an unresolved SecretRef", () => {
     const warnings = startWarnings({
-      hindsightApiUrl: "http://hindsight.test",
+      hindsightApiUrl: "https://hindsight.test",
       hindsightApiToken: { source: "file", provider: "p", id: "x" },
     });
     expect(warnings).toEqual([
@@ -384,21 +406,31 @@ describe("service start warnings", () => {
     ]);
   });
 
-  it("warns once for a bearer token over plain http to a remote host", () => {
+  it("warns once that token and conversation text are unencrypted with the opt-in", () => {
     const warnings = startWarnings({
       hindsightApiUrl: "http://studio:8888",
+      allowInsecureHttp: true,
       hindsightApiToken: "secret-token",
     });
     expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain("plain http");
+    expect(warnings[0]).toContain("bearer token");
+    expect(warnings[0]).toContain("conversation text");
     expect(warnings[0]).not.toContain("secret-token");
   });
 
-  it("stays quiet for https, loopback or no token", () => {
+  it("warns with the opt-in even when no token is set", () => {
+    const warnings = startWarnings({
+      hindsightApiUrl: "http://studio:8888",
+      allowInsecureHttp: true,
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("conversation text");
+  });
+
+  it("stays quiet for https and loopback", () => {
     expect(startWarnings({ hindsightApiUrl: "https://h", hindsightApiToken: "t" })).toEqual([]);
     expect(
       startWarnings({ hindsightApiUrl: "http://127.0.0.1:1", hindsightApiToken: "t" }),
     ).toEqual([]);
-    expect(startWarnings({ hindsightApiUrl: "http://studio:8888" })).toEqual([]);
   });
 });

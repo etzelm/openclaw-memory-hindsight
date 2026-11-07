@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.2 (2026-11-06)
+
+### Security
+
+- Refuse plain http to a non-loopback `hindsightApiUrl` unless the new `allowInsecureHttp` option
+  is `true` (CWE-319, cleartext transmission). Before, 0.1.1 sent the bearer token and
+  conversation text unencrypted and only warned when a token was set. Config resolution now
+  throws an error naming `allowInsecureHttp`; loopback http and https are unchanged.
+- With the opt-in set, the service start warning says both the bearer token (if any) and
+  conversation text go unencrypted, even when no token is configured.
+- Every request to Hindsight is sent with `redirect: "error"`, so an https endpoint cannot answer
+  307/308 and move the body (conversation text) to plain http.
+- Upgrade note: a config that used a remote `http://` URL must switch to https, a loopback
+  tunnel, or set `allowInsecureHttp: true`.
+
 ## 0.1.1 (2026-11-06)
 
 First version published to npm and ClawHub (0.1.0 was never published). Pre-publish hardening

@@ -45,6 +45,11 @@
       "help": "Agent id to owner bank id, so several agents share one private bank (for example wb-dev and wb-dev2 to wb)",
       "advanced": true
     },
+    "allowInsecureHttp": {
+      "label": "Allow Insecure HTTP",
+      "help": "Permit plain http to a non-loopback host. Token and conversation text are sent unencrypted; prefer https or a loopback tunnel",
+      "advanced": true
+    },
     "retainMission": {
       "label": "Retain Mission",
       "help": "Applied to each bank before its first write: what Hindsight should extract",
@@ -65,6 +70,11 @@
       "memoryMode": {
         "type": "string",
         "enum": ["hybrid", "context", "tools"]
+      },
+      "allowInsecureHttp": {
+        "type": "boolean",
+        "default": false,
+        "description": "Allow plain http to a non-loopback hindsightApiUrl; the bearer token and conversation text then travel unencrypted"
       },
       "autoRecall": {
         "type": "boolean"
