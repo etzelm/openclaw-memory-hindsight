@@ -1,0 +1,33 @@
+# Package CI: install, typecheck + build (tsc -> dist/), vitest, oxlint, oxfmt check, pack listing.
+
+stages:
+  - check
+
+variables:
+  GIT_DEPTH: "1"
+  npm_config_cache: "$CI_PROJECT_DIR/.npm"
+
+default:
+  image: node:24-alpine
+  tags:
+    - claw
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+
+check:
+  stage: check
+  script:
+    - node --version && npm --version
+    - npm ci --no-audit --no-fund
+    - npm run typecheck
+    - npm run build
+    - npm test
+    - npm run lint
+    - npm run format:check
+    # The published file list must never carry tests, helpers or local state.
+    - npm pack --dry-run --json --ignore-scripts > pack.json
+    - node -e 'const f=require("./pack.json")[0].files.map(x=>x.path);console.log(f.join("\n"));const bad=f.filter(p=>/\.test\.|test-helpers|^src\/|\.env|secret|token/i.test(p));if(bad.length){console.error("forbidden in pack:",bad);process.exit(1)}'

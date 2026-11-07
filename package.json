@@ -1,0 +1,83 @@
+{
+  "name": "@etzelm/openclaw-memory-hindsight",
+  "version": "0.1.1",
+  "description": "Native Hindsight memory engine for OpenClaw: memory slot provider runtime, auto-recall, auto-retain, pre-compaction flush and hindsight_* agent tools.",
+  "keywords": [
+    "hindsight",
+    "memory",
+    "openclaw",
+    "openclaw-plugin"
+  ],
+  "homepage": "https://github.com/etzelm/openclaw-memory-hindsight#readme",
+  "bugs": {
+    "url": "https://github.com/etzelm/openclaw-memory-hindsight/issues"
+  },
+  "license": "MIT",
+  "author": "Mitchell Etzel",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/etzelm/openclaw-memory-hindsight.git"
+  },
+  "files": [
+    "dist/**/*.js",
+    "!dist/**/*.test.js",
+    "!dist/test-helpers.js",
+    "openclaw.plugin.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "lint": "oxlint src",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "typebox": "1.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "openclaw": "2026.10.10",
+    "oxfmt": "0.76.0",
+    "oxlint": "1.91.0",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.10.1"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "install": {
+      "npmSpec": "@etzelm/openclaw-memory-hindsight",
+      "clawhubSpec": "clawhub:@etzelm/openclaw-memory-hindsight",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.10.1"
+    },
+    "compat": {
+      "pluginApi": ">=2026.10.1"
+    },
+    "build": {
+      "openclawVersion": "2026.10.10"
+    }
+  }
+}

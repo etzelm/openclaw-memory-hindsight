@@ -1,0 +1,116 @@
+{
+  "id": "hindsight-native",
+  "categories": ["memory"],
+  "name": "Memory Hindsight",
+  "description": "Hindsight-backed long-term memory: auto-recall, auto-retain, hindsight_* agent tools and the native memory provider runtime.",
+  "activation": {
+    "onStartup": false
+  },
+  "kind": "memory",
+  "configContracts": {
+    "secretInputs": {
+      "paths": [
+        {
+          "path": "hindsightApiToken",
+          "expected": "string"
+        }
+      ]
+    }
+  },
+  "contracts": {
+    "tools": ["hindsight_recall", "hindsight_reflect", "hindsight_retain"]
+  },
+  "toolMetadata": {
+    "hindsight_retain": {
+      "sideEffecting": true
+    }
+  },
+  "uiHints": {
+    "hindsightApiUrl": {
+      "label": "Hindsight API URL",
+      "placeholder": "http://localhost:8888",
+      "help": "Base URL of the Hindsight API server"
+    },
+    "hindsightApiToken": {
+      "label": "Hindsight API Token",
+      "sensitive": true,
+      "help": "Bearer token for the Hindsight API; configure it as a SecretRef"
+    },
+    "memoryMode": {
+      "label": "Memory Mode",
+      "help": "hybrid: auto-recall plus tools; context: auto-recall only; tools: tools only"
+    },
+    "agentBankMap": {
+      "label": "Agent Bank Map",
+      "help": "Agent id to owner bank id, so several agents share one private bank (for example wb-dev and wb-dev2 to wb)",
+      "advanced": true
+    },
+    "retainMission": {
+      "label": "Retain Mission",
+      "help": "Applied to each bank before its first write: what Hindsight should extract",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["hindsightApiUrl"],
+    "properties": {
+      "hindsightApiUrl": {
+        "type": "string"
+      },
+      "hindsightApiToken": {
+        "type": ["string", "object"]
+      },
+      "memoryMode": {
+        "type": "string",
+        "enum": ["hybrid", "context", "tools"]
+      },
+      "autoRecall": {
+        "type": "boolean"
+      },
+      "autoRetain": {
+        "type": "boolean"
+      },
+      "recallBudget": {
+        "type": "string",
+        "enum": ["low", "mid", "high"]
+      },
+      "recallTypes": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": ["world", "experience", "observation"]
+        }
+      },
+      "preferObservations": {
+        "type": "boolean"
+      },
+      "recallPromptPreamble": {
+        "type": "string"
+      },
+      "retainMission": {
+        "type": "string"
+      },
+      "retainContext": {
+        "type": "string"
+      },
+      "excludeProviders": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "skipOperationalSessions": {
+        "type": "boolean"
+      },
+      "agentBankMap": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
