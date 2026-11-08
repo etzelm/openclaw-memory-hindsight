@@ -1,5 +1,6 @@
 # Public CI: the same gates as .gitlab-ci.yml (install, typecheck, build,
-# test, lint, format check, pack guard). Runs on pull requests and on main.
+# test with coverage floor, lint, format check, pack guard). Runs on pull
+# requests and on main.
 
 name: CI
 
@@ -33,7 +34,7 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
       - run: npm run build
-      - run: npm test
+      - run: npm run test:coverage
       - run: npm run lint
       - run: npm run format:check
 

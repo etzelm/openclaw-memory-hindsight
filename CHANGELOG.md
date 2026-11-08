@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.3.0 (2026-11-08)
+
+### Upgrade notes
+
+- No config change is needed. The new `knowledgeReadTools` key is off by default, so the
+  registered tools are the same as in 0.2.0 unless you turn it on.
+- The retain queue file format is unchanged. See Downgrade notes before going back to 0.2.0.
+- Recalled memories that contain text shaped like the `<hindsight_memories>` wrapper or
+  OpenClaw's internal-context delimiters are now escaped before they reach the model.
+
+### Security
+
+- Recall wrapper: `<hindsight_memories>` and `</hindsight_memories>` tags inside recalled text
+  are neutralized in more forms than the exact literal: any case, whitespace inside the tag,
+  attributes, self-closing, a missing `>`, `-` for `_`, invisible characters, accents, common
+  Cyrillic/Greek lookalike letters, fullwidth letters and `<` lookalikes (everything Unicode
+  confusables.txt maps to `<`, plus angle brackets).
+- OpenClaw prompt delimiters in recalled text are escaped: `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>`
+  and `<<<END_OPENCLAW_INTERNAL_CONTEXT>>>` (variants in case, spacing or invisible characters
+  too), `OpenClaw runtime context:`, `End OpenClaw runtime context.`,
+  `OpenClaw runtime context (internal):`, the runtime-context notice line and the legacy
+  carrier prefaces that precede it. Prose that mentions OpenClaw runtime context is unchanged.
+
+### Added
+
+- `scripts/compat-matrix.sh`: host keyword `beta` (npm dist-tag `beta`), comma-separated
+  `--hosts` and `--runtimes`, and matrix rows in the requested host order.
+- `knowledgeReadTools` (default off): opt-in read-only knowledge-base tools
+  `hindsight_get_knowledge_base_tree`, `hindsight_search_knowledge_base` and
+  `hindsight_get_knowledge_page`, with the vendor plugin's names. They read the same
+  audience-routed bank as `hindsight_recall`; a missing bank reads as empty. Off, the
+  registered tool set is unchanged; the manifest's static `contracts.tools` still lists the
+  three names. Output is capped (page 32000 characters, tree 500 entries, search 50 hits)
+  and a knowledge-base response body over 1 MiB fails.
+
+### Changed
+
+- CI enforces a vitest coverage floor (`npm run test:coverage`, `@vitest/coverage-v8`) at
+  lines 94%, branches 86%, functions 95%, statements 93% (develop's measured coverage minus a
+  margin). GitLab shows the percentage on MRs and keeps the report as an artifact. Both pack
+  checks also reject `coverage/` (the `files` allowlist already kept it out of the pack).
+- `scripts/launchd/hs-compat-nightly.plist.example`: `LimitLoadToSessionType` Aqua and
+  Background, so it also loads in the `user/<uid>` domain; the docs cover installing it for an
+  account without a GUI session.
+
+### Fixes
+
+- `scripts/live-proof.sh`: X2 now searches every Claude Code project dir that appeared during
+  the run, and every file under the projects dir modified during it, for the code word, not
+  only names with `hs-live-proof`. Dirs it did not predict are counted and never deleted;
+  symlinks there are not followed.
+- `scripts/compat-matrix.sh`: an empty `--hosts` or `--runtimes` list is refused (exit 2).
+- `scripts/compat-nightly.sh`: one run at a time per `WORK_ROOT`; a lock is stale when its pid
+  does not run the same script path or it is older than 12 h.
+- Config: `hindsightApiUrl` with a bare trailing `?` or `#` is rejected like a non-empty query
+  string or fragment.
+- Retain queue: a retain is no longer lost when the file cannot be rewritten but can still be
+  appended to. The new copy is appended instead (load keeps the newest copy per document), and the
+  32 MiB bound still applies to appends, so the file cannot grow without bound. A failed replay
+  save is retried by the next one.
+- Retain queue: after a crash between replay's batched writes, load keeps only the newest copy
+  per bank and document id, and replay always sends `update_mode: replace` with the item's
+  document id.
+- Auto-retain no longer loses a turn when the host continues a run after a transient model
+  retry. The second `agent_end` for the same run id now re-sends the whole run from its first
+  start instead of only the continuation, so the run's document is replaced with complete
+  content. The run start is kept per session and run id; a new run id, `session_end` or a stop
+  drops it. Host maintenance turns no longer touch it.
+
+### Downgrade notes
+
+- The queue file format is unchanged. 0.2.0 keeps duplicate copies and replays them oldest first
+  (same document id, replace), so a re-retain of that document before replay finishes can leave
+  older text. A build that ignores tombstone lines (unreleased queue builds before 0.2.0) may
+  replay an out-of-date copy over a newer one that was sent live. Let the queue drain, or delete
+  `retain-queue.jsonl`, before downgrading.
+
 ## 0.2.0 (2026-11-07)
 
 ### Upgrade notes

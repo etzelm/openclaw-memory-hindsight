@@ -59,6 +59,7 @@ export function createHindsightProviderRuntime(params: {
   service: HindsightService;
 }): MemoryProviderRuntime {
   const { providerId, service } = params;
+  const reference = (id: string) => ({ providerId, id });
   return {
     async open({ agentId: rawAgentId, context }: MemoryProviderOpenParams) {
       if (!rawAgentId?.trim()) {
@@ -80,8 +81,6 @@ export function createHindsightProviderRuntime(params: {
         assertCurrent();
         return grant.bankId;
       };
-      const reference = (id: string) => ({ providerId, id });
-
       const provider: MemoryProviderHandle = {
         capabilities: {
           sources: ["memory"],

@@ -175,7 +175,13 @@ export function createHindsightService(params: {
             // A setup 4xx is about the bank config, not this item: keep it (see BankSetupError).
             throw isDroppingRejection(error) ? new BankSetupError(error) : error;
           }
-          await client.retain(entry.bankId, entry.item, { signal });
+          // Replay may repeat a delivered item (a crash before the batched save); a replace of
+          // the same document id makes the repeat a no-op on the server.
+          await client.retain(
+            entry.bankId,
+            { ...entry.item, document_id: entry.documentId, update_mode: "replace" },
+            { signal },
+          );
         },
         logger: params.logger,
         ...params.retainQueueRetry,

@@ -1,4 +1,4 @@
-// Fails when an `npm pack --json` file list carries tests, helpers or local state,
+// Fails when an `npm pack --json` file list carries tests, helpers, coverage output or local state,
 // or when a file every release needs is missing from the pack.
 // Usage: node scripts/pack-guard.mjs pack.json
 import { readFileSync } from "node:fs";
@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 // Match whole path segments, so names like tokenizer.js or src-map.js are not rejected.
 // Secret-like names only count when they carry a key/credential extension.
 export const FORBIDDEN =
-  /(^|\/)[^/]*\.test\.|(^|\/)test-helpers|^src\/|(^|\/)\.env|(^|\/)[^/]*(secret|token)[^/]*\.(json|txt|key|pem)$/i;
+  /(^|\/)[^/]*\.test\.|(^|\/)test-helpers|^src\/|^coverage\/|(^|\/)\.env|(^|\/)[^/]*(secret|token)[^/]*\.(json|txt|key|pem)$/i;
 
 export const REQUIRED = [
   "CHANGELOG.md",

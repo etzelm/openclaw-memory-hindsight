@@ -1,4 +1,5 @@
-# Package CI: install, typecheck + build (tsc -> dist/), vitest, oxlint, oxfmt check, pack listing.
+# Package CI: install, typecheck + build (tsc -> dist/), vitest with coverage floor, oxlint,
+# oxfmt check, pack listing.
 
 stages:
   - check
@@ -25,9 +26,20 @@ check:
     - npm ci --no-audit --no-fund
     - npm run typecheck
     - npm run build
-    - npm test
+    - npm run test:coverage
     - npm run lint
     - npm run format:check
     # The published file list must never carry tests, helpers or local state.
     - npm pack --dry-run --json --ignore-scripts > pack.json
-    - node -e 'const f=require("./pack.json")[0].files.map(x=>x.path);console.log(f.join("\n"));const bad=f.filter(p=>/\.test\.|test-helpers|^src\/|\.env|secret|token/i.test(p));if(bad.length){console.error("forbidden in pack:",bad);process.exit(1)}'
+    - node -e 'const f=require("./pack.json")[0].files.map(x=>x.path);console.log(f.join("\n"));const bad=f.filter(p=>/\.test\.|test-helpers|^src\/|^coverage\/|\.env|secret|token/i.test(p));if(bad.length){console.error("forbidden in pack:",bad);process.exit(1)}'
+  # MR widget percentage comes from the text-summary Lines row.
+  coverage: '/Lines\s*:\s*(\d+(?:\.\d+)?)%/'
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - coverage/
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml

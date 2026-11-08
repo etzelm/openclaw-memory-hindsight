@@ -18,7 +18,14 @@
     }
   },
   "contracts": {
-    "tools": ["hindsight_recall", "hindsight_reflect", "hindsight_retain"]
+    "tools": [
+      "hindsight_recall",
+      "hindsight_reflect",
+      "hindsight_retain",
+      "hindsight_get_knowledge_base_tree",
+      "hindsight_search_knowledge_base",
+      "hindsight_get_knowledge_page"
+    ]
   },
   "toolMetadata": {
     "hindsight_retain": {
@@ -73,6 +80,11 @@
     "retainTags": {
       "label": "Retain Tags",
       "help": "Tags added to every retained memory (for example source:openclaw)",
+      "advanced": true
+    },
+    "knowledgeReadTools": {
+      "label": "Knowledge Base Read Tools",
+      "help": "Offer hindsight_get_knowledge_base_tree, hindsight_search_knowledge_base and hindsight_get_knowledge_page on the same bank as hindsight_recall",
       "advanced": true
     }
   },
@@ -157,6 +169,11 @@
         "minimum": 1,
         "default": 604800000,
         "description": "Queued retains older than this many milliseconds are dropped (default 7 days)"
+      },
+      "knowledgeReadTools": {
+        "type": "boolean",
+        "default": false,
+        "description": "Offer the read-only knowledge-base tools (tree, search, page) on the session's own memory bank"
       },
       "agentBankMap": {
         "type": "object",

@@ -36,6 +36,12 @@
     <key>Minute</key>
     <integer>30</integer>
   </dict>
+  <!-- Aqua: gui/<uid> domain (logged-in account). Background: user/<uid> domain (no GUI session). -->
+  <key>LimitLoadToSessionType</key>
+  <array>
+    <string>Aqua</string>
+    <string>Background</string>
+  </array>
   <key>RunAtLoad</key>
   <false/>
   <key>LowPriorityIO</key>

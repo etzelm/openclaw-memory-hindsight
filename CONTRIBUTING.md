@@ -32,12 +32,13 @@ Use Node 24 or later. Run the same gates as CI:
 npm ci
 npm run typecheck
 npm run build
-npm test
+npm run test:coverage
 npm run lint
 npm run format:check
 ```
 
-`npm run format` fixes formatting. Add or update tests in `src/*.test.ts` for any behavior change.
+`npm run format` fixes formatting. Add or update tests in `src/*.test.ts` for any behavior change;
+`test:coverage` fails if coverage drops below the floor in `vitest.config.ts`.
 
 Keep changes small and focused. TypeScript ESM only, no new runtime dependencies without
 discussion, and no secrets, tokens or private hostnames in code, tests or logs.

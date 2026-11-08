@@ -96,6 +96,17 @@ describe("hindsightConfigSchema", () => {
     ).toThrow(/query string or fragment/);
   });
 
+  it.each([
+    ["bare trailing ?", "http://h?"],
+    ["bare trailing # after a path", "http://h/api#"],
+    ["empty query and fragment", "http://h/?#"],
+    ["bare ? after a port and path", "http://h:8888/v1?"],
+  ])("rejects an api url with an empty query or fragment: %s", (_label, hindsightApiUrl) => {
+    expect(() => hindsightConfigSchema.parse({ hindsightApiUrl, allowInsecureHttp: true })).toThrow(
+      "hindsightApiUrl must not contain a query string or fragment",
+    );
+  });
+
   it("detects unresolved tokens and plain-http remote hosts", () => {
     expect(hasUnresolvedToken({ hindsightApiToken: { source: "file", id: "x" } })).toBe(true);
     expect(hasUnresolvedToken({ hindsightApiToken: "t" })).toBe(false);

@@ -8,6 +8,7 @@
 # Hosts (default "floor latest main"):
 #   floor    the package's openclaw.install.minHostVersion (2026.10.10 today), from npm
 #   latest   the npm dist-tag latest, resolved to a version
+#   beta     the npm dist-tag beta, resolved to a version
 #   main     upstream main, resolved to a commit with git ls-remote so both runtimes test the
 #            same commit, built from source
 #   any other word is passed to live-proof.sh --openclaw as is
@@ -20,8 +21,8 @@
 # cells must pass. Every other FAIL is unexpected.
 #
 # Options:
-#   --hosts "LIST"            hosts to test
-#   --runtimes "LIST"         runtimes to test
+#   --hosts "LIST"            hosts to test, separated by spaces or commas
+#   --runtimes "LIST"         runtimes to test, separated by spaces or commas
 #   --plugin SPEC             passed to live-proof.sh (default: this checkout)
 #   --results-dest DEST       copy the run dir here with $RESULTS_PUT (default cp -R), then
 #                             delete the local copy
@@ -47,8 +48,8 @@ usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' 
 need() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 needs a value" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --hosts) need "$@"; HOSTS=$2; shift 2 ;;
-    --runtimes) need "$@"; RUNTIMES=$2; shift 2 ;;
+    --hosts) need "$@"; HOSTS=$(printf '%s' "$2" | tr ',' ' '); shift 2 ;;
+    --runtimes) need "$@"; RUNTIMES=$(printf '%s' "$2" | tr ',' ' '); shift 2 ;;
     --plugin) need "$@"; PLUGIN=$2; shift 2 ;;
     --results-dest) need "$@"; RESULTS_DEST=$2; shift 2 ;;
     --render) need "$@"; RENDER=$2; shift 2 ;;
@@ -60,6 +61,9 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
+# No word splitting or globbing here: only test that each list holds a non-blank character.
+case "$HOSTS" in *[![:space:]]*) ;; *) echo "--hosts needs at least one entry" >&2; exit 2 ;; esac
+case "$RUNTIMES" in *[![:space:]]*) ;; *) echo "--runtimes needs at least one entry" >&2; exit 2 ;; esac
 
 # render RUN_DIR: classify every cell and write MATRIX.md + matrix.json; exit 1 on an unexpected cell
 render() {
@@ -132,7 +136,8 @@ for f in sorted(glob.glob(os.path.join(run, "cells", "*", "results.json"))):
         print(f"unreadable {d}/results.json: {error}", file=sys.stderr)
         continue  # reported below as a missing cell
     cells.append({"dir": d, "status": status, "text": text, "results": r})
-hosts, runtimes = [], [r for r in meta.get("runtimes", [])]
+# Rows in the requested host order (run.json), then any host only the cells name.
+hosts, runtimes = list(dict.fromkeys(meta.get("hostLabels", {}).values())), [r for r in meta.get("runtimes", [])]
 for c in cells:
     r = c["results"]
     suffix = "-" + r["runtime"]
@@ -140,8 +145,6 @@ for c in cells:
     c["host"] = meta.get("hostLabels", {}).get(h, h)
     if c["host"] not in hosts: hosts.append(c["host"])
     if r["runtime"] not in runtimes: runtimes.append(r["runtime"])
-for h in meta.get("hostLabels", {}).values():
-    if h not in hosts: hosts.append(h)
 grid = {(c["host"], c["results"]["runtime"]): c for c in cells}
 unexpected = [c for c in cells if c["status"] == "unexpected"]
 # A requested cell without results.json (the harness died before writing it) is unexpected too.
@@ -265,6 +268,13 @@ import json, sys
 m = json.load(open(sys.argv[1]))
 ok = {"ghost embedded", "ghost claude-cli"} <= set(m["missing"]) and not any(x.startswith(("floor ", "latest ", "main ")) for x in m["missing"])
 print("self-test missing cells:", "PASS" if ok else "FAIL " + str(m["missing"])); sys.exit(0 if ok else 1)' "$d/matrix.json" || st=1
+  # Rows follow the requested host order, then hosts only the cells name.
+  python3 -c '
+import re, sys
+top = open(sys.argv[1]).read().split("## Cells")[0].splitlines()
+rows = [l.split(" | ")[0][2:] for l in top if re.match(r"\| [a-z]+ \| ", l)]
+want = ["floor", "latest", "main", "ghost", "lie", "oddskip", "short", "trunc"]
+print("self-test host order:", "PASS" if rows == want else "FAIL " + str(rows)); sys.exit(0 if rows == want else 1)' "$d/MATRIX.md" || st=1
   # Only partial cells left: exit 3, or 0 when the matrix itself ran with --setup-only.
   rm -rf "$d/cells" "$d/exits.tsv"; mkdir -p "$d/cells/main-embedded"
   python3 -c '
@@ -326,8 +336,8 @@ for h in $HOSTS; do
   case "$h" in
     floor) [ -n "$FLOOR" ] || { echo "no openclaw.install.minHostVersion in package.json" >&2; exit 2; }
            spec=$FLOOR; label="$FLOOR (floor)" ;;
-    latest) spec=$(npm view openclaw dist-tags.latest 2>/dev/null); [ -n "$spec" ] || { echo "npm view openclaw failed" >&2; exit 2; }
-            label="$spec (latest)" ;;
+    latest|beta) spec=$(npm view openclaw "dist-tags.$h" 2>/dev/null); [ -n "$spec" ] || { echo "no npm dist-tag $h for openclaw (or npm view failed)" >&2; exit 2; }
+            label="$spec ($h)" ;;
     main) spec=$(git ls-remote "$OPENCLAW_REPO" refs/heads/main 2>/dev/null | cut -f1); [ -n "$spec" ] || { echo "git ls-remote main failed" >&2; exit 2; }
           label="main@${spec:0:10}" ;;
     *) spec=$h; label=$h ;;

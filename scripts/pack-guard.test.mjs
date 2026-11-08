@@ -9,11 +9,12 @@ test("a complete clean pack passes, including names that merely contain token or
   assert.deepEqual(check(good), { bad: [], missing: [] });
 });
 
-test("tests, helpers, src, env files and credential files are rejected", () => {
+test("tests, helpers, src, coverage, env files and credential files are rejected", () => {
   const planted = [
     "dist/a.test.js",
     "dist/test-helpers.js",
     "src/index.ts",
+    "coverage/index.html",
     ".env",
     "dist/.env.local",
     "dist/api-token.json",

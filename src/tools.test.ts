@@ -47,6 +47,9 @@ function harness(overrides: Record<string, unknown> = {}) {
   return { fake, service, deduper: createFlushDeduper() };
 }
 
+const respond404 = (detail: string) =>
+  createTestService(async () => new Response(JSON.stringify({ detail }), { status: 404 })).service;
+
 describe("hindsight tools", () => {
   it("retains to the audience bank after applying the bank mission once", async () => {
     const { fake, service, deduper } = harness();
@@ -142,17 +145,14 @@ describe("hindsight tools", () => {
   });
 
   it("treats Hindsight's bank-not-found 404 as empty and other 404s as errors", async () => {
-    const respond = (detail: string) =>
-      createTestService(async () => new Response(JSON.stringify({ detail }), { status: 404 }))
-        .service;
-    const missing = respond("Bank 'dev' not found");
+    const missing = respond404("Bank 'dev' not found");
     expect(
       JSON.stringify(await createRecallTool(missing, ownerCtx())!.execute("c", { query: "q" })),
     ).toContain("No relevant memories found.");
     expect(
       JSON.stringify(await createReflectTool(missing, ownerCtx())!.execute("c", { query: "q" })),
     ).toContain("No relevant memories found.");
-    const route = respond("Not Found");
+    const route = respond404("Not Found");
     await expect(createRecallTool(route, ownerCtx())!.execute("c", { query: "q" })).rejects.toThrow(
       "HTTP 404",
     );

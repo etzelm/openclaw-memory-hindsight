@@ -80,14 +80,19 @@ the name, so the harness unsets it.
 
 Cleanup removes exactly this run's dir, after checking it is a real dir directly under
 `projects/` with `-hs-live-proof-` in its name, or a shortened name (the hash comes from this
-run's random scratch path). A candidate that already existed before the
-Gateway started is never removed; X2 fails and names it (`preexisting`). X2 also fails while
-the dir exists, and when any file under a `projects/*hs-live-proof*` dir holds this run's code
-word or workspace path. That last check only reports and never deletes; it catches a dir the CLI
-named some other way. `CLAUDE_CONFIG_DIR` is not pointed at the scratch dir because the CLI then
-no longer finds the login. A
-user-level Claude Code hook or MCP server would run inside the proof turns, outside this
-isolation.
+run's random scratch path). A candidate that already existed before the Gateway started is
+never removed; X2 fails and names it (`preexisting`). X2 also fails while the dir exists.
+
+At the start of the run the harness lists `projects/` (in memory only) and writes a marker file into
+the results dir. At the end, X2 fails when this run's code word or workspace path is in any file
+under a `projects/*hs-live-proof*` dir, under an entry that appeared during the run, or anywhere
+under `projects/` modified after the marker. That catches a transcript the CLI wrote under some
+other name, in a new dir or in one that already existed. New entries the run did not predict are
+counted in X2 and never deleted: another Claude Code session on the machine may own them, so on
+their own they do not fail X2. A concurrent Claude Code session that reads this run's output (and so
+its code word or workspace path) does fail X2. `CLAUDE_CONFIG_DIR` is not pointed at the scratch dir
+because the CLI then no longer finds the login. A user-level Claude Code hook or MCP server would
+run inside the proof turns, outside this isolation.
 
 ### Checks
 
@@ -122,13 +127,15 @@ scripts/compat-matrix.sh --hosts "floor 2026.11.1" --runtimes embedded --token-f
   --anthropic-env-file ~/anthropic.env
 ```
 
-Hosts: `floor` is `openclaw.install.minHostVersion` from `package.json` (2026.10.10),
-`latest` is the npm dist-tag resolved to a version, `main` is upstream `main` resolved to one
-commit with `git ls-remote` so both runtimes test the same build. Each host is prepared once
-and removed after its cells. The run dir holds `MATRIX.md`, `matrix.json`, one dir per cell and
-the cell logs, and is copied to `--results-dest` even when the run stops early. `--render DIR`
-rebuilds the matrix from existing cells; `--self-test` checks the cell classifier against
-fixtures.
+Hosts: `floor` is `openclaw.install.minHostVersion` from `package.json` (2026.10.10), `latest` and
+`beta` are the npm dist-tags resolved to a version (right after a stable release `beta` can be the
+same version as `latest`, or older), `main` is upstream `main` resolved to one commit with `git
+ls-remote` so both runtimes test the same build. Any other word goes to `--openclaw` as is (an npm
+version such as `2026.11.5-beta.1`). `--hosts` and `--runtimes` take spaces or commas (`--hosts
+floor,latest,beta,main`), and the rows follow that order. Each host is prepared once and removed
+after its cells. The run dir holds `MATRIX.md`, `matrix.json`, one dir per cell and the cell logs,
+and is copied to `--results-dest` even when the run stops early. `--render DIR` rebuilds the matrix
+from existing cells; `--self-test` checks the cell classifier against fixtures.
 
 Exit codes: 0 every cell as expected, 1 an unexpected cell, 2 usage, 3 only partial cells
 left. A cell is partial when its turn checks are SKIP because it ran in an agent exec shell
@@ -180,6 +187,30 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.etzelm.hs-compat-n
 launchctl kickstart -k "gui/$(id -u)/com.etzelm.hs-compat-nightly"   # optional first run now
 ```
 
+`gui/<uid>` exists only while the account is logged in at the console. For an account that
+never logs in there (a build user reached over ssh), use `user/$(id -u)` in the `bootstrap`,
+`kickstart` and `bootout` commands; the plist's `LimitLoadToSessionType` allows both. Use one
+domain per account: the `user` domain does not load the agent again after a reboot, so add the
+`bootstrap` command as an `@reboot` line to that account's crontab, and leave that line out for
+an account with a console login (its login loads the plist into `gui/<uid>`):
+
+```sh
+@reboot sleep 150; launchctl bootstrap user/$(id -u) ~/Library/LaunchAgents/com.etzelm.hs-compat-nightly.plist >> ~/Library/Logs/hs-compat-nightly.log 2>&1
+```
+
+The `sleep 150` waits for launchd to finish setting up the user domain after boot; 150 s is a guess
+that worked on one Mac, not a documented value. A bootstrap that runs too early fails, and the line
+logs it, so check the log after a reboot and raise the delay if needed. If both happen,
+`compat-nightly.sh` runs one copy at a time per `WORK_ROOT`; a lock is stale when its pid is not
+running the same script path or it is older than `HS_COMPAT_LOCK_MAX_MIN` minutes (720). A launchd
+job does not run in an agent exec shell, so its turn checks run; the `claude-cli` cells also need
+the CLI login to be readable from that domain, so check the first log after installing and after a
+reboot.
+
+`HS_COMPAT_REPO` can be a local clone that only fetches from the forge; then set
+`HS_COMPAT_REF=refs/remotes/origin/develop`, and keep something fetching that clone (for
+example `HS_COMPAT_PRE`).
+
 `node`, `npm`, `pnpm`, `git` and `claude` must be on the plist `PATH`. Add `HS_COMPAT_PRE` (a
 command run first) or `GIT_SSH_COMMAND` to `EnvironmentVariables` if the repo needs them, and
 `RESULTS_PUT` if the results go somewhere `cp -R` cannot reach. The log is
@@ -188,7 +219,7 @@ latest `MATRIX.md` in the results dir, or check the exit code at the end of the 
 remove it:
 
 ```sh
-launchctl bootout "gui/$(id -u)/com.etzelm.hs-compat-nightly"
+launchctl bootout "gui/$(id -u)/com.etzelm.hs-compat-nightly"   # or user/$(id -u)
 rm ~/Library/LaunchAgents/com.etzelm.hs-compat-nightly.plist
 rm -r "$HOME/Library/Application Support/hs-compat"
 ```

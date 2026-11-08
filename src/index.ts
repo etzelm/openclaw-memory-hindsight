@@ -31,9 +31,15 @@ import { type MemoryPluginCapability, resolveLearnRegistrar } from "./sdk-types.
 import { createHindsightService } from "./service.js";
 import {
   createFlushDeduper,
+  createKnowledgePageTool,
+  createKnowledgeSearchTool,
+  createKnowledgeTreeTool,
   createRecallTool,
   createReflectTool,
   createRetainTool,
+  KB_PAGE_TOOL,
+  KB_SEARCH_TOOL,
+  KB_TREE_TOOL,
   RECALL_TOOL,
   REFLECT_TOOL,
   RETAIN_TOOL,
@@ -131,7 +137,9 @@ export default definePluginEntry({
       logger: api.logger,
     });
     const flushDeduper = createFlushDeduper();
-    const runStartBySession = new Map<string, string | null>();
+    // Per session: where the current run started, kept for the whole run (by runId) so a second
+    // agent_end for the run (host continuation after a retry, or a re-delivery) re-sends all of it.
+    const runStartBySession = new Map<string, { runId?: string; marker: string | null }>();
 
     const capability: MemoryPluginCapability = {
       providerRuntime: createHindsightProviderRuntime({
@@ -166,13 +174,35 @@ export default definePluginEntry({
     registerTool(RETAIN_TOOL, (ctx) => createRetainTool(service, flushDeduper, ctx));
     registerTool(RECALL_TOOL, (ctx) => createRecallTool(service, ctx));
     registerTool(REFLECT_TOOL, (ctx) => createReflectTool(service, ctx));
+    // Opt-in: registered only when knowledgeReadTools is on at startup, so the default tool set is
+    // unchanged. Each factory also reads the live key and returns null once it is turned off.
+    if (startupConfig.knowledgeReadTools) {
+      registerTool(KB_TREE_TOOL, (ctx) => createKnowledgeTreeTool(service, ctx));
+      registerTool(KB_SEARCH_TOOL, (ctx) => createKnowledgeSearchTool(service, ctx));
+      registerTool(KB_PAGE_TOOL, (ctx) => createKnowledgePageTool(service, ctx));
+    }
 
     api.on("before_prompt_build", async (event, ctx) => {
       const config = currentConfig();
       const sessionKey = ctx.sessionKey;
-      // Marks the run start for agent_end even when recall is skipped.
-      if (sessionKey && !runStartBySession.has(sessionKey) && Array.isArray(event.messages)) {
-        runStartBySession.set(sessionKey, runStartMarker(event.messages, event.currentUserMessage));
+      const maintenance = isMaintenanceTurn({
+        trigger: ctx.trigger,
+        sessionKey,
+      });
+      // Marks the run start for agent_end even when recall is skipped. A rebuild or continuation
+      // of the same run keeps the first start; maintenance turns never touch the markers.
+      const prior = sessionKey ? runStartBySession.get(sessionKey) : undefined;
+      if (
+        sessionKey &&
+        !maintenance &&
+        Array.isArray(event.messages) &&
+        (!prior || prior.runId !== ctx.runId)
+      ) {
+        runStartBySession.delete(sessionKey);
+        runStartBySession.set(sessionKey, {
+          runId: ctx.runId,
+          marker: runStartMarker(event.messages, event.currentUserMessage),
+        });
         if (runStartBySession.size > MAX_RUN_MARKERS) {
           runStartBySession.delete(runStartBySession.keys().next().value!);
         }
@@ -181,7 +211,7 @@ export default definePluginEntry({
         service.stopped() ||
         !config.autoRecall ||
         config.memoryMode === "tools" ||
-        isMaintenanceTurn({ trigger: ctx.trigger, sessionKey }) ||
+        maintenance ||
         isIncognitoSessionKey(sessionKey) ||
         !sessionUsesMemory(config, {
           sessionKey,
@@ -233,9 +263,16 @@ export default definePluginEntry({
 
     api.on("agent_end", async (event, ctx) => {
       const sessionKey = ctx.sessionKey;
-      // Taken before any skip so the next run marks its own start.
-      const runStart = sessionKey ? runStartBySession.get(sessionKey) : undefined;
-      if (sessionKey) {
+      const runId = event.runId ?? ctx.runId;
+      const maintenance = isMaintenanceTurn({
+        trigger: ctx.trigger,
+        sessionKey,
+      });
+      const start = sessionKey && !maintenance ? runStartBySession.get(sessionKey) : undefined;
+      const runStart = start?.marker;
+      // Taken before any skip. The marker stays while the run can still continue; without a
+      // runId it is dropped so the next run marks its own start.
+      if (sessionKey && start && (runId === undefined || start.runId !== runId)) {
         runStartBySession.delete(sessionKey);
       }
       const config = currentConfig();
@@ -245,7 +282,7 @@ export default definePluginEntry({
         !event.success ||
         !Array.isArray(event.messages) ||
         event.messages.length === 0 ||
-        isMaintenanceTurn({ trigger: ctx.trigger, sessionKey }) ||
+        maintenance ||
         isIncognitoSessionKey(sessionKey) ||
         !sessionUsesMemory(config, {
           sessionKey,
@@ -267,8 +304,9 @@ export default definePluginEntry({
         return;
       }
       const tags = [...new Set([...config.retainTags, ...retention.tags])];
-      // One document per run: a re-delivered agent_end for the same run replaces, not duplicates.
-      const runPart = sanitizeDocumentIdPart(event.runId ?? ctx.runId, `${Date.now()}`);
+      // One document per run. Every agent_end for the run carries the run from its first start,
+      // so a continuation or a re-delivery replaces the document with the whole run.
+      const runPart = sanitizeDocumentIdPart(runId, `${Date.now()}`);
       const documentId = `openclaw:${sanitizeDocumentIdPart(sessionKey, "session")}-${sessionKeyDigest(sessionKey)}:run:${runPart}`;
       try {
         // No ctx.assertMemoryAudienceCurrent() here. The host starts agent_end handlers without

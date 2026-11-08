@@ -16,5 +16,5 @@
   "tabWidth": 2,
   "trailingComma": "all",
   "useTabs": false,
-  "ignorePatterns": ["dist/**", "node_modules/**", "package-lock.json"]
+  "ignorePatterns": ["dist/**", "coverage/**", "node_modules/**", "package-lock.json"]
 }

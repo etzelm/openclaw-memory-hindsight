@@ -46,6 +46,8 @@ export class HindsightHttpError extends Error {
     readonly bankMissing = false,
     /** True only when the body said so; an empty 404 body sets `bankMissing` but not this. */
     readonly bankMissingExplicit = false,
+    /** True only for Hindsight's "Knowledge page '<id>' not found" 404. */
+    readonly pageMissing = false,
   ) {
     super(message);
     this.name = "HindsightHttpError";
@@ -75,6 +77,66 @@ export function isExplicitBankMissingBody(text: string): boolean {
     return false;
   }
 }
+
+/** Only Hindsight's `Knowledge page '<id>' not found` detail; a route "Not Found" does not count. */
+export function isExplicitPageMissingBody(text: string): boolean {
+  try {
+    const detail = (JSON.parse(text) as { detail?: unknown } | null)?.detail;
+    return typeof detail === "string" && /\bknowledge page\b.*\bnot found\b/i.test(detail);
+  } catch {
+    return false;
+  }
+}
+
+/** Largest knowledge-base response body read; a bigger one fails instead of filling memory. */
+export const KB_MAX_RESPONSE_BYTES = 1024 * 1024;
+// Error bodies are only classified, never copied, so a small prefix is enough.
+const ERROR_BODY_MAX_BYTES = 64 * 1024;
+
+class BodyTooLargeError extends Error {}
+
+/** Reads at most `maxBytes` of the body; throws BodyTooLargeError past it and stops reading. */
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new BodyTooLargeError();
+  }
+  if (!response.body) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new BodyTooLargeError();
+    }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+/** One folder or page of the knowledge-base tree (fields this plugin reads). */
+export type HindsightKnowledgeNode = {
+  id: string;
+  kind: "folder" | "page";
+  name: string;
+  is_stale?: boolean | null;
+  children?: HindsightKnowledgeNode[] | null;
+};
+
+export type HindsightKnowledgeSearchHit = {
+  id: string;
+  name: string;
+  snippet: string;
+};
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -120,7 +182,7 @@ export class HindsightClient {
   private async request<T>(
     operation: string,
     url: string,
-    init: { method: string; body?: unknown; signal?: AbortSignal },
+    init: { method: string; body?: unknown; signal?: AbortSignal; maxBodyBytes?: number },
   ): Promise<T> {
     const hasBody = init.body !== undefined;
     const response = await this.fetchImpl(url, {
@@ -131,18 +193,41 @@ export class HindsightClient {
       ...(init.signal ? { signal: init.signal } : {}),
     });
     if (!response.ok) {
-      const body = response.status === 404 ? await response.text().catch(() => "") : "";
+      const body =
+        response.status === 404
+          ? // An oversized body is not "empty", so it never reads as a missing bank.
+            await readBoundedText(response, ERROR_BODY_MAX_BYTES).catch((error: unknown) =>
+              error instanceof BodyTooLargeError ? "<oversized>" : "",
+            )
+          : "";
       const bankMissing = response.status === 404 && isBankMissingBody(body);
       const bankMissingExplicit = response.status === 404 && isExplicitBankMissingBody(body);
+      const pageMissing = response.status === 404 && isExplicitPageMissingBody(body);
       // Server error bodies can echo request content; keep only the status in the message.
       throw new HindsightHttpError(
         `Hindsight ${operation} failed: HTTP ${response.status}`,
         response.status,
         bankMissing,
         bankMissingExplicit,
+        pageMissing,
       );
     }
-    const text = await response.text();
+    let text: string;
+    if (init.maxBodyBytes === undefined) {
+      text = await response.text();
+    } else {
+      try {
+        text = await readBoundedText(response, init.maxBodyBytes);
+      } catch (error) {
+        if (error instanceof BodyTooLargeError) {
+          throw new Error(
+            `Hindsight ${operation} failed: response larger than ${init.maxBodyBytes} bytes`,
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+    }
     // SAFETY: T only names optional fields; every caller type-checks each field before use.
     return (text ? JSON.parse(text) : {}) as T;
   }
@@ -214,6 +299,66 @@ export class HindsightClient {
     } catch (error) {
       // Any 404 here: "Bank '<id>' not found" and "Memory unit '<id>' not found" both mean absent.
       if (error instanceof HindsightHttpError && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async getKnowledgeBaseTree(
+    bankId: string,
+    signal?: AbortSignal,
+  ): Promise<HindsightKnowledgeNode[]> {
+    const response = await this.request<{ roots?: HindsightKnowledgeNode[] }>(
+      "knowledge tree",
+      this.bankUrl(bankId, "/knowledge-base/tree"),
+      { method: "GET", signal, maxBodyBytes: KB_MAX_RESPONSE_BYTES },
+    );
+    return Array.isArray(response.roots) ? response.roots : [];
+  }
+
+  async searchKnowledgeBase(
+    bankId: string,
+    query: string,
+    options: { limit?: number; signal?: AbortSignal } = {},
+  ): Promise<HindsightKnowledgeSearchHit[]> {
+    const params = new URLSearchParams({ q: query });
+    if (options.limit !== undefined) {
+      params.set("limit", String(options.limit));
+    }
+    const response = await this.request<{ results?: HindsightKnowledgeSearchHit[] }>(
+      "knowledge search",
+      this.bankUrl(bankId, `/knowledge-base/search?${params.toString()}`),
+      { method: "GET", signal: options.signal, maxBodyBytes: KB_MAX_RESPONSE_BYTES },
+    );
+    return Array.isArray(response.results) ? response.results : [];
+  }
+
+  /**
+   * Returns null when the bank or page does not exist. Hindsight scopes page ids to the bank in
+   * the URL, so a page id from another bank is also null. A route 404 stays an error.
+   */
+  async getKnowledgePage(
+    bankId: string,
+    pageId: string,
+    signal?: AbortSignal,
+  ): Promise<{ id: string; name: string; markdown: string } | null> {
+    try {
+      const body = await this.request<{ name?: unknown; markdown?: unknown }>(
+        "knowledge page",
+        this.bankUrl(bankId, `/knowledge-base/pages/${encodeURIComponent(pageId)}`),
+        { method: "GET", signal, maxBodyBytes: KB_MAX_RESPONSE_BYTES },
+      );
+      if (typeof body.markdown !== "string") {
+        throw new Error("Hindsight knowledge page failed: unexpected response");
+      }
+      return {
+        id: pageId,
+        name: typeof body.name === "string" ? body.name : "",
+        markdown: body.markdown,
+      };
+    } catch (error) {
+      if (error instanceof HindsightHttpError && (error.bankMissing || error.pageMissing)) {
         return null;
       }
       throw error;

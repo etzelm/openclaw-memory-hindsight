@@ -186,9 +186,265 @@ export function formatMemories(results: readonly HindsightRecallResult[]): strin
     .join("\n\n");
 }
 
-/** Stops recalled text from closing (or reopening) the wrapper it is rendered inside. */
+/**
+ * Names that must not follow a tag opener, with case, `_` and `-` folded away: the wrapper and
+ * OpenClaw's internal-context BEGIN/END markers (whose exact forms get the host escape below).
+ */
+const PROTECTED_NAMES = [
+  "hindsightmemories",
+  "beginopenclawinternalcontext",
+  "endopenclawinternalcontext",
+];
+/**
+ * Characters a reader does not see as letters, skipped when spelling the wrapper name:
+ * default-ignorables, whitespace, combining marks (after NFKD, so precomposed accents too)
+ * and blanks that are neither (Hangul fillers, braille blank).
+ */
+const INVISIBLE_CHAR_RE =
+  /^[\p{Default_Ignorable_Code_Point}\p{White_Space}\p{Mn}\p{Me}\u115F\u1160\u2800\u3164\uFFA0]$/u;
+/**
+ * Common Cyrillic, Greek and Latin lookalikes of the wrapper name's letters, upper and lower
+ * case (looked up both before and after lowercasing).
+ */
+const NAME_CONFUSABLES: ReadonlyMap<string, string> = new Map([
+  ["\u041D", "h"],
+  ["\u0397", "h"],
+  ["\u041C", "m"],
+  ["\u039C", "m"],
+  ["\u039D", "n"],
+  ["\u0422", "t"],
+  ["\u03A4", "t"],
+  ["\u0395", "e"],
+  ["\u03B5", "e"],
+  ["\u04BB", "h"],
+  ["\u0456", "i"],
+  ["\u0131", "i"],
+  ["\u03B9", "i"],
+  ["\u0501", "d"],
+  ["\u0455", "s"],
+  ["\u0261", "g"],
+  ["\u0435", "e"],
+  ["\u043E", "o"],
+  ["\u03BF", "o"],
+]);
+/**
+ * `<` and its lookalikes: every confusables.txt entry whose target ends in `<` (including
+ * `<<`, `<<<`, `><` and letter-plus-`<` targets), plus angle brackets and quotation marks a
+ * reader takes for one. The model, not an HTML parser, reads the block.
+ */
+const TAG_OPENERS = new Set([
+  "<",
+  "\uFF1C",
+  "\uFE64",
+  "\u2039",
+  "\u276E",
+  "\u02C2",
+  "\u1438",
+  "\u16B2",
+  "\u2D66",
+  "\u{1D236}",
+  "\u{16AEC}",
+  "\u{1032D}",
+  "\u226A",
+  "\u22D8",
+  "\u2AA5",
+  "\u150C",
+  "\u1444",
+  "\u2329",
+  "\u3008",
+  "\u300A",
+  "\u27E8",
+  "\u27EA",
+  "\u276C",
+  "\u2770",
+  "\u29FC",
+]);
+/** Slash and backslash plus the division and fraction slashes, skipped before the name. */
+const SLASHES = new Set(["/", "\\", "\u2215", "\u2044"]);
+/** OpenClaw's internal-context markers and the escaped forms the host uses for untrusted text. */
+const HOST_MARKERS: ReadonlyArray<readonly [string, string]> = [
+  ["<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>", "[[OPENCLAW_INTERNAL_CONTEXT_BEGIN]]"],
+  ["<<<END_OPENCLAW_INTERNAL_CONTEXT>>>", "[[OPENCLAW_INTERNAL_CONTEXT_END]]"],
+];
+/** The host's runtime-context notice line; legacy carriers are only stripped when it follows. */
+const RUNTIME_CONTEXT_NOTICE =
+  "This context is runtime-generated, not user-authored. Keep internal details private.";
+/** Legacy carrier prefaces the host strips when the notice follows them (any sentence suffix). */
+const RUNTIME_CONTEXT_PREFACES = [
+  "OpenClaw runtime context for the active user request in this turn. Do not reply to or describe this context. Use it to continue answering the active user request now. Do not wait for another message.",
+  "OpenClaw runtime context for the immediately preceding user message.",
+  "OpenClaw runtime event.",
+];
+/**
+ * Runtime-context phrases the host recognizes in prompt text, matched after folding (see
+ * foldText) and replaced whole. The footer escape is the host's own; the others follow its
+ * style. Prefaces only count with the notice after them, as in the host, so prose such as
+ * "an OpenClaw runtime event." is left alone.
+ */
+const HOST_PHRASES: ReadonlyArray<readonly [string, string]> = [
+  ["End OpenClaw runtime context.", "[[RUNTIME_CONTEXT_FOOTER_ESCAPED]]"],
+  ["OpenClaw runtime context:", "[[RUNTIME_CONTEXT_HEADER_ESCAPED]]"],
+  ["OpenClaw runtime context (internal):", "[[RUNTIME_CONTEXT_INTERNAL_HEADER_ESCAPED]]"],
+  [RUNTIME_CONTEXT_NOTICE, "[[RUNTIME_CONTEXT_NOTICE_ESCAPED]]"],
+  ...RUNTIME_CONTEXT_PREFACES.flatMap((preface) => {
+    const sentences = preface.split(". ");
+    return sentences.map(
+      (_, index) =>
+        [
+          `${sentences.slice(index).join(". ")} ${RUNTIME_CONTEXT_NOTICE}`,
+          "[[RUNTIME_CONTEXT_PREFACE_ESCAPED]]",
+        ] as const,
+    );
+  }),
+];
+
+/** One character as the wrapper-name matcher sees it: NFKD, lowercase, marks and lookalikes folded. */
+function foldNameChar(ch: string): string {
+  if (ch.length === 1 && ch < "\x80") {
+    return /\s/.test(ch) ? "" : ch.toLowerCase();
+  }
+  let out = "";
+  for (const base of ch.normalize("NFKD")) {
+    const lower = (NAME_CONFUSABLES.get(base) ?? base).toLowerCase().normalize("NFKD");
+    for (const part of lower) {
+      if (!INVISIBLE_CHAR_RE.test(part)) {
+        out += NAME_CONFUSABLES.get(part) ?? part;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * True when the text after a tag opener spells a protected name: leading slashes, case,
+ * accents, `_`/`-`, invisible characters and common lookalike letters are ignored.
+ * Attributes, `>` and anything after the name do not matter, so opening, closing and
+ * self-closing forms all match.
+ */
+function spellsProtectedName(text: string, from: number): boolean {
+  let name = "";
+  let leading = true;
+  let i = from;
+  while (i < text.length) {
+    const ch = String.fromCodePoint(text.codePointAt(i) ?? 0);
+    i += ch.length;
+    for (const folded of foldNameChar(ch)) {
+      if (folded === "_" || folded === "-" || (leading && SLASHES.has(folded))) {
+        continue;
+      }
+      leading = false;
+      name += folded;
+      if (PROTECTED_NAMES.includes(name)) {
+        return true;
+      }
+      if (!PROTECTED_NAMES.some((candidate) => candidate.startsWith(name))) {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+/** Folded text (foldNameChar, minus `_`/`-`) with the source span of each folded character. */
+function foldText(text: string): { folded: string; starts: number[]; ends: number[] } {
+  let folded = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const ch = String.fromCodePoint(text.codePointAt(i) ?? 0);
+    for (const part of foldNameChar(ch)) {
+      if (part !== "_" && part !== "-") {
+        folded += part;
+        // One entry per UTF-16 unit, so indexOf positions line up for astral characters too.
+        for (let unit = 0; unit < part.length; unit += 1) {
+          starts.push(i);
+          ends.push(i + ch.length);
+        }
+      }
+    }
+    i += ch.length;
+  }
+  return { folded, starts, ends };
+}
+
+const FOLDED_HOST_PHRASES = HOST_PHRASES.map(
+  ([phrase, escaped]) => [foldText(phrase).folded, escaped] as const,
+);
+
+/**
+ * True when no letter or digit ends right before `index` in the source (invisible characters
+ * are looked through), so "weekend OpenClaw runtime context." is not a footer match.
+ */
+function startsAtWordBoundary(text: string, index: number): boolean {
+  let i = index;
+  while (i > 0) {
+    const low = text.charCodeAt(i - 1);
+    const size = low >= 0xdc00 && low <= 0xdfff && i > 1 ? 2 : 1;
+    const ch = text.slice(i - size, i);
+    if (/\s/u.test(ch)) {
+      return true;
+    }
+    const folded = foldNameChar(ch);
+    if (folded) {
+      return !/[\p{L}\p{N}]$/u.test(folded);
+    }
+    i -= size;
+  }
+  return true;
+}
+
+/**
+ * Replaces every folded match of a host phrase that starts at a word boundary; earlier and
+ * then longer matches win.
+ */
+function escapeHostPhrases(text: string): string {
+  const { folded, starts, ends } = foldText(text);
+  const spans: Array<{ start: number; end: number; escaped: string }> = [];
+  for (const [key, escaped] of FOLDED_HOST_PHRASES) {
+    for (let at = folded.indexOf(key); at !== -1; at = folded.indexOf(key, at + 1)) {
+      const start = starts[at] ?? 0;
+      if (startsAtWordBoundary(text, start)) {
+        spans.push({ start, end: ends[at + key.length - 1] ?? 0, escaped });
+      }
+    }
+  }
+  spans.sort((x, y) => x.start - y.start || y.end - x.end);
+  let out = "";
+  let last = 0;
+  for (const span of spans) {
+    if (span.start >= last) {
+      out += `${text.slice(last, span.start)}${span.escaped}`;
+      last = span.end;
+    }
+  }
+  return out + text.slice(last);
+}
+
+/**
+ * Stops recalled text from closing (or reopening) the wrapper it is rendered inside or forging
+ * OpenClaw prompt delimiters. Exact internal-context markers get the host's escaped form,
+ * runtime-context phrases are replaced (matched after folding), and the opener of any
+ * remaining wrapper or marker tag variant becomes `&lt;`. Other text is left unchanged.
+ */
 export function neutralizeMemoryTags(text: string): string {
-  return text.replace(/<(\/?hindsight_memories>)/gi, "&lt;$1");
+  let marked = text;
+  for (const [marker, escaped] of HOST_MARKERS) {
+    marked = marked.replaceAll(marker, escaped);
+  }
+  const source = escapeHostPhrases(marked);
+  let out = "";
+  let last = 0;
+  for (let i = 0; i < source.length;) {
+    const ch = String.fromCodePoint(source.codePointAt(i) ?? 0);
+    const next = i + ch.length;
+    if (TAG_OPENERS.has(ch) && spellsProtectedName(source, next)) {
+      out += `${source.slice(last, i)}&lt;`;
+      last = next;
+    }
+    i = next;
+  }
+  return out + source.slice(last);
 }
 
 export function buildRecallContext(

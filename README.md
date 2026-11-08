@@ -11,7 +11,8 @@ contracts instead of only hooking prompts:
   run, replaced on re-delivery). Host maintenance turns (the pre-compaction flush and Active
   Memory's recall child) get neither; they use the tools. A bank nothing was retained to yet
   reads as "no memories", without a warning.
-- **Agent tools** `hindsight_retain`, `hindsight_recall`, `hindsight_reflect`.
+- **Agent tools** `hindsight_retain`, `hindsight_recall`, `hindsight_reflect`, plus opt-in
+  read-only knowledge-base tools (see [Knowledge-base read tools](#knowledge-base-read-tools)).
 - **Recall tool declaration** (`recallToolNames`): Active Memory uses `hindsight_recall` and
   `hindsight_reflect` without a `toolsAllow` list.
 - **Pre-compaction flush, tools arm**: before compaction the host runs a silent turn that saves
@@ -58,7 +59,7 @@ tarball and install that:
 git clone https://github.com/etzelm/openclaw-memory-hindsight.git
 cd openclaw-memory-hindsight
 npm ci && npm pack
-openclaw plugins install npm-pack:./etzelm-openclaw-memory-hindsight-0.2.0.tgz --force --accept-capabilities
+openclaw plugins install npm-pack:./etzelm-openclaw-memory-hindsight-0.3.0.tgz --force --accept-capabilities
 ```
 
 `--force` confirms the "outside ClawHub review" warning for a local archive. Every install asks for
@@ -123,15 +124,21 @@ tool conflict.
 | `retainQueueEnabled`        | `true`               | Queue auto-retains that fail because Hindsight is unreachable and send them later (see below)         |
 | `retainQueueMaxItems`       | `500`                | Most queued retains kept (1 to 10000); the oldest are dropped first                                   |
 | `retainQueueMaxAgeMs`       | `604800000` (7 days) | Queued retains older than this are dropped                                                            |
+| `knowledgeReadTools`        | `false`              | Offer the read-only knowledge-base tools (see below); turning it on needs a gateway restart           |
 
 Fixed values (not configurable): recall max tokens 1024, query cap 800 characters, recall
-timeout 10 s, retain and reflect timeout 30 s, memory get timeout 10 s (each combined with the
-host's abort signal when there is one), retained roles user and assistant, JSON transcript format, recall injected before
-the user message (outside the system prompt, so the cached prefix stays stable).
+timeout 10 s, retain and reflect timeout 30 s, memory get and knowledge-base tool timeout 10 s
+(each combined with the host's abort signal when there is one), retained roles user and
+assistant, JSON transcript format, recall injected before the user message (outside the system
+prompt, so the cached prefix stays stable). Knowledge-base tool caps: a response body over
+1 MiB fails; a page shows its first 32000 characters, then `(truncated, N more characters)`;
+the tree shows 500 entries, then `(truncated, N more entries)`; search shows at most 50 hits
+with snippets cut at 500 characters and names and ids at 200.
 
 Config changes apply without a restart: the plugin re-reads its entry from the host's current
 config snapshot (`api.runtime.config.current()`), falling back to the register-time
-`api.pluginConfig`.
+`api.pluginConfig`. One exception: `knowledgeReadTools` registers its tools at startup, so turning
+it on takes a gateway restart (turning it off applies at once).
 
 ### Offline retain queue
 
@@ -174,16 +181,60 @@ session transcripts.
   for its bank's queue, and its failure is logged as before.
 - **Disk writes.** A new item is appended, on a new line even after a torn last line. Replacing,
   pruning and replay rewrite the file (atomic rename); replay writes once per 25 delivered items and
-  at the end of each pass. If a rewrite that should drop an out-of-date copy fails, a tombstone line
-  is appended so a restart does not replay that copy. One queue per file per process, shared across
-  service restarts. If a bank already has queued items and the queue file cannot be written (disk
-  full, permissions), the retain is sent live instead. If the live write already failed, the queue
-  error is logged and the retain is not kept.
+  at the end of each pass, and a failed write is retried by the next one. If a rewrite fails, the
+  new or newer copy is appended instead, with a tombstone for any item the limits drop; the older
+  copy stays in the file until the next successful rewrite, and load keeps only the newest line per
+  bank and document id. An append that would take
+  the file past 32 MiB rewrites it instead. Only when that rewrite fails too is the item not queued:
+  an out-of-date copy it replaced gets a tombstone line so a restart does not replay it, and the
+  retain is sent live, or, when its live write already failed, logged and not kept. Until the next
+  successful rewrite, the file stays within 32 MiB plus at most one short tombstone line per item
+  removed from the queue meanwhile. A crash between replay's writes can also leave an already delivered copy before
+  a newer one; load keeps the newer one, and replay always sends `update_mode: replace` with the
+  item's document id, so a repeat is harmless. One queue per file per process, shared across
+  service restarts.
+- **Downgrade.** The file format is unchanged. 0.2.0 reads tombstones but keeps every copy of a
+  document (left by a crash during replay or by a replace that could not rewrite the file) and
+  sends them oldest first, same document id with replace, so the newest text wins unless the same
+  document is retained again before that replay finishes. 0.1.x has no queue and ignores the file.
+  A build that ignores tombstone lines (only unreleased queue builds before 0.2.0) can replay an
+  out-of-date copy a tombstone hid; if the newer copy was then sent live and never queued, the stale
+  text overwrites it on the server. Let the queue drain (the file is deleted when it is empty), or
+  delete the file, before downgrading.
 - Only auto-retain is queued. `hindsight_retain` and the pre-compaction flush return the error to
   the agent, as before. With `retainQueueEnabled: false` the plugin neither reads nor writes the
   file; delete it, or turn the queue back on to drain it. `retainQueueEnabled` is read at service
   start (restart the gateway after changing it); the two limits apply live. One gateway process per
   state dir: the file is not locked.
+
+### Knowledge-base read tools
+
+With `knowledgeReadTools: true` the agent also gets three read-only tools over Hindsight's
+knowledge pages (documents Hindsight writes and refreshes from memories), under the same names as
+the vendor plugin:
+
+- `hindsight_get_knowledge_base_tree`: folders and pages with page ids and a stale mark
+  (`GET .../knowledge-base/tree`).
+- `hindsight_search_knowledge_base`: pages matching a query, with a snippet (`query`, optional
+  `limit` clamped to 1-50; `GET .../knowledge-base/search`).
+- `hindsight_get_knowledge_page`: one page as markdown by `page_id`
+  (`GET .../knowledge-base/pages/<id>`).
+
+They follow the recall tools' rules: same bank from the host-minted memory audience (an
+owner-private session reads the owner bank, a conversation reads only its own
+`<bank>::conv::<hash>` bank), same session filters, none in `context` mode or without an
+audience. Hindsight scopes page ids to the bank in the URL, so a page id from the owner bank is
+"not found" through a conversation bank. A bank nothing was written to reads as "no knowledge
+pages yet"; as with recall, a 404 with an empty body counts as a missing bank too. A route 404
+(`{"detail":"Not Found"}`: wrong URL or a Hindsight version without these endpoints) stays an
+error. `page_id` must look like a Hindsight id (letters, digits, `_ . : -`, starting with a
+letter or digit, at most 200 characters) and is refused otherwise, before any request. Output
+is marked as untrusted data, like recall, and capped (see Fixed values). The manifest's
+`contracts.tools` always lists the three names (it is static), so they appear in plugin status
+and doctor tool-owner output even with the key off; they are registered only when it is on.
+Host tool listings can therefore show them while the key is off: the manifest's `configSignals`
+only test that a key is present, not that it is `true`, so they cannot express this key. The
+write tools (create folder, create page, update, delete) are not ported.
 
 ### Mapping from `@vectorize-io/hindsight-openclaw`
 
@@ -251,8 +302,8 @@ and 2026-11-07):
 - 2026.10.10 is the first release that records a dashboard session created by
   `sessions.create` as a direct chat (openclaw#181359). On 2026.10.1 through 2026.10.9 the host
   gives turns in such a session no memory audience ("root session ... has no durable chat
-  type"), so the plugin neither recalls nor retains there. Nothing leaks; memory just does not
-  work for those sessions, including `openclaw agent --session-key` runs in them.
+  type"), so the plugin neither recalls nor retains there: no memory is read or written in those
+  sessions, including `openclaw agent --session-key` runs in them.
 - 2026.9.36 has no tools-arm flush plan (`persistenceToolNames`) and no
   `assertMemoryAudienceCurrent`. 2026.10.1 is the first release with `recallToolNames`, the
   tools-arm `providerFlushPlanResolver` result and `memoryAudience` /
@@ -308,15 +359,16 @@ deprecated on npm once the fix ships, as 0.1.1 is.
 - **`memory.search` through the provider runtime skips the plugin filters.** It is gated by the
   caller's audience (owner-private or conversation), not by `memoryMode`, `excludeProviders` or
   incognito session keys. Those filters apply to auto-recall, auto-retain and the tools only.
-- `hindsightApiUrl` must not contain credentials, a query string or a fragment (the parser
-  rejects it). An unresolved SecretRef token, or a token sent over plain `http` to a
-  non-loopback host, logs one warning at service start.
+- `hindsightApiUrl` must not contain credentials, a query string or a fragment, even an empty
+  one such as a trailing `?` or `#` (the parser rejects it). An unresolved SecretRef token, or a
+  token sent over plain `http` to a non-loopback host, logs one warning at service start.
 - Flush dedupe is per process; a restart mid-cycle can repeat a flush write, which the stable
   document id plus `update_mode: replace` turns into an overwrite.
 - Conversation banks are never pruned by the plugin, and `openclaw memory forget` does not reach
   slot owners (no host seam yet).
 
-Not ported from the vendor plugin: knowledge-base tools, tool-call retention
+Not ported from the vendor plugin: knowledge-base write tools (create, update, delete; the
+read tools are opt-in, see above), tool-call retention
 (`retainToolCalls`), `retainEveryNTurns` windows, the local Hindsight daemon, and
 per-user/per-channel bank granularity (replaced by audience routing).
 

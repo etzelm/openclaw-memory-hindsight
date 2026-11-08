@@ -218,8 +218,10 @@ jobs:
       - name: Publish to ClawHub
         working-directory: pkg
         run: |
+          log() { echo "[$(date -u +%H:%M:%SZ)] $*"; }
           inspect_out="$RUNNER_TEMP/inspect.out"
           inspect_err="$RUNNER_TEMP/inspect.err"
+          log "checking whether $PACKAGE_NAME@$VERSION is already on ClawHub"
           if clawhub --no-input package inspect "$PACKAGE_NAME" --version "$VERSION" --json > "$inspect_out" 2> "$inspect_err"; then
             remote_sha="$(node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(j.version?.artifact?.sha256??"")}catch{}' "$inspect_out")"
             if [ -z "$remote_sha" ]; then
@@ -238,6 +240,12 @@ jobs:
             cat "$inspect_err" "$inspect_out"
             exit 1
           fi
+          log "not on ClawHub yet; uploading $TARBALL ($(stat -c %s "$TARBALL") bytes, sha256 $SHA256)"
+          log "the CLI then waits for ClawHub security checks; a heartbeat line follows every 30 s"
+          # --wait prints nothing until it ends, so run it in the background and
+          # report progress here. --wait-timeout ends it before the 40 min job limit.
+          publish_out="$RUNNER_TEMP/publish.out"
+          : > "$publish_out"
           clawhub --no-input package publish "./$TARBALL" \
             --family code-plugin \
             --owner etzelm \
@@ -245,7 +253,36 @@ jobs:
             --source-commit "$GITHUB_SHA" \
             --source-ref "$GITHUB_REF_NAME" \
             --wait \
-            --json
+            --wait-timeout 1800 \
+            --json > "$publish_out" 2>&1 &
+          pid=$!
+          start=$(date +%s)
+          shown=0
+          show_new_output() {
+            lines=$(wc -l < "$publish_out")
+            if [ "$lines" -gt "$shown" ]; then
+              sed -n "$((shown + 1)),${lines}p" "$publish_out"
+              shown=$lines
+            fi
+          }
+          while kill -0 "$pid" 2> /dev/null; do
+            sleep 30
+            show_new_output
+            # The owner view may show the pending version; the public view does not.
+            if timeout 20 clawhub --no-input package inspect "$PACKAGE_NAME" --version "$VERSION" --json > "$inspect_out" 2> "$inspect_err"; then
+              state="visible to the owner: $(node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const out=[];const walk=(o,p)=>{if(o&&typeof o==="object"){for(const[k,v]of Object.entries(o))walk(v,p?p+"."+k:k)}else if(/status|state|scan|verdict|moderation/i.test(p))out.push(p+"="+o)};walk(j,"");process.stdout.write(out.join(" ").slice(0,300)||"no status fields")}catch{process.stdout.write("unreadable JSON")}' "$inspect_out" || true)"
+            else
+              state="not visible yet or inspect timed out ($(head -c 120 "$inspect_err" | tr '\n' ' '))"
+            fi
+            log "waiting: $(($(date +%s) - start)) s elapsed, publish still running; $state"
+          done
+          rc=0
+          wait "$pid" || rc=$?
+          # tail, not show_new_output: also prints a last line with no newline.
+          tail -n +"$((shown + 1))" "$publish_out"
+          echo
+          log "clawhub package publish exited $rc after $(($(date +%s) - start)) s"
+          exit "$rc"
 
       - name: Remove ClawHub credentials
         if: always()

@@ -121,12 +121,21 @@ function isQueuedRetain(value: unknown): value is QueuedRetain {
   );
 }
 
+/** One queued copy per bank and document id; JSON keeps ids with any characters apart. */
+function queueKey(key: { bankId: string; documentId: string }): string {
+  return JSON.stringify([key.bankId, key.documentId]);
+}
+
 /** The key of a tombstone line, written when a rewrite failed to drop an out-of-date copy. */
 function tombstoneKey(value: unknown): { bankId: string; documentId: string } | undefined {
   const t = (value as { tombstone?: { bankId?: unknown; documentId?: unknown } } | null)?.tombstone;
   return typeof t?.bankId === "string" && typeof t.documentId === "string"
     ? { bankId: t.bankId, documentId: t.documentId }
     : undefined;
+}
+
+function tombstoneLine(key: { bankId: string; documentId: string }): string {
+  return JSON.stringify({ tombstone: { bankId: key.bankId, documentId: key.documentId } });
 }
 
 /** True when the file is empty or its last byte is a newline. */
@@ -155,13 +164,18 @@ function stored(entry: QueuedRetain, line = JSON.stringify(entry)): Stored {
 /**
  * Bounded, file-backed FIFO of failed auto-retains, one JSON line per item. One entry per bank and
  * document id: a newer retain of the same document replaces the queued one in place. A new item is
- * appended to the file; replacing, pruning and replay rewrite it (mode 600, atomic rename).
+ * appended to the file; replacing, pruning and replay rewrite it (mode 600, atomic rename). When a
+ * rewrite fails, the item is appended instead (`load()` keeps the newest copy of each document). An
+ * append that would push the file past the size bound goes through a rewrite; when both fail, the
+ * caller sends the item live.
  */
 export class RetainQueue {
   private stored: Stored[] = [];
   private dropWarned = false;
   /** Removals not yet written (replay batches its writes). */
   private dirty = false;
+  /** Bytes in the file as this queue last read or wrote it; appends grow it, rewrites reset it. */
+  private fileBytes = 0;
   private limits: () => RetainQueueLimits;
   private logger: QueueLogger;
 
@@ -207,13 +221,18 @@ export class RetainQueue {
     } catch (error) {
       if ((error as { code?: unknown }).code === "ENOENT") {
         this.stored = [];
+        this.fileBytes = 0;
         return;
       }
       throw error;
     }
-    let loaded: Stored[] = [];
+    this.fileBytes = Buffer.byteLength(text, "utf8");
+    // Keyed by bank and document id in file order. A later copy wins and takes the later place:
+    // a crash between replay's batched saves leaves a delivered copy before a newer append.
+    const loaded = new Map<string, Stored>();
     let skipped = 0;
     let tombstones = 0;
+    let duplicates = 0;
     for (const line of text.split("\n")) {
       if (!line.trim()) {
         continue;
@@ -221,15 +240,17 @@ export class RetainQueue {
       try {
         const entry: unknown = JSON.parse(line);
         if (isQueuedRetain(entry)) {
-          loaded.push(stored(entry, line));
+          const key = queueKey(entry);
+          if (loaded.delete(key)) {
+            duplicates += 1;
+          }
+          loaded.set(key, stored(entry, line));
           continue;
         }
         const dead = tombstoneKey(entry);
         if (dead) {
-          // Drops the earlier copies the tombstone was written for.
-          loaded = loaded.filter(
-            (s) => s.entry.bankId !== dead.bankId || s.entry.documentId !== dead.documentId,
-          );
+          // Drops the earlier copy the tombstone was written for.
+          loaded.delete(queueKey(dead));
           tombstones += 1;
           continue;
         }
@@ -238,11 +259,11 @@ export class RetainQueue {
       }
       skipped += 1;
     }
-    this.stored = loaded;
+    this.stored = [...loaded.values()];
     if (skipped > 0) {
       this.logger.warn?.(`memory-hindsight: retain queue skipped ${skipped} unreadable line(s)`);
     }
-    if (this.prune(false) > 0 || skipped > 0 || tombstones > 0) {
+    if (this.prune(false) > 0 || skipped > 0 || tombstones > 0 || duplicates > 0) {
       try {
         this.persist();
       } catch (error) {
@@ -307,23 +328,59 @@ export class RetainQueue {
     } else {
       this.stored.push(next);
     }
+    let rewriteError: unknown;
     try {
-      if (this.prune(false) === 0 && index < 0 && existsSync(this.filePath)) {
+      if (
+        this.prune(false) === 0 &&
+        index < 0 &&
+        existsSync(this.filePath) &&
+        this.canAppend(next.size)
+      ) {
         this.append(next.line);
         return true;
       }
       this.persist();
+      // False when the bound dropped the item just added or replaced.
+      return this.stored.includes(next);
     } catch (error) {
-      // A queued copy of the same document is out of date now (the caller sends the newer one
-      // live), so it must not be replayed over it: not from memory, and not after a restart.
-      this.stored = index >= 0 ? before.filter((_, i) => i !== index) : before;
-      if (index >= 0) {
-        this.markStale(before[index]!.entry);
-      }
-      throw error;
+      rewriteError = error;
     }
-    // False when the bound dropped the item just added or replaced.
-    return this.stored.includes(next);
+    // The rewrite failed. load() keeps the newest copy per bank and document id, so appending the
+    // new copy also replaces an older one in the file; the byte check keeps the file bounded.
+    const kept = index >= 0 ? before.filter((_, i) => i !== index) : before;
+    // Memory becomes what load() gives for the file plus the appended text: the new copy after the
+    // older one, and a tombstone for every item the bounds drop, so no dropped line can come back
+    // on a restart (say, after a later tombstone brings the count under maxItems).
+    this.stored = [...kept, next];
+    this.prune(false);
+    const keepsNext = this.stored.includes(next);
+    const dead = kept.filter((s) => !this.stored.includes(s)).map((s) => s.entry);
+    if (!keepsNext && index >= 0) {
+      dead.push(before[index]!.entry);
+    }
+    const lines = dead.map((e) => tombstoneLine(e));
+    if (keepsNext) {
+      lines.push(next.line);
+    }
+    const text = lines.join("\n");
+    // One more byte for the trailing newline, as Stored.size counts it.
+    if (existsSync(this.filePath) && this.canAppend(Buffer.byteLength(text, "utf8") + 1)) {
+      try {
+        if (text) {
+          this.append(text);
+        }
+        return keepsNext;
+      } catch {
+        // Neither write worked; handled below.
+      }
+    }
+    // A queued copy of the same document is out of date now (the caller sends the newer one live),
+    // so it must not be replayed over it: not from memory, and not after a restart.
+    this.stored = kept;
+    if (index >= 0) {
+      this.markStale(before[index]!.entry);
+    }
+    throw rewriteError;
   }
 
   /**
@@ -389,11 +446,16 @@ export class RetainQueue {
     chmodSync(dir, 0o700);
   }
 
+  /** No append that would take the file past the size bound (one byte for a torn line's newline). */
+  private canAppend(size: number): boolean {
+    return this.fileBytes + size + 1 <= this.maxBytes();
+  }
+
   private append(line: string): void {
     // A torn last line (crash mid-append) must not swallow this item: start on a fresh line.
-    appendFileSync(this.filePath, `${endsWithNewline(this.filePath) ? "" : "\n"}${line}\n`, {
-      mode: 0o600,
-    });
+    const text = `${endsWithNewline(this.filePath) ? "" : "\n"}${line}\n`;
+    appendFileSync(this.filePath, text, { mode: 0o600 });
+    this.fileBytes += Buffer.byteLength(text, "utf8");
     try {
       chmodSync(this.filePath, 0o600);
     } catch {
@@ -407,9 +469,7 @@ export class RetainQueue {
    */
   private markStale(entry: QueuedRetain): void {
     try {
-      this.append(
-        JSON.stringify({ tombstone: { bankId: entry.bankId, documentId: entry.documentId } }),
-      );
+      this.append(tombstoneLine(entry));
     } catch (error) {
       this.logger.warn?.(
         `memory-hindsight: could not mark an out-of-date queued retain (${formatErrorMessage(error)}); a restart may replay it before the newer copy is written again`,
@@ -418,18 +478,26 @@ export class RetainQueue {
   }
 
   private persist(): void {
+    this.rewrite();
+    // Cleared only once written, so a failed replay save is retried by the next save().
     this.dirty = false;
+  }
+
+  private rewrite(): void {
     if (this.stored.length === 0) {
       rmSync(this.filePath, { force: true });
+      this.fileBytes = 0;
       this.dropWarned = false;
       return;
     }
     this.ensureDir();
     const tmp = `${this.filePath}.tmp`;
-    writeFileSync(tmp, `${this.stored.map((s) => s.line).join("\n")}\n`, { mode: 0o600 });
+    const text = `${this.stored.map((s) => s.line).join("\n")}\n`;
+    writeFileSync(tmp, text, { mode: 0o600 });
     // writeFileSync keeps the mode of an existing file; force it.
     chmodSync(tmp, 0o600);
     renameSync(tmp, this.filePath);
+    this.fileBytes = Buffer.byteLength(text, "utf8");
   }
 }
 

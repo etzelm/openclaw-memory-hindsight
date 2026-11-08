@@ -31,6 +31,8 @@ export type HindsightConfig = {
   retainQueueEnabled: boolean;
   retainQueueMaxItems: number;
   retainQueueMaxAgeMs: number;
+  /** Offer the read-only knowledge-base tools (tree, search, page). Off by default. */
+  knowledgeReadTools: boolean;
 };
 
 export const DEFAULT_RETAIN_QUEUE_MAX_ITEMS = 500;
@@ -73,6 +75,7 @@ const CONFIG_KEYS = [
   "retainQueueEnabled",
   "retainQueueMaxItems",
   "retainQueueMaxAgeMs",
+  "knowledgeReadTools",
 ] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -183,7 +186,9 @@ function normalizeApiUrl(raw: string | undefined): string {
       "hindsightApiUrl must not contain credentials (user:password@); use hindsightApiToken",
     );
   }
-  if (url.search || url.hash) {
+  // An empty query or fragment (a bare trailing `?` or `#`) leaves search/hash empty but stays
+  // in href; `?` and `#` cannot appear in an http(s) href except as those delimiters.
+  if (/[?#]/.test(url.href)) {
     throw new Error("hindsightApiUrl must not contain a query string or fragment");
   }
   return raw.replace(/\/+$/, "");
@@ -277,6 +282,7 @@ export const hindsightConfigSchema = {
         "retainQueueMaxAgeMs",
         DEFAULT_RETAIN_QUEUE_MAX_AGE_MS,
       ),
+      knowledgeReadTools: readBool(value, "knowledgeReadTools", false),
     };
   },
 };

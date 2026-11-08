@@ -15,7 +15,7 @@ body:
     attributes:
       label: Summary
       description: One sentence on what is broken.
-      placeholder: Auto-recall adds no memories on owner direct chats after upgrading to 0.2.0.
+      placeholder: Auto-recall adds no memories on owner direct chats after upgrading to 0.3.0.
     validations:
       required: true
   - type: textarea
@@ -48,7 +48,7 @@ body:
     attributes:
       label: Plugin version
       description: From `openclaw plugins list --verbose` or your package manager.
-      placeholder: 0.2.0
+      placeholder: 0.3.0
     validations:
       required: true
   - type: input

@@ -133,6 +133,19 @@ if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
 fi
 CLAUDE_PROJ_ROOT=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects
 CLAUDE_SNAP=0; CLAUDE_PRE=""
+# claude_ls: names of the entries directly under the projects dir, one per line, sorted.
+claude_ls() {
+  [ -d "$CLAUDE_PROJ_ROOT" ] || return 0
+  (cd "$CLAUDE_PROJ_ROOT" && for n in * .[!.]* ..?*; do
+    if [ -e "$n" ] || [ -L "$n" ]; then printf '%s\n' "$n"; fi
+  done) | LC_ALL=C sort
+}
+# Start-of-run listing of the projects dir, kept in memory only, and a marker file for its
+# time. Cleanup searches every entry that appears during the run, and every file modified after
+# the marker in an entry that was already there, for this run's code word, whatever its name.
+CLAUDE_ALL_PRE=$(claude_ls)
+CLAUDE_MARK=$OUT/.claude-start
+: > "$CLAUDE_MARK"
 CHECKS=$OUT/checks.tsv
 : > "$CHECKS"
 TOKF=$L/hs-token; HDR=$L/hs-auth.hdr; ANTHF=$L/anthropic-key
@@ -267,18 +280,41 @@ $(claude_proj_dirs)
 EOF
   CLAUDE_SNAP=1
 }
-# claude_traces: report only, never deletes. Files under any hs-live-proof project dir, or under
-# this run's candidates, that hold the code word or this run's workspace path (the CLI writes the
-# cwd into every transcript line). Catches a dir the CLI named some other way.
+# claude_new: entries under the projects dir that were not there at the start of the run, as
+# paths, one per line. Includes this run's candidates when they are still there.
+claude_new() {
+  claude_ls | LC_ALL=C comm -13 <(printf '%s\n' "$CLAUDE_ALL_PRE") - | while IFS= read -r n; do
+    [ -n "$n" ] && printf '%s\n' "$CLAUDE_PROJ_ROOT/$n"
+  done
+}
+# claude_unpredicted: new entries that are not one of this run's candidates. Report only: they
+# may belong to another Claude Code session on the machine, so they are never deleted.
+claude_unpredicted() {
+  claude_new | LC_ALL=C comm -23 - <(claude_proj_dirs | LC_ALL=C sort)
+}
+# claude_traces: report only, never deletes. Files that hold the code word or this run's
+# workspace path (the CLI writes the cwd into every transcript line): any file under an
+# hs-live-proof project dir, this run's candidates or an entry new since the start of the run,
+# and any file under the projects dir modified after the start marker. Symlinks are never
+# followed (one could point outside projects/). Catches a dir the CLI named some other way, new
+# or not.
 claude_traces() {
   local d
   {
-    for d in "$CLAUDE_PROJ_ROOT"/*hs-live-proof*; do [ -e "$d" ] && printf '%s\n' "$d"; done
-    claude_proj_dirs
-  } | sort -u | while IFS= read -r d; do
-    [ -e "$d" ] || continue
-    grep -r -l -F -e "$CODE" -e "$L_REAL/workspace" -e "$L/workspace" -- "$d" 2>/dev/null
-  done | sort -u
+    {
+      for d in "$CLAUDE_PROJ_ROOT"/*hs-live-proof*; do [ -e "$d" ] && printf '%s\n' "$d"; done
+      claude_proj_dirs
+      claude_new
+    } | sort -u | while IFS= read -r d; do
+      # A symlink could point outside projects/: never follow it.
+      { [ -e "$d" ] && [ ! -L "$d" ]; } || continue
+      grep -r -l -F -e "$CODE" -e "$L_REAL/workspace" -e "$L/workspace" -- "$d" 2>/dev/null
+    done
+    if [ -f "$CLAUDE_MARK" ] && [ -d "$CLAUDE_PROJ_ROOT" ]; then
+      find "$CLAUDE_PROJ_ROOT" -type f -newer "$CLAUDE_MARK" \
+        -exec grep -l -F -e "$CODE" -e "$L_REAL/workspace" -e "$L/workspace" -- {} + 2>/dev/null
+    fi
+  } | sort -u
 }
 cleanup() {
   local st=$?
@@ -328,7 +364,9 @@ EOF
   fi
   row X1 "proof banks $BANK* deleted" deleted "$banks_left" "$([ "$banks_left" = deleted ] && echo PASS || echo FAIL)"
   traces=$(claude_traces)
-  local x2obs x2ok=1
+  local x2obs x2ok=1 unpred
+  unpred=$(claude_unpredicted)
+  rm -f "$CLAUDE_MARK"
   x2obs="$state_left; claude project dir $claude_left"
   [ "$state_left" = removed ] || x2ok=0
   case "$claude_left" in present|kept) x2ok=0 ;; esac
@@ -337,6 +375,9 @@ EOF
   fi
   if [ -n "$traces" ]; then
     x2ok=0; x2obs="$x2obs; run traces under the claude projects dir: $(printf '%s\n' "$traces" | head -3 | tr '\n' ' ')"
+  fi
+  if [ -n "$unpred" ]; then
+    x2obs="$x2obs; new claude project dirs this run did not predict, left alone: $(printf '%s\n' "$unpred" | wc -l | tr -d ' ')"
   fi
   [ -n "$HOST_DIR" ] && x2obs="$x2obs; host dir kept for the caller"
   row X2 "scratch state removed" removed "$(printf '%s' "$x2obs" | redact)" "$([ "$x2ok" = 1 ] && echo PASS || echo FAIL)"

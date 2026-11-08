@@ -1,7 +1,15 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import memoryPlugin, { PLUGIN_ID, readPluginConfigEntry, sessionKeyDigest } from "./index.js";
@@ -390,6 +398,175 @@ describe("auto-retain", () => {
   });
 });
 
+/** The auto-retain items posted, in order. */
+const retained = (requests: RecordedRequest[]) =>
+  requests
+    .filter((r) => r.method === "POST" && r.url.endsWith("/memories"))
+    .map((r) => {
+      const item = (r.body as { items: Array<Record<string, any>> }).items[0]!;
+      return {
+        documentId: item.document_id as string,
+        updateMode: item.update_mode as string,
+        tags: item.tags as string[] | undefined,
+        texts: JSON.parse(item.content).map((m: { content: string }) => m.content) as string[],
+      };
+    });
+
+describe("auto-retain across one run's agent_end calls", () => {
+  const SESSION = "agent:dev:main";
+  const ctxFor = (runId: string, extra: Record<string, unknown> = {}) => ({
+    agentId: "dev",
+    sessionKey: SESSION,
+    memoryAudience: OWNER,
+    runId,
+    ...extra,
+  });
+  const prior = [
+    { role: "user", content: "older" },
+    { role: "assistant", content: "older reply" },
+  ];
+  const ask = { role: "user", content: "the code word is heron" };
+  const reply = { role: "assistant", content: "noted: heron" };
+  const resume =
+    "Continue the current task from the existing transcript, preserving completed work.";
+  const resumed = { role: "assistant", content: "nothing left to do" };
+  const firstAttempt = async (hook: (name: string) => AnyFn | undefined, runId = "run-1") => {
+    await hook("before_prompt_build")!(
+      {
+        prompt: ask.content,
+        currentUserMessage: ask.content,
+        messages: [...prior, ask],
+      },
+      ctxFor(runId),
+    );
+    await hook("agent_end")!(
+      { success: true, runId, messages: [...prior, ask, reply] },
+      ctxFor(runId),
+    );
+  };
+
+  it("re-sends the whole run when the host continues it after a retry", async () => {
+    const { fake, hook } = setup({ retainTags: ["source:openclaw"] });
+    await firstAttempt(hook);
+    // The host's in-run continuation: same runId, a synthetic prompt, a second agent_end.
+    await hook("before_prompt_build")(
+      {
+        prompt: resume,
+        currentUserMessage: resume,
+        messages: [...prior, ask, reply],
+      },
+      ctxFor("run-1"),
+    );
+    await hook("agent_end")(
+      {
+        success: true,
+        runId: "run-1",
+        messages: [...prior, ask, reply, { role: "user", content: resume }, resumed],
+      },
+      ctxFor("run-1"),
+    );
+    const [first, second] = retained(fake.requests);
+    expect(first!.texts).toEqual([ask.content, reply.content]);
+    expect(second!.documentId).toBe(first!.documentId);
+    expect(second!.updateMode).toBe("replace");
+    expect(second!.tags).toEqual(["source:openclaw"]);
+    expect(second!.texts.slice(0, 2)).toEqual([ask.content, reply.content]);
+    expect(second!.texts).toContain(resumed.content);
+    expect(second!.texts).not.toContain("older");
+  });
+
+  it("sends identical content for a re-delivered agent_end", async () => {
+    const { fake, hook } = setup();
+    await firstAttempt(hook);
+    await hook("agent_end")(
+      { success: true, runId: "run-1", messages: [...prior, ask, reply] },
+      ctxFor("run-1"),
+    );
+    const [first, second] = retained(fake.requests);
+    expect(second).toEqual(first);
+    expect(first!.texts).toEqual([ask.content, reply.content]);
+  });
+
+  it("starts a new run fresh", async () => {
+    const { fake, hook } = setup();
+    await firstAttempt(hook);
+    const next = { role: "user", content: "what was the code word?" };
+    const answer = { role: "assistant", content: "heron" };
+    await hook("before_prompt_build")(
+      {
+        prompt: next.content,
+        currentUserMessage: next.content,
+        messages: [...prior, ask, reply, next],
+      },
+      ctxFor("run-2"),
+    );
+    await hook("agent_end")(
+      {
+        success: true,
+        runId: "run-2",
+        messages: [...prior, ask, reply, next, answer],
+      },
+      ctxFor("run-2"),
+    );
+    const [, second] = retained(fake.requests);
+    expect(second!.documentId).toMatch(/:run:run-2$/);
+    expect(second!.texts).toEqual([next.content, answer.content]);
+  });
+
+  it("keeps the run start across a maintenance turn in the same session", async () => {
+    const { fake, hook } = setup();
+    await firstAttempt(hook);
+    const flush = ctxFor("flush-1", { trigger: "memory" });
+    await hook("before_prompt_build")(
+      {
+        prompt: "flush",
+        messages: [...prior, ask, reply, { role: "user", content: "flush" }],
+      },
+      flush,
+    );
+    await hook("agent_end")({ success: true, runId: "flush-1", messages: [ask] }, flush);
+    await hook("before_prompt_build")(
+      {
+        prompt: resume,
+        currentUserMessage: resume,
+        messages: [...prior, ask, reply],
+      },
+      ctxFor("run-1"),
+    );
+    await hook("agent_end")(
+      {
+        success: true,
+        runId: "run-1",
+        messages: [...prior, ask, reply, { role: "user", content: resume }, resumed],
+      },
+      ctxFor("run-1"),
+    );
+    const posts = retained(fake.requests);
+    expect(posts).toHaveLength(2);
+    expect(posts[1]!.texts.slice(0, 2)).toEqual([ask.content, reply.content]);
+  });
+
+  it("drops the run start when the session ends", async () => {
+    const { fake, hook } = setup();
+    await firstAttempt(hook);
+    await hook("session_end")(
+      { sessionId: "s1", messageCount: 3, reason: "reset" },
+      ctxFor("run-1"),
+    );
+    // Without a marker, agent_end falls back to the last user message.
+    await hook("agent_end")(
+      {
+        success: true,
+        runId: "run-1",
+        messages: [...prior, ask, reply, { role: "user", content: "later ask" }, resumed],
+      },
+      ctxFor("run-1"),
+    );
+    const [, second] = retained(fake.requests);
+    expect(second!.texts).toEqual(["later ask", resumed.content]);
+  });
+});
+
 describe("document ids", () => {
   it("keeps session keys that sanitize alike apart with a short hash of the raw key", () => {
     expect(sessionKeyDigest("a b")).not.toBe(sessionKeyDigest("a/b"));
@@ -473,6 +650,9 @@ describe("service start warnings", () => {
   });
 });
 
+const logs = (api: OpenClawPluginApi, level: "warn" | "debug") =>
+  (api.logger[level] as ReturnType<typeof vi.fn<AnyFn>>).mock.calls.map(([m]) => String(m));
+
 describe("auto-recall on a bank that does not exist yet", () => {
   const ctx = {
     agentId: "fresh",
@@ -483,9 +663,6 @@ describe("auto-recall on a bank that does not exist yet", () => {
     },
   };
   const event = { prompt: "where does hindsight run?", messages: [] };
-  const logs = (api: OpenClawPluginApi, level: "warn" | "debug") =>
-    (api.logger[level] as ReturnType<typeof vi.fn<AnyFn>>).mock.calls.map(([m]) => String(m));
-
   it("treats Hindsight's bank-not-found 404 as no memories: no warning, a debug line", async () => {
     const { api, fake, hook } = setup();
     fake.fetch.mockResolvedValueOnce(
@@ -648,6 +825,15 @@ async function forgetQueuesInMemory() {
   mod.resetSharedRetainQueues();
 }
 
+/** One queue file line for bank `dev`, as an earlier run wrote it. */
+const queueLine = (documentId: string, content: string) =>
+  JSON.stringify({
+    bankId: "dev",
+    documentId,
+    item: { content, document_id: documentId },
+    queuedAt: Date.now(),
+  });
+
 const doc = (id: string) => ({ content: `text ${id}`, document_id: id });
 
 function turn(runId: string, memoryAudience: unknown = OWNER, agentId = "dev") {
@@ -786,6 +972,69 @@ describe("offline retain queue", () => {
     );
     second.stop();
     expect(queuedItems(stateDir).map((i) => i.documentId)).toEqual(["B", "A", "C"]);
+  });
+
+  it("replays one copy per document, as a replace of that document id, after a crash", async () => {
+    const stateDir = newStateDir();
+    // A crash between replay's batched saves left a delivered copy of A before a newer one.
+    mkdirSync(dirname(queueFile(stateDir)), { recursive: true });
+    writeFileSync(
+      queueFile(stateDir),
+      `${[queueLine("A", "old A"), queueLine("B", "text B"), queueLine("A", "new A")].join("\n")}\n`,
+    );
+    const requests: RecordedRequest[] = [];
+    const fetch = vi.fn<AnyFn>(async (url: string, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      requests.push({ method: init?.method ?? "GET", url, body });
+      return new Response("{}", { status: 200 });
+    });
+    const { service } = createTestService(fetch);
+    service.startRetainQueue(stateDir);
+    await service.retainQueue()!.flush();
+    const items = requests
+      .filter((r) => r.method === "POST" && r.url.endsWith("/memories"))
+      .map((r) => (r.body as { items: Array<Record<string, unknown>> }).items[0]!);
+    expect(items.map((i) => [i.document_id, i.content, i.update_mode])).toEqual([
+      ["B", "text B", "replace"],
+      ["A", "new A", "replace"],
+    ]);
+    expect(existsSync(queueFile(stateDir))).toBe(false);
+    service.stop();
+  });
+
+  it("keeps a re-sent retain queued while Hindsight is down and the file cannot be rewritten", async () => {
+    const stateDir = newStateDir();
+    const down = vi.fn<AnyFn>(async () => {
+      throw new TypeError("fetch failed");
+    });
+    const { service } = createTestService(down);
+    service.startRetainQueue(stateDir);
+    const file = queueFile(stateDir);
+    await expect(service.retainOrQueue("dev", doc("A"), AbortSignal.timeout(60_000))).resolves.toBe(
+      "queued",
+    );
+    await service.retainQueue()!.flush();
+    // A directory at the temp path makes every rewrite fail (EISDIR, for root too).
+    mkdirSync(`${file}.tmp`);
+    try {
+      for (const content of ["second", "third"]) {
+        await expect(
+          service.retainOrQueue("dev", { content, document_id: "A" }, AbortSignal.timeout(60_000)),
+        ).resolves.toBe("queued");
+      }
+    } finally {
+      rmSync(`${file}.tmp`, { recursive: true, force: true });
+    }
+    service.stop();
+    const { RetainQueue } = await import("./retain-queue.js");
+    const restarted = new RetainQueue({
+      filePath: file,
+      limits: () => ({ maxItems: 100, maxAgeMs: 60_000 }),
+      logger: {},
+    });
+    restarted.load();
+    expect(restarted.list()).toEqual([{ bankId: "dev", documentId: "A" }]);
+    expect(restarted.peek()?.item.content).toBe("third");
   });
 
   it("sends a retain live when queueing it behind its bank fails (disk error)", async () => {
