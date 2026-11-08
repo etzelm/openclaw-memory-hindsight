@@ -8,6 +8,7 @@ import {
 } from "openclaw/plugin-sdk/plugin-entry";
 import { isIncognitoSessionKey } from "openclaw/plugin-sdk/routing";
 import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isBankNotFound } from "./client.js";
 import {
   type HindsightConfig,
   hasUnresolvedToken,
@@ -25,7 +26,7 @@ import {
   RECALL_TOOL_NAMES,
 } from "./memory-capability.js";
 import { createHindsightProviderRuntime } from "./provider-runtime.js";
-import { routeAudience, sessionUsesMemory } from "./routing.js";
+import { isMaintenanceTurn, routeAudience, sessionUsesMemory } from "./routing.js";
 import { type MemoryPluginCapability, resolveLearnRegistrar } from "./sdk-types.js";
 import { createHindsightService } from "./service.js";
 import {
@@ -180,6 +181,7 @@ export default definePluginEntry({
         service.stopped() ||
         !config.autoRecall ||
         config.memoryMode === "tools" ||
+        isMaintenanceTurn({ trigger: ctx.trigger, sessionKey }) ||
         isIncognitoSessionKey(sessionKey) ||
         !sessionUsesMemory(config, {
           sessionKey,
@@ -219,6 +221,11 @@ export default definePluginEntry({
           prependContext: buildRecallContext(results, config.recallPromptPreamble),
         };
       } catch (error) {
+        if (isBankNotFound(error)) {
+          // Nothing was retained to this bank yet: no memories, not a failure.
+          api.logger.debug?.("memory-hindsight: auto-recall found no bank yet");
+          return undefined;
+        }
         api.logger.warn?.(`memory-hindsight: auto-recall skipped: ${formatErrorMessage(error)}`);
         return undefined;
       }
@@ -238,6 +245,7 @@ export default definePluginEntry({
         !event.success ||
         !Array.isArray(event.messages) ||
         event.messages.length === 0 ||
+        isMaintenanceTurn({ trigger: ctx.trigger, sessionKey }) ||
         isIncognitoSessionKey(sessionKey) ||
         !sessionUsesMemory(config, {
           sessionKey,
@@ -258,7 +266,7 @@ export default definePluginEntry({
       if (!retention || isEphemeralOperationalText(retention.transcript)) {
         return;
       }
-      const { tags } = retention;
+      const tags = [...new Set([...config.retainTags, ...retention.tags])];
       // One document per run: a re-delivered agent_end for the same run replaces, not duplicates.
       const runPart = sanitizeDocumentIdPart(event.runId ?? ctx.runId, `${Date.now()}`);
       const documentId = `openclaw:${sanitizeDocumentIdPart(sessionKey, "session")}-${sessionKeyDigest(sessionKey)}:run:${runPart}`;
@@ -270,8 +278,7 @@ export default definePluginEntry({
         // The audience was current when the run produced these messages, and the bank comes
         // from that host-minted audience, so the write stays in the right partition.
         const signal = AbortSignal.timeout(RETAIN_TIMEOUT_MS);
-        await service.ensureBank(route.bankId, signal);
-        await service.client.retain(
+        const outcome = await service.retainOrQueue(
           route.bankId,
           {
             content: retention.transcript,
@@ -291,10 +298,10 @@ export default definePluginEntry({
               ...(ctx.channelId ? { channel_id: ctx.channelId } : {}),
             },
           },
-          { signal },
+          signal,
         );
         api.logger.debug?.(
-          `memory-hindsight: retained ${retention.messageCount} messages (${route.audience.kind})`,
+          `memory-hindsight: ${outcome === "sent" ? "retained" : "queued"} ${retention.messageCount} messages (${route.audience.kind})`,
         );
       } catch (error) {
         api.logger.warn?.(`memory-hindsight: auto-retain failed: ${formatErrorMessage(error)}`);
@@ -314,8 +321,9 @@ export default definePluginEntry({
 
     api.registerService({
       id: PLUGIN_ID,
-      start: () => {
+      start: (ctx?: { stateDir?: string }) => {
         service.start();
+        service.startRetainQueue(ctx?.stateDir);
         const raw =
           readPluginConfigEntry(api.runtime?.config?.current?.(), PLUGIN_ID) ?? api.pluginConfig;
         const config = currentConfig();

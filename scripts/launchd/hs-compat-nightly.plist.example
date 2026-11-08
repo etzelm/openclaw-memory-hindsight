@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Nightly compatibility matrix for @etzelm/openclaw-memory-hindsight (see docs/compat-matrix.md).
+  A per-user LaunchAgent: install it for the account that owns the Hindsight token and the
+  claude CLI login. Replace every __PLACEHOLDER__ before loading.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.etzelm.hs-compat-nightly</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__HOME__/Library/Application Support/hs-compat/compat-nightly.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__NODE_BIN__:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>HS_COMPAT_REPO</key>
+    <string>__REPO_URL__</string>
+    <key>HS_COMPAT_REF</key>
+    <string>develop</string>
+    <key>HS_COMPAT_RESULTS</key>
+    <string>__RESULTS_DEST__</string>
+    <key>HS_COMPAT_ARGS</key>
+    <string>--token-env-file __HINDSIGHT_ENV_FILE__ --anthropic-env-file __ANTHROPIC_ENV_FILE__</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/hs-compat-nightly.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/hs-compat-nightly.log</string>
+</dict>
+</plist>

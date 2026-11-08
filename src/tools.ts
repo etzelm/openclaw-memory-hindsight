@@ -121,16 +121,14 @@ export function createRetainTool(
     async execute(_toolCallId, rawParams, signal) {
       const params = asOptionalRecord(rawParams) ?? {};
       const content = requiredString(params, "content");
-      const tags = Array.isArray(params.tags)
-        ? [
-            ...new Set(
-              params.tags
-                .filter((tag): tag is string => typeof tag === "string")
-                .map((tag) => tag.trim())
-                .filter(Boolean),
-            ),
-          ]
+      const callTags = Array.isArray(params.tags)
+        ? params.tags.filter((tag): tag is string => typeof tag === "string")
         : [];
+      const tags = [
+        ...new Set(
+          [...service.config().retainTags, ...callTags].map((tag) => tag.trim()).filter(Boolean),
+        ),
+      ];
       const occurredAt = typeof params.occurred_at === "string" ? params.occurred_at.trim() : "";
       const flushId = ctx.memoryFlush?.flushId;
       if (flushId && !deduper.claim(flushId, bank.bankId, content)) {

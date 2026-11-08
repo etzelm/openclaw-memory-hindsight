@@ -1,0 +1,304 @@
+# Release on a vX.Y.Z tag: run the CI gates, pack once, then publish that exact
+# tarball to npm (trusted publishing, provenance), to ClawHub, and to a GitHub
+# release with its sha256. Setup and steps: RELEASING.md.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PACKAGE_NAME: "@etzelm/openclaw-memory-hindsight"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Tag matches package.json version
+        id: version
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::package.json version '$version' is not X.Y.Z"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Tagged commit is on main
+        run: |
+          git fetch --no-tags --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::$GITHUB_SHA is not on main"
+            exit 1
+          fi
+
+      - run: node --version && npm --version
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - run: npm run lint
+      - run: npm run format:check
+      - run: node --test scripts/pack-guard.test.mjs
+
+      # dist/ is already built above, so lifecycle scripts are skipped.
+      - name: Pack and guard
+        id: pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          npm pack --json --ignore-scripts --pack-destination "$RUNNER_TEMP/out" > "$RUNNER_TEMP/pack.json"
+          node scripts/pack-guard.mjs "$RUNNER_TEMP/pack.json"
+          tarball="$(node -p 'require(process.argv[1])[0].filename' "$RUNNER_TEMP/pack.json")"
+          cd "$RUNNER_TEMP/out"
+          sha256sum "$tarball" > "$tarball.sha256"
+          cat "$tarball.sha256"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 "$tarball.sha256")" >> "$GITHUB_OUTPUT"
+
+      # Find a ClawHub rejection before the irreversible npm publish. A dry run
+      # needs no token and uploads nothing.
+      - name: ClawHub dry run
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          CLAWHUB_VERSION: "0.25.1"
+          CLAWHUB_DISABLE_TELEMETRY: "1"
+        run: |
+          npm install --global --no-audit --no-fund --ignore-scripts \
+            --prefix "$RUNNER_TEMP/clawhub-cli" "clawhub@$CLAWHUB_VERSION"
+          export CLAWHUB_CONFIG_PATH="$RUNNER_TEMP/clawhub-dry/config.json"
+          "$RUNNER_TEMP/clawhub-cli/bin/clawhub" --no-input package publish "$RUNNER_TEMP/out/$TARBALL" \
+            --family code-plugin \
+            --owner etzelm \
+            --source-repo "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF_NAME" \
+            --dry-run
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package
+          path: |
+            ${{ runner.temp }}/out/*.tgz
+            ${{ runner.temp }}/out/*.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  npm:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      id-token: write
+    env:
+      TARBALL: ${{ needs.build.outputs.tarball }}
+      VERSION: ${{ needs.build.outputs.version }}
+      SHA256: ${{ needs.build.outputs.sha256 }}
+    steps:
+      # registry-url as in npm's trusted publishing example; the token comes
+      # from the OIDC exchange, not from NODE_AUTH_TOKEN.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package
+          path: pkg
+
+      # Check against the build job output, not the file shipped in the artifact.
+      - name: Verify tarball checksum
+        working-directory: pkg
+        run: echo "$SHA256  $TARBALL" | sha256sum -c -
+
+      # Trusted publishing (OIDC) needs npm 11.5.1 or newer.
+      - name: npm version supports trusted publishing
+        run: |
+          v="$(npm --version)"
+          if [ "$(printf '%s\n11.5.1\n' "$v" | sort -V | head -1)" != "11.5.1" ]; then
+            echo "::error::npm $v is older than 11.5.1"
+            exit 1
+          fi
+
+      # A rerun after a later job failed must not fail here: skip when the same
+      # bytes are already on npm, fail when a different tarball holds the version.
+      - name: Publish to npm with provenance
+        working-directory: pkg
+        run: |
+          local_integrity="sha512-$(openssl dgst -sha512 -binary "$TARBALL" | base64 -w0)"
+          remote_integrity="$(npm view "$PACKAGE_NAME@$VERSION" dist.integrity 2>/dev/null || true)"
+          if [ -n "$remote_integrity" ]; then
+            if [ "$remote_integrity" = "$local_integrity" ]; then
+              echo "$PACKAGE_NAME@$VERSION is already on npm with the same bytes; skipping"
+              exit 0
+            fi
+            echo "::error::$PACKAGE_NAME@$VERSION is already on npm with different bytes"
+            exit 1
+          fi
+          npm publish "./$TARBALL" --provenance --access public --ignore-scripts
+
+  clawhub:
+    needs: [build, npm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment: release
+    permissions: {}
+    env:
+      TARBALL: ${{ needs.build.outputs.tarball }}
+      VERSION: ${{ needs.build.outputs.version }}
+      SHA256: ${{ needs.build.outputs.sha256 }}
+      CLAWHUB_VERSION: "0.25.1"
+      CLAWHUB_DISABLE_TELEMETRY: "1"
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package
+          path: pkg
+
+      # Check against the build job output, not the file shipped in the artifact.
+      - name: Verify tarball checksum
+        working-directory: pkg
+        run: echo "$SHA256  $TARBALL" | sha256sum -c -
+
+      - name: Install ClawHub CLI
+        run: |
+          npm install --global --no-audit --no-fund --ignore-scripts \
+            --prefix "$RUNNER_TEMP/clawhub-cli" "clawhub@$CLAWHUB_VERSION"
+          echo "$RUNNER_TEMP/clawhub-cli/bin" >> "$GITHUB_PATH"
+          echo "CLAWHUB_CONFIG_PATH=$RUNNER_TEMP/clawhub/config.json" >> "$GITHUB_ENV"
+
+      - name: Log in to ClawHub
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          if [ -z "$CLAWHUB_TOKEN" ]; then
+            echo "::error::CLAWHUB_TOKEN is not set in the release environment"
+            exit 1
+          fi
+          mkdir -p "$(dirname "$CLAWHUB_CONFIG_PATH")"
+          # The CLI takes the token only as an argument. Actions masks it in logs
+          # and the runner is discarded after the job.
+          clawhub --no-input login --token "$CLAWHUB_TOKEN" > /dev/null
+          clawhub --no-input whoami
+
+      # Same rerun rule as npm: skip when ClawHub already holds these bytes.
+      # Fail closed: only a clean "not found" lets the publish go ahead.
+      - name: Publish to ClawHub
+        working-directory: pkg
+        run: |
+          inspect_out="$RUNNER_TEMP/inspect.out"
+          inspect_err="$RUNNER_TEMP/inspect.err"
+          if clawhub --no-input package inspect "$PACKAGE_NAME" --version "$VERSION" --json > "$inspect_out" 2> "$inspect_err"; then
+            remote_sha="$(node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(j.version?.artifact?.sha256??"")}catch{}' "$inspect_out")"
+            if [ -z "$remote_sha" ]; then
+              echo "::error::$PACKAGE_NAME@$VERSION exists on ClawHub but inspect returned no artifact sha256; not publishing"
+              exit 1
+            fi
+            if [ "$remote_sha" = "$SHA256" ]; then
+              echo "$PACKAGE_NAME@$VERSION is already on ClawHub with the same bytes; skipping"
+              exit 0
+            fi
+            echo "::error::$PACKAGE_NAME@$VERSION is already on ClawHub with different bytes"
+            exit 1
+          fi
+          if ! grep -Eqi 'not found|404' "$inspect_err" "$inspect_out"; then
+            echo "::error::clawhub package inspect failed for a reason other than not found; not publishing"
+            cat "$inspect_err" "$inspect_out"
+            exit 1
+          fi
+          clawhub --no-input package publish "./$TARBALL" \
+            --family code-plugin \
+            --owner etzelm \
+            --source-repo "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF_NAME" \
+            --wait \
+            --json
+
+      - name: Remove ClawHub credentials
+        if: always()
+        run: |
+          if [ -n "${CLAWHUB_CONFIG_PATH:-}" ]; then
+            rm -rf "$(dirname "$CLAWHUB_CONFIG_PATH")"
+          fi
+
+  github-release:
+    needs: [build, npm, clawhub]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TARBALL: ${{ needs.build.outputs.tarball }}
+      VERSION: ${{ needs.build.outputs.version }}
+      SHA256: ${{ needs.build.outputs.sha256 }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package
+          path: pkg
+
+      # Check against the build job output, not the file shipped in the artifact.
+      - name: Verify tarball checksum
+        working-directory: pkg
+        run: echo "$SHA256  $TARBALL" | sha256sum -c -
+
+      - name: Create GitHub release
+        working-directory: pkg
+        run: |
+          # Rewrite the checksum file from the verified build output.
+          echo "$SHA256  $TARBALL" > "$TARBALL.sha256"
+          tar -xzf "$TARBALL" package/CHANGELOG.md
+          awk -v v="$VERSION" '
+            $0 ~ "^## " v "( |$)" { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' package/CHANGELOG.md > notes.md
+          {
+            echo
+            echo "npm: https://www.npmjs.com/package/$PACKAGE_NAME/v/$VERSION"
+            echo "ClawHub: clawhub:$PACKAGE_NAME@$VERSION"
+            echo
+            echo "sha256: \`$SHA256\`"
+          } >> notes.md
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$TARBALL" "$TARBALL.sha256" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$TARBALL" "$TARBALL.sha256" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$GITHUB_REF_NAME" --notes-file notes.md
+          fi

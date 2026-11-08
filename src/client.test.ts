@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HindsightClient } from "./client.js";
+import { HindsightClient, isBankMissingBody, isBankNotFound } from "./client.js";
 import { createFakeHindsight } from "./test-helpers.js";
 
 describe("HindsightClient bank urls", () => {
@@ -44,5 +44,44 @@ describe("HindsightClient bank urls", () => {
     for (const [, init] of fake.fetch.mock.calls) {
       expect(init?.redirect).toBe("error");
     }
+  });
+});
+
+describe("missing bank vs other 404s", () => {
+  const client = (status: number, body: string) =>
+    new HindsightClient({
+      resolveEndpoint: () => ({ apiUrl: "http://hindsight.test" }),
+      fetch: async () => new Response(body, { status }),
+    });
+  const recallError = (status: number, body: string) =>
+    client(status, body)
+      .recall("fresh", "q", { budget: "low" })
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+
+  it("reads Hindsight's bank-not-found body as a missing bank", async () => {
+    const error = await recallError(404, JSON.stringify({ detail: "Bank 'fresh' not found" }));
+    expect(isBankNotFound(error)).toBe(true);
+    // The body never reaches the message.
+    expect(String(error)).toBe("HindsightHttpError: Hindsight recall failed: HTTP 404");
+  });
+
+  it("does not read an unknown route, an HTML page or a 500 as a missing bank", async () => {
+    expect(isBankNotFound(await recallError(404, JSON.stringify({ detail: "Not Found" })))).toBe(
+      false,
+    );
+    expect(isBankNotFound(await recallError(404, "<html>404</html>"))).toBe(false);
+    expect(isBankNotFound(await recallError(500, ""))).toBe(false);
+  });
+
+  it("keeps an empty 404 body as a missing bank", () => {
+    expect(isBankMissingBody("")).toBe(true);
+  });
+
+  it("returns null from getMemory for a missing memory unit", async () => {
+    const body = JSON.stringify({ detail: "Memory unit 'm9' not found" });
+    await expect(client(404, body).getMemory("dev", "m9")).resolves.toBeNull();
   });
 });

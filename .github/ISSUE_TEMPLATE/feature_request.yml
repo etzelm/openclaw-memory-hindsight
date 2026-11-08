@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose a new capability or an improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Concrete use cases help most. If the gap is in OpenClaw itself (for example a missing
+        host seam), say so; the fix may belong upstream.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence on what you want.
+      placeholder: Port tool-call retention (retainToolCalls) from the vendor plugin.
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What you cannot do today, and why that matters.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: The behavior or config you would like.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, and why they fall short.
+  - type: dropdown
+    id: implementation_intent
+    attributes:
+      label: Do you plan to open a PR for this?
+      options:
+        - Yes, I plan to implement this myself
+        - Maybe, with guidance
+        - No, proposing the idea only
+    validations:
+      required: true

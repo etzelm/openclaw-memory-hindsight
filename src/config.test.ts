@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_RECALL_PROMPT_PREAMBLE,
@@ -171,6 +172,62 @@ describe("hindsightConfigSchema", () => {
   });
 });
 
+describe("retainTags", () => {
+  const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
+
+  it("defaults to no tags and keeps a trimmed, deduplicated list", () => {
+    expect(hindsightConfigSchema.parse(base).retainTags).toEqual([]);
+    expect(
+      hindsightConfigSchema.parse({
+        ...base,
+        retainTags: [" source:openclaw ", "source:openclaw", "", "team:ops"],
+      }).retainTags,
+    ).toEqual(["source:openclaw", "team:ops"]);
+  });
+
+  it("is declared in the manifest config schema", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ) as { configSchema: { properties: Record<string, unknown> } };
+    expect(manifest.configSchema.properties.retainTags).toEqual({
+      type: "array",
+      items: { type: "string" },
+    });
+  });
+
+  it("accepts a vendor config once the keys without an equivalent are removed", () => {
+    const vendor = {
+      hindsightApiUrl: "https://hindsight.example",
+      hindsightApiToken: { source: "file", provider: "hindsight", id: "value" },
+      skipOperationalSessions: true,
+      retainMission: "Extract durable facts.",
+      recallTypes: ["observation", "world", "experience"],
+      preferObservations: true,
+      agentBankMap: { troubleshooter: "main", "wb-dev": "wb", "wb-dev2": "wb", "wb-review": "wb" },
+      retainTags: ["source:openclaw"],
+      retainContext: "Transcript from OpenClaw.",
+    };
+    const dropped = {
+      debugPerfTiming: true,
+      dynamicBankGranularity: ["agent"],
+      retainToolCalls: false,
+    };
+    expect(() => hindsightConfigSchema.parse({ ...vendor, ...dropped })).toThrow(
+      /unknown keys: debugPerfTiming, dynamicBankGranularity, retainToolCalls/,
+    );
+    const cfg = hindsightConfigSchema.parse(vendor);
+    expect(cfg.retainTags).toEqual(["source:openclaw"]);
+    expect(cfg.agentBankMap).toEqual(vendor.agentBankMap);
+  });
+
+  it("rejects a value that is not an array of strings", () => {
+    expect(() => hindsightConfigSchema.parse({ ...base, retainTags: "source:openclaw" })).toThrow(
+      /retainTags must be an array of strings/,
+    );
+    expect(() => hindsightConfigSchema.parse({ ...base, retainTags: [1] })).toThrow(/retainTags/);
+  });
+});
+
 describe("agentBankMap", () => {
   it("parses the vendor-compatible map and rejects bad entries", () => {
     const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
@@ -186,6 +243,40 @@ describe("agentBankMap", () => {
     );
     expect(() => hindsightConfigSchema.parse({ ...base, agentBankMap: { dev: "" } })).toThrow(
       /agentBankMap/,
+    );
+  });
+});
+
+describe("retain queue config", () => {
+  it("defaults the offline retain queue on, bounded to 500 items and 7 days", () => {
+    const base = { hindsightApiUrl: "http://127.0.0.1:8888" };
+    expect(hindsightConfigSchema.parse(base)).toMatchObject({
+      retainQueueEnabled: true,
+      retainQueueMaxItems: 500,
+      retainQueueMaxAgeMs: 604_800_000,
+    });
+    expect(
+      hindsightConfigSchema.parse({
+        ...base,
+        retainQueueEnabled: false,
+        retainQueueMaxItems: 10,
+        retainQueueMaxAgeMs: 60_000,
+      }),
+    ).toMatchObject({
+      retainQueueEnabled: false,
+      retainQueueMaxItems: 10,
+      retainQueueMaxAgeMs: 60_000,
+    });
+    for (const bad of [0, -1, 1.5, "10", 10_001]) {
+      expect(() => hindsightConfigSchema.parse({ ...base, retainQueueMaxItems: bad })).toThrow(
+        /retainQueueMaxItems must be an integer/,
+      );
+    }
+    expect(() => hindsightConfigSchema.parse({ ...base, retainQueueMaxAgeMs: -1 })).toThrow(
+      /retainQueueMaxAgeMs must be an integer/,
+    );
+    expect(() => hindsightConfigSchema.parse({ ...base, retainQueueEnabled: "yes" })).toThrow(
+      /retainQueueEnabled must be a boolean/,
     );
   });
 });

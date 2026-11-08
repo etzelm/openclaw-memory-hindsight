@@ -1,0 +1,38 @@
+# Dependabot version updates. These pull requests open on the GitHub mirror and are ported into
+# GitLab develop like any outside pull request (see CONTRIBUTING.md).
+# Dependabot, not Renovate: native on GitHub, no app or token, updates SHA-pinned actions.
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    # Dependencies are pinned to exact versions; keep them exact.
+    versioning-strategy: increase
+    ignore:
+      # The openclaw dev dependency is the type baseline (openclaw.build.openclawVersion in
+      # package.json). It moves by hand together with the compat matrix, not by bot.
+      - dependency-name: openclaw
+    groups:
+      production:
+        dependency-type: production
+      development:
+        dependency-type: development
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5

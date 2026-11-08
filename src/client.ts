@@ -42,6 +42,10 @@ export class HindsightHttpError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    /** True only for Hindsight's "Bank '<id>' not found" 404, not for a route that does not exist. */
+    readonly bankMissing = false,
+    /** True only when the body said so; an empty 404 body sets `bankMissing` but not this. */
+    readonly bankMissingExplicit = false,
   ) {
     super(message);
     this.name = "HindsightHttpError";
@@ -49,7 +53,27 @@ export class HindsightHttpError extends Error {
 }
 
 export function isBankNotFound(error: unknown): boolean {
-  return error instanceof HindsightHttpError && error.status === 404;
+  return error instanceof HindsightHttpError && error.bankMissing;
+}
+
+/**
+ * Hindsight answers a missing bank with 404 `{"detail":"Bank '<id>' not found"}` and an unknown
+ * route (wrong hindsightApiUrl path, proxy prefix) with 404 `{"detail":"Not Found"}`. Only the
+ * first means "no memories yet"; the second stays a loud error. An empty 404 body counts as a
+ * missing bank, as before. The body is only inspected, never copied into the error.
+ */
+export function isBankMissingBody(text: string): boolean {
+  return !text.trim() || isExplicitBankMissingBody(text);
+}
+
+/** Only Hindsight's `Bank '<id>' not found` detail, without the empty-body fallback. */
+export function isExplicitBankMissingBody(text: string): boolean {
+  try {
+    const detail = (JSON.parse(text) as { detail?: unknown } | null)?.detail;
+    return typeof detail === "string" && /\bbank\b.*\bnot found\b/i.test(detail);
+  } catch {
+    return false;
+  }
 }
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -107,10 +131,15 @@ export class HindsightClient {
       ...(init.signal ? { signal: init.signal } : {}),
     });
     if (!response.ok) {
+      const body = response.status === 404 ? await response.text().catch(() => "") : "";
+      const bankMissing = response.status === 404 && isBankMissingBody(body);
+      const bankMissingExplicit = response.status === 404 && isExplicitBankMissingBody(body);
       // Server error bodies can echo request content; keep only the status in the message.
       throw new HindsightHttpError(
         `Hindsight ${operation} failed: HTTP ${response.status}`,
         response.status,
+        bankMissing,
+        bankMissingExplicit,
       );
     }
     const text = await response.text();
@@ -183,7 +212,8 @@ export class HindsightClient {
       );
       return typeof body.text === "string" ? { id: memoryId, text: body.text } : null;
     } catch (error) {
-      if (isBankNotFound(error)) {
+      // Any 404 here: "Bank '<id>' not found" and "Memory unit '<id>' not found" both mean absent.
+      if (error instanceof HindsightHttpError && error.status === 404) {
         return null;
       }
       throw error;

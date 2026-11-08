@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.2.0 (2026-11-07)
+
+### Upgrade notes
+
+- OpenClaw `>=2026.10.10` is now required (was `>=2026.10.1`). Upgrade OpenClaw first; older
+  hosts refuse the install. See Fixes below for why.
+- The offline retain queue is on by default (`retainQueueEnabled`). Auto-retains that fail
+  because Hindsight is unreachable are written to
+  `<state dir>/hindsight-native/retain-queue.jsonl` and sent later. The file holds conversation
+  text (mode 600). Set `retainQueueEnabled: false` to drop them as before.
+
+### Added
+
+- `retainTags`: tags added to every retained memory, with the same key and meaning as
+  `@vectorize-io/hindsight-openclaw`. They apply to auto-retain, `hindsight_retain` and the
+  pre-compaction flush, merged before inline `<retain_tags>` and per-call tags without
+  duplicates. A vendor config that sets it no longer fails with "unknown keys: retainTags".
+- `scripts/live-proof.sh` is now a reusable harness: `--openclaw` (npm version, git ref or
+  path), `--runtime embedded|claude-cli`, `--plugin` (checkout, tarball or install spec) and
+  `--phase`, with a PASS/FAIL/SKIP table and `results.json`. It replaces the earlier
+  single-host script.
+- `scripts/compat-matrix.sh` runs the harness for the minimum host version, the latest release
+  and `main` on both runtimes and writes `MATRIX.md`. A nightly launchd example is documented,
+  not installed.
+- Offline retain queue, on by default (`retainQueueEnabled`). An auto-retain that fails because
+  Hindsight is unreachable (network error, timeout, HTTP 5xx) is saved to
+  `<state dir>/hindsight-native/retain-queue.jsonl` (mode 600) and sent later, instead of being
+  dropped. A 4xx answer is still logged and dropped.
+- Each queued item keeps its bank and document id. Replay never routes it to another bank, and a
+  second retain of the same document replaces the queued copy. No URL or token is stored.
+- Replay runs at service start, on a backoff timer (30 s doubling to 15 min) and after the next
+  successful retain, oldest first, so each bank sees its writes in order.
+- `retainQueueMaxItems` (default 500), `retainQueueMaxAgeMs` (default 7 days) and a fixed 32 MiB
+  total (UTF-8 bytes) bound the queue. A single retain over the bound is not queued. Dropped
+  items log one warning until the queue drains.
+- Queued items keep the tags resolved when the run ended (`retainTags` plus inline
+  `<retain_tags>`). A queued retain whose bank no longer exists (Hindsight 404 `Bank not found`)
+  is dropped with a warning on replay, like other 4xx answers.
+- Replay drops an item only on a Hindsight HTTP 4xx about that item. A refused redirect, an
+  ambiguous 404, auth and rate-limit answers, a 4xx from bank setup and unexpected errors keep it
+  and back off. If a bank already has queued items and the queue file cannot be written, the
+  retain is sent live instead.
+
+### Fixes
+
+- A first recall on a bank nothing was retained to yet no longer logs a warning
+  (`auto-recall skipped: Hindsight recall failed: HTTP 404`). Hindsight's
+  `Bank '<id>' not found` 404 now reads as "no memories" in auto-recall, memory search and the
+  `hindsight_recall` / `hindsight_reflect` tools, with a debug line at most. A 404 from a route
+  that does not exist (wrong `hindsightApiUrl` path) and other HTTP errors stay loud.
+- No auto-recall and no auto-retain on host maintenance turns: the pre-compaction flush turn
+  (trigger `memory`) and Active Memory's recall child (`<session>:active-memory:<id>`). Before,
+  the flush turn recalled with the host's flush prompt as the query, and the recall child could
+  be retained as if it were a conversation. The `hindsight_*` tools stay available to both.
+- `openclaw.install.minHostVersion` and the `openclaw` peer dependency are now `>=2026.10.10`
+  (was `>=2026.10.1`). OpenClaw 2026.10.1 through 2026.10.9 give turns in a dashboard session
+  created by `sessions.create` no memory audience, so the plugin could not recall or retain
+  there. 2026.10.10 records those sessions as direct chats (openclaw#181359).
+
 ## 0.1.2 (2026-11-06)
 
 ### Security

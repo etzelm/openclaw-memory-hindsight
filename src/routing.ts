@@ -87,3 +87,20 @@ export function sessionUsesMemory(
   }
   return !(sessionKey && OPERATIONAL_SESSION_RE.test(sessionKey));
 }
+
+// Active Memory's blocking recall child: `<parent>:active-memory:<12 hex>` (as memory-core reads it).
+const ACTIVE_MEMORY_RECALL_SESSION_RE = /:active-memory:[a-f0-9]{12}$/i;
+
+/**
+ * Host maintenance turns that get no auto-recall and no auto-retain. The pre-compaction flush
+ * (trigger "memory") sends a fixed host prompt and saves through hindsight_retain; Active
+ * Memory's recall child sends a recall prompt and reads through hindsight_recall. Neither is a
+ * user turn, so recalling on its prompt or retaining its transcript only adds noise. The
+ * hindsight_* tools stay available to both.
+ */
+export function isMaintenanceTurn(params: { trigger?: string; sessionKey?: string }): boolean {
+  return (
+    params.trigger === "memory" ||
+    Boolean(params.sessionKey && ACTIVE_MEMORY_RECALL_SESSION_RE.test(params.sessionKey.trim()))
+  );
+}

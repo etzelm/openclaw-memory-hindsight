@@ -8,7 +8,9 @@ contracts instead of only hooking prompts:
 - **Provider runtime**: `memory.status`, `memory.search` (v2) and `memory.get` in the Gateway,
   CLI and Control UI read Hindsight through the host's audience-checked provider API.
 - **Auto-recall** before each prompt and **auto-retain** of each finished run (one document per
-  run, replaced on re-delivery).
+  run, replaced on re-delivery). Host maintenance turns (the pre-compaction flush and Active
+  Memory's recall child) get neither; they use the tools. A bank nothing was retained to yet
+  reads as "no memories", without a warning.
 - **Agent tools** `hindsight_retain`, `hindsight_recall`, `hindsight_reflect`.
 - **Recall tool declaration** (`recallToolNames`): Active Memory uses `hindsight_recall` and
   `hindsight_reflect` without a `toolsAllow` list.
@@ -31,7 +33,7 @@ It only imports `openclaw/plugin-sdk/*`. The single runtime dependency is `typeb
 
 ## Install
 
-Needs OpenClaw 2026.10.1 or newer and a reachable Hindsight API.
+Needs OpenClaw 2026.10.10 or newer and a reachable Hindsight API.
 
 From npm:
 
@@ -56,7 +58,7 @@ tarball and install that:
 git clone https://github.com/etzelm/openclaw-memory-hindsight.git
 cd openclaw-memory-hindsight
 npm ci && npm pack
-openclaw plugins install npm-pack:./etzelm-openclaw-memory-hindsight-0.1.1.tgz --force --accept-capabilities
+openclaw plugins install npm-pack:./etzelm-openclaw-memory-hindsight-0.2.0.tgz --force --accept-capabilities
 ```
 
 `--force` confirms the "outside ClawHub review" warning for a local archive. Every install asks for
@@ -101,22 +103,26 @@ tool conflict.
 
 ## Configuration
 
-| Key                         | Default           | Meaning                                                                                               |
-| --------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------- |
-| `hindsightApiUrl`           | required          | Base URL of the Hindsight API                                                                         |
-| `hindsightApiToken`         | none              | Bearer token; use a SecretRef                                                                         |
-| `memoryMode`                | `hybrid`          | `hybrid`: auto-recall and tools; `context`: auto-recall only, no tools, no flush; `tools`: tools only |
-| `autoRecall` / `autoRetain` | `true`            | Turn the hooks on or off                                                                              |
-| `recallBudget`              | `mid`             | Hindsight recall budget: `low`, `mid`, `high`                                                         |
-| `recallTypes`               | all               | Subset of `world`, `experience`, `observation`                                                        |
-| `preferObservations`        | Hindsight default | Prefer consolidated observations in recall                                                            |
-| `recallPromptPreamble`      | built in          | Text above the injected `<hindsight_memories>` block                                                  |
-| `retainMission`             | none              | Applied to each bank once before its first write                                                      |
-| `retainContext`             | built in          | Context string sent with each retain                                                                  |
-| `excludeProviders`          | `[]`              | Message providers that never recall or retain (for example `heartbeat`)                               |
-| `skipOperationalSessions`   | `true`            | Skip cron, heartbeat and subagent sessions                                                            |
-| `agentBankMap`              | `{}`              | Agent id to bank id, so several agents share one owner bank                                           |
-| `allowInsecureHttp`         | `false`           | Allow plain http to a non-loopback `hindsightApiUrl` (token and conversation text unencrypted)        |
+| Key                         | Default              | Meaning                                                                                               |
+| --------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------- |
+| `hindsightApiUrl`           | required             | Base URL of the Hindsight API                                                                         |
+| `hindsightApiToken`         | none                 | Bearer token; use a SecretRef                                                                         |
+| `memoryMode`                | `hybrid`             | `hybrid`: auto-recall and tools; `context`: auto-recall only, no tools, no flush; `tools`: tools only |
+| `autoRecall` / `autoRetain` | `true`               | Turn the hooks on or off                                                                              |
+| `recallBudget`              | `mid`                | Hindsight recall budget: `low`, `mid`, `high`                                                         |
+| `recallTypes`               | all                  | Subset of `world`, `experience`, `observation`                                                        |
+| `preferObservations`        | Hindsight default    | Prefer consolidated observations in recall                                                            |
+| `recallPromptPreamble`      | built in             | Text above the injected `<hindsight_memories>` block                                                  |
+| `retainMission`             | none                 | Applied to each bank once before its first write                                                      |
+| `retainContext`             | built in             | Context string sent with each retain                                                                  |
+| `retainTags`                | `[]`                 | Tags added to every retained memory (auto-retain, `hindsight_retain`, pre-compaction flush)           |
+| `excludeProviders`          | `[]`                 | Message providers that never recall or retain (for example `heartbeat`)                               |
+| `skipOperationalSessions`   | `true`               | Skip cron, heartbeat and subagent sessions                                                            |
+| `agentBankMap`              | `{}`                 | Agent id to bank id, so several agents share one owner bank                                           |
+| `allowInsecureHttp`         | `false`              | Allow plain http to a non-loopback `hindsightApiUrl` (token and conversation text unencrypted)        |
+| `retainQueueEnabled`        | `true`               | Queue auto-retains that fail because Hindsight is unreachable and send them later (see below)         |
+| `retainQueueMaxItems`       | `500`                | Most queued retains kept (1 to 10000); the oldest are dropped first                                   |
+| `retainQueueMaxAgeMs`       | `604800000` (7 days) | Queued retains older than this are dropped                                                            |
 
 Fixed values (not configurable): recall max tokens 1024, query cap 800 characters, recall
 timeout 10 s, retain and reflect timeout 30 s, memory get timeout 10 s (each combined with the
@@ -127,14 +133,67 @@ Config changes apply without a restart: the plugin re-reads its entry from the h
 config snapshot (`api.runtime.config.current()`), falling back to the register-time
 `api.pluginConfig`.
 
+### Offline retain queue
+
+When an auto-retain cannot reach Hindsight (network error, timeout or HTTP 5xx), the plugin
+writes it to `<state dir>/hindsight-native/retain-queue.jsonl` and logs one warning per failed
+retain. The state dir is the one the host passes to plugin services (`~/.openclaw` by default,
+or `OPENCLAW_STATE_DIR`). The file is mode 600 in a mode 700 directory, one JSON line per item.
+It holds the bank id, document id and the retain payload (transcript, context, tags, metadata),
+and never the API URL or token. The transcript is conversation text, so treat the file like
+session transcripts.
+
+- **Same bank, always.** Each item keeps the bank chosen from the run's memory audience when the
+  run ended. Replay writes to that bank only, even if `agentBankMap` changed in between. Items do
+  not record the server: if `hindsightApiUrl` points at another Hindsight by then, they go there
+  under the same bank id.
+- **No duplicates.** Each item keeps its document id and is sent with `update_mode: replace`. A
+  second retain of the same document replaces the queued copy, and a replay that the server had
+  already received overwrites instead of adding a document.
+- **Replay.** At service start, on a timer after a failure, and after the next successful retain.
+  The first retry comes 30 s after a failed pass, and the wait doubles after each further failed
+  pass (a turn for a bank with queued items also starts a pass), up to 15 min. Items go out oldest
+  first and a pass stops at the first item it cannot deliver, so each bank sees its writes in order.
+  While a bank has queued items, a new retain for that bank queues behind them. Two retains for one
+  bank that are in flight at the same moment can still land out of order if the earlier one fails
+  and is queued.
+- **Not queued.** A 4xx answer (bad request, unknown bank, auth) and a refused redirect are logged
+  and dropped as before. On replay, only a Hindsight HTTP 4xx about the item drops it, with a
+  warning: any 4xx except 401, 403, 429 and an ambiguous 404 (a wrong `hindsightApiUrl` path, an
+  HTML or empty body). Hindsight creates a bank on its first retain, so its explicit `Bank '<id>'
+  not found` 404 is about the item and drops it. Everything else keeps the item, ends the pass and
+  backs off: network errors, timeouts, 5xx, 401, 403, 429, an ambiguous 404, a 4xx from bank setup
+  (applying `retainMission`), a refused redirect and any unexpected error. Kept items hold back
+  items for other banks until the next attempt; anything other than a network error, timeout or 5xx
+  logs one warning until something is delivered again.
+- **Tags.** An item keeps the tags resolved when the run ended (`retainTags` plus inline
+  `<retain_tags>`); a later `retainTags` change does not touch queued items.
+- **Limits.** Items beyond `retainQueueMaxItems` or a fixed 32 MiB total (UTF-8 bytes on disk,
+  oldest first), or older than `retainQueueMaxAgeMs`, are dropped with one warning until the queue
+  is empty again. A single retain larger than 32 MiB is not queued: it is sent live without waiting
+  for its bank's queue, and its failure is logged as before.
+- **Disk writes.** A new item is appended, on a new line even after a torn last line. Replacing,
+  pruning and replay rewrite the file (atomic rename); replay writes once per 25 delivered items and
+  at the end of each pass. If a rewrite that should drop an out-of-date copy fails, a tombstone line
+  is appended so a restart does not replay that copy. One queue per file per process, shared across
+  service restarts. If a bank already has queued items and the queue file cannot be written (disk
+  full, permissions), the retain is sent live instead. If the live write already failed, the queue
+  error is logged and the retain is not kept.
+- Only auto-retain is queued. `hindsight_retain` and the pre-compaction flush return the error to
+  the agent, as before. With `retainQueueEnabled: false` the plugin neither reads nor writes the
+  file; delete it, or turn the queue back on to drain it. `retainQueueEnabled` is read at service
+  start (restart the gateway after changing it); the two limits apply live. One gateway process per
+  state dir: the file is not locked.
+
 ### Mapping from `@vectorize-io/hindsight-openclaw`
 
-| Vendor key                                                                                                                                                                                                                                                                                     | Here                                                                                                      |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `hindsightApiUrl`, `hindsightApiToken`, `memoryMode`, `autoRecall`, `autoRetain`, `recallBudget`, `recallTypes`, `preferObservations`, `recallPromptPreamble`, `retainMission`, `retainContext`, `excludeProviders`, `skipOperationalSessions`, `agentBankMap`                                 | Same key, same meaning                                                                                    |
-| `dynamicBankId`, `dynamicBankGranularity`, `bankIdPrefix`                                                                                                                                                                                                                                      | Replaced by audience routing: owner bank = agent id (or `agentBankMap`), conversations get their own bank |
-| `retainRoles`, `recallRoles`, `retainFormat`, `recallMaxTokens`, `recallMaxQueryChars`, `recallTimeoutMs`, `recallInjectionPosition`, `retainSource`                                                                                                                                           | Fixed values (see above)                                                                                  |
-| `retainToolCalls`, `retainEveryNTurns`, `retainOverlapTurns`, `recallContextTurns`, `retainTags`, `retainQueue*`, `enableKnowledgeTools`, `allowKnowledgeDelete`, daemon keys (`apiPort`, `embedPort`, `embedVersion`, `daemonIdleTimeout`), `llm*`, `debug*`, `log*`, `skipStatelessSessions` | Not supported; remove them (unknown keys are rejected)                                                    |
+| Vendor key                                                                                                                                                                                                                                                                                                        | Here                                                                                                      |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `hindsightApiUrl`, `hindsightApiToken`, `memoryMode`, `autoRecall`, `autoRetain`, `recallBudget`, `recallTypes`, `preferObservations`, `recallPromptPreamble`, `retainMission`, `retainContext`, `retainTags`, `excludeProviders`, `skipOperationalSessions`, `agentBankMap`                                      | Same key, same meaning                                                                                    |
+| `dynamicBankId`, `dynamicBankGranularity`, `bankIdPrefix`                                                                                                                                                                                                                                                         | Replaced by audience routing: owner bank = agent id (or `agentBankMap`), conversations get their own bank |
+| `retainRoles`, `recallRoles`, `retainFormat`, `recallMaxTokens`, `recallMaxQueryChars`, `recallTimeoutMs`, `recallInjectionPosition`, `retainSource`                                                                                                                                                              | Fixed values (see above)                                                                                  |
+| `retainQueueMaxAgeMs`                                                                                                                                                                                                                                                                                             | Same key; must be a positive number of ms (the vendor's `-1` for no limit is rejected)                    |
+| `retainToolCalls`, `retainEveryNTurns`, `retainOverlapTurns`, `recallContextTurns`, `retainQueuePath`, `retainQueueFlushIntervalMs`, `enableKnowledgeTools`, `allowKnowledgeDelete`, daemon keys (`apiPort`, `embedPort`, `embedVersion`, `daemonIdleTimeout`), `llm*`, `debug*`, `log*`, `skipStatelessSessions` | Not supported; remove them (unknown keys are rejected)                                                    |
 
 ## Compared with `@vectorize-io/hindsight-openclaw`
 
@@ -168,11 +227,32 @@ or a loopback tunnel. To accept the risk on a trusted network, set `allowInsecur
 plugin then warns at service start that the token and conversation text travel unencrypted.
 Redirects are refused, so an https endpoint cannot forward a request body to plain http.
 
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md) for how and for supported
+versions.
+
 ## Compatibility
 
-`openclaw.install.minHostVersion` and `openclaw.compat.pluginApi` are `>=2026.10.1`. Evidence
-(published `openclaw` npm tarballs and release tags, checked 2026-11-03):
+### Supported OpenClaw versions
 
+OpenClaw `>=2026.10.10` is supported. Older hosts lack APIs or session behavior the plugin needs
+(see [Host API evidence](#host-api-evidence)). Memory needs the embedded agent runtime; CLI
+runtimes such as `claude-cli` get none yet (see [Limitations](#limitations)).
+
+`scripts/compat-matrix.sh` runs the live proof on the floor host (2026.10.10), the latest
+OpenClaw release and OpenClaw `main`, on the embedded and `claude-cli` runtimes. See
+[docs/compat-matrix.md](docs/compat-matrix.md) for how to run it and the expected cells.
+
+### Host API evidence
+
+`openclaw.install.minHostVersion` is `>=2026.10.10`; `openclaw.compat.pluginApi` is
+`>=2026.10.1`. Evidence (published `openclaw` npm tarballs and release tags, checked 2026-11-03
+and 2026-11-07):
+
+- 2026.10.10 is the first release that records a dashboard session created by
+  `sessions.create` as a direct chat (openclaw#181359). On 2026.10.1 through 2026.10.9 the host
+  gives turns in such a session no memory audience ("root session ... has no durable chat
+  type"), so the plugin neither recalls nor retains there. Nothing leaks; memory just does not
+  work for those sessions, including `openclaw agent --session-key` runs in them.
 - 2026.9.36 has no tools-arm flush plan (`persistenceToolNames`) and no
   `assertMemoryAudienceCurrent`. 2026.10.1 is the first release with `recallToolNames`, the
   tools-arm `providerFlushPlanResolver` result and `memoryAudience` /
@@ -187,6 +267,15 @@ Redirects are refused, so an https endpoint cannot forward a request body to pla
   is on `main` after 2026.10.10. On older hosts Memory Core's tools can appear next to ours when
   dreaming keeps it loaded.
 
+## Releases and versioning
+
+The plugin follows [semver](https://semver.org/). Before 1.0, a patch release (0.1.x) carries
+fixes and security fixes only, and a minor release (0.x.0) may change config or behavior, with an
+upgrade note in [CHANGELOG.md](CHANGELOG.md). Raising the minimum OpenClaw version is at least a
+minor release. Each release has a CHANGELOG entry, a `vX.Y.Z` tag on GitHub and the same version
+on npm and ClawHub. Only the latest release gets fixes. A version with a known security problem is
+deprecated on npm once the fix ships, as 0.1.1 is.
+
 ## Limitations
 
 - **No memory on CLI-backed runtimes.** OpenClaw's CLI runner (for example `claude-cli`)
@@ -194,7 +283,10 @@ Redirects are refused, so an https endpoint cannot forward a request body to pla
   as of 2026-11-07). On those turns auto-recall, auto-retain and the `hindsight_*` tools are
   skipped with "this session has no memory audience". Use an embedded model route for agents
   that need memory, or keep `@vectorize-io/hindsight-openclaw` for them until the host passes
-  the audience on CLI turns.
+  the audience on CLI turns. The host bug is
+  [openclaw/openclaw#194453](https://github.com/openclaw/openclaw/issues/194453); the fix,
+  [openclaw/openclaw#194454](https://github.com/openclaw/openclaw/pull/194454), is in review and
+  not merged as of 2026-11-07.
 - **Sessions without a memory audience get no memory.** Recall, retain and the tools need a
   host-minted audience. The host mints one only for sessions whose root has a durable chat
   type: owner direct chats get the owner-private bank, groups and other senders get a
@@ -203,6 +295,12 @@ Redirects are refused, so an https endpoint cannot forward a request body to pla
   (the vendor plugin fell back to the agent bank). This is intended per the SDK contract ("a
   session authority without an audience has no private or conversation grant"). Run
   `openclaw doctor --fix` to stamp older dashboard roots.
+- **Workspace memory files are outside the bank split.** The audience split covers Hindsight
+  banks only. An agent with file or shell tools can still write a fact to its workspace (for
+  example the daily note `memory/YYYY-MM-DD.md` that the default `AGENTS.md` suggests for
+  "remember this"), and any later session of that agent with the same tools can read it,
+  group chats included. To keep owner facts out of group sessions, sandbox non-main sessions
+  or deny `group:fs` and `group:runtime` for them in OpenClaw's tool policy.
 - **Auto-retain does not re-check audience currency.** The host starts `agent_end` handlers
   without awaiting them and releases the run's audience when the attempt ends, so a currency
   check there would race and drop retains. The bank still comes from the host-minted audience of
@@ -219,8 +317,8 @@ Redirects are refused, so an https endpoint cannot forward a request body to pla
   slot owners (no host seam yet).
 
 Not ported from the vendor plugin: knowledge-base tools, tool-call retention
-(`retainToolCalls`), `retainEveryNTurns` windows, the offline retain queue, the local Hindsight
-daemon, and per-user/per-channel bank granularity (replaced by audience routing).
+(`retainToolCalls`), `retainEveryNTurns` windows, the local Hindsight daemon, and
+per-user/per-channel bank granularity (replaced by audience routing).
 
 ## Rollback
 
@@ -243,5 +341,8 @@ npm run typecheck && npm run build && npm test && npm run lint && npm run format
 npm pack --dry-run   # dist/*.js, openclaw.plugin.json, README, CHANGELOG, LICENSE only
 ```
 
-`scripts/live-proof.sh` runs the end-to-end proof against a throwaway Gateway; see
-[docs/proof/2026-11-03.md](docs/proof/2026-11-03.md).
+`scripts/live-proof.sh` runs one OpenClaw host (npm version, git ref or path) on the embedded
+or `claude-cli` runtime through a throwaway Gateway and real turns, and prints a PASS/FAIL
+table. `scripts/compat-matrix.sh` runs it for the floor host, the latest release and `main`.
+See [docs/compat-matrix.md](docs/compat-matrix.md), including the expected `claude-cli` cells
+and an optional nightly launchd schedule.

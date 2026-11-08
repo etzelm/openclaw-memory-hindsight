@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { hindsightConfigSchema } from "./config.js";
 import {
   conversationBankId,
+  isMaintenanceTurn,
   ownerBankId,
   type MemoryAudience,
   routeAudience,
@@ -102,5 +103,23 @@ describe("bank ids", () => {
 
   it("returns a mapped bank id raw so the client encodes it exactly once", () => {
     expect(ownerBankId("dev", { dev: "team/shared" })).toBe("team/shared");
+  });
+});
+
+describe("isMaintenanceTurn", () => {
+  it("matches the flush trigger and Active Memory recall children only", () => {
+    expect(isMaintenanceTurn({ trigger: "memory", sessionKey: "agent:main:main" })).toBe(true);
+    expect(
+      isMaintenanceTurn({ sessionKey: "agent:main:dashboard:abc:active-memory:0123456789ab" }),
+    ).toBe(true);
+    expect(isMaintenanceTurn({ trigger: "user", sessionKey: "agent:main:main" })).toBe(false);
+    expect(isMaintenanceTurn({ trigger: "manual", sessionKey: "agent:main:dashboard:abc" })).toBe(
+      false,
+    );
+    // A user-named session that only mentions active-memory is a normal session.
+    expect(isMaintenanceTurn({ sessionKey: "agent:main:dashboard:active-memory:notes" })).toBe(
+      false,
+    );
+    expect(isMaintenanceTurn({})).toBe(false);
   });
 });

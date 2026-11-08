@@ -50,9 +50,29 @@
       "help": "Permit plain http to a non-loopback host. Token and conversation text are sent unencrypted; prefer https or a loopback tunnel",
       "advanced": true
     },
+    "retainQueueEnabled": {
+      "label": "Offline Retain Queue",
+      "help": "Keep auto-retains that fail because Hindsight is unreachable (network error, timeout, 5xx) in a local file under the state dir and send them later to the same bank",
+      "advanced": true
+    },
+    "retainQueueMaxItems": {
+      "label": "Retain Queue Max Items",
+      "help": "Oldest queued retains are dropped beyond this count",
+      "advanced": true
+    },
+    "retainQueueMaxAgeMs": {
+      "label": "Retain Queue Max Age (ms)",
+      "help": "Queued retains older than this are dropped (default 7 days)",
+      "advanced": true
+    },
     "retainMission": {
       "label": "Retain Mission",
       "help": "Applied to each bank before its first write: what Hindsight should extract",
+      "advanced": true
+    },
+    "retainTags": {
+      "label": "Retain Tags",
+      "help": "Tags added to every retained memory (for example source:openclaw)",
       "advanced": true
     }
   },
@@ -105,6 +125,12 @@
       "retainContext": {
         "type": "string"
       },
+      "retainTags": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
       "excludeProviders": {
         "type": "array",
         "items": {
@@ -113,6 +139,24 @@
       },
       "skipOperationalSessions": {
         "type": "boolean"
+      },
+      "retainQueueEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Queue auto-retains that fail because Hindsight is unreachable (network error, timeout, HTTP 5xx) in <state dir>/hindsight-native/retain-queue.jsonl (mode 600) and replay them to the same bank; 4xx answers are not queued"
+      },
+      "retainQueueMaxItems": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10000,
+        "default": 500,
+        "description": "Most queued retains kept; the oldest are dropped beyond this"
+      },
+      "retainQueueMaxAgeMs": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 604800000,
+        "description": "Queued retains older than this many milliseconds are dropped (default 7 days)"
       },
       "agentBankMap": {
         "type": "object",

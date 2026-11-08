@@ -168,3 +168,34 @@ describe("memory-hindsight provider runtime get timeout", () => {
     }
   });
 });
+
+describe("memory-hindsight provider runtime on a bank that does not exist yet", () => {
+  const openWith = async (detail: string) => {
+    const { service } = createTestService(
+      async () => new Response(JSON.stringify({ detail }), { status: 404 }),
+    );
+    const runtime = createHindsightProviderRuntime({ providerId: "memory-hindsight", service });
+    const result = await runtime.open({
+      cfg: {},
+      agentId: "dev",
+      purpose: "default",
+      context: { authority: OPERATOR, assertCurrent: () => {} },
+    } as OpenParams);
+    return result.provider!;
+  };
+
+  it("returns no hits for Hindsight's bank-not-found 404", async () => {
+    const provider = await openWith("Bank 'dev' not found");
+    await expect(provider.search({ query: "hindsight" })).resolves.toEqual({
+      hits: [],
+      coverage: "complete",
+    });
+  });
+
+  it("fails the search for a 404 from a route that does not exist", async () => {
+    const provider = await openWith("Not Found");
+    await expect(provider.search({ query: "hindsight" })).rejects.toThrow(
+      "memory-hindsight: memory search failed: Hindsight recall failed: HTTP 404",
+    );
+  });
+});

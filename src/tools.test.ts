@@ -82,6 +82,20 @@ describe("hindsight tools", () => {
     });
   });
 
+  it("adds configured retainTags before the call's own tags, without duplicates", async () => {
+    const { fake, service, deduper } = harness({ retainTags: ["source:openclaw"] });
+    const tool = createRetainTool(service, deduper, ownerCtx())!;
+    await tool.execute("c1", { content: "Use pnpm", tags: ["tooling", "source:openclaw"] });
+    await tool.execute("c2", { content: "Use vitest" });
+    const items = fake.requests
+      .filter((r) => new URL(r.url).pathname.endsWith("/memories"))
+      .map((r) => (r.body as { items: Array<{ tags?: string[] }> }).items[0]);
+    expect(items.map((item) => item?.tags)).toEqual([
+      ["source:openclaw", "tooling"],
+      ["source:openclaw"],
+    ]);
+  });
+
   it("is withheld without an audience, in context mode, incognito or excluded sessions", () => {
     const { service, deduper } = harness();
     expect(createRetainTool(service, deduper, ownerCtx({ memoryAudience: undefined }))).toBeNull();
@@ -127,6 +141,26 @@ describe("hindsight tools", () => {
     expect(JSON.stringify(result)).toContain("No relevant memories found.");
   });
 
+  it("treats Hindsight's bank-not-found 404 as empty and other 404s as errors", async () => {
+    const respond = (detail: string) =>
+      createTestService(async () => new Response(JSON.stringify({ detail }), { status: 404 }))
+        .service;
+    const missing = respond("Bank 'dev' not found");
+    expect(
+      JSON.stringify(await createRecallTool(missing, ownerCtx())!.execute("c", { query: "q" })),
+    ).toContain("No relevant memories found.");
+    expect(
+      JSON.stringify(await createReflectTool(missing, ownerCtx())!.execute("c", { query: "q" })),
+    ).toContain("No relevant memories found.");
+    const route = respond("Not Found");
+    await expect(createRecallTool(route, ownerCtx())!.execute("c", { query: "q" })).rejects.toThrow(
+      "HTTP 404",
+    );
+    await expect(
+      createReflectTool(route, ownerCtx())!.execute("c", { query: "q" }),
+    ).rejects.toThrow("HTTP 404");
+  });
+
   it("dedupes retries within one flush and uses a stable document id", async () => {
     const { fake, service, deduper } = harness();
     const ctx = ownerCtx({ memoryFlush: { flushId: "flush-1" } });
@@ -155,6 +189,22 @@ describe("hindsight tools", () => {
     )!;
     await next.execute("c3", { content: "Decision: ship native plugin" });
     expect(fake.requests.filter((r) => r.url.endsWith("/memories"))).toHaveLength(2);
+  });
+
+  it("tags pre-compaction flush writes with retainTags", async () => {
+    const { fake, service, deduper } = harness({ retainTags: ["source:openclaw"] });
+    const ctx = ownerCtx({ memoryFlush: { flushId: "flush-tags" } });
+    await createRetainTool(service, deduper, ctx)!.execute("c1", { content: "Keep the flush tag" });
+    const retains = fake.requests.filter((r) => r.url.endsWith("/memories"));
+    expect(retains[0]?.body).toMatchObject({
+      items: [
+        {
+          tags: ["source:openclaw"],
+          document_id: flushDocumentId("flush-tags", "Keep the flush tag"),
+          metadata: { retention_scope: "pre_compaction_flush" },
+        },
+      ],
+    });
   });
 
   it("releases a flush claim when the write fails so a retry can persist", async () => {

@@ -1,0 +1,47 @@
+# Public CI: the same gates as .gitlab-ci.yml (install, typecheck, build,
+# test, lint, format check, pack guard). Runs on pull requests and on main.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: node --version && npm --version
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - run: npm run lint
+      - run: npm run format:check
+
+      - name: Pack guard tests
+        run: node --test scripts/pack-guard.test.mjs
+
+      # The published file list must never carry tests, helpers or local state.
+      - name: Pack guard
+        run: |
+          npm pack --dry-run --json --ignore-scripts > "$RUNNER_TEMP/pack.json"
+          node scripts/pack-guard.mjs "$RUNNER_TEMP/pack.json"

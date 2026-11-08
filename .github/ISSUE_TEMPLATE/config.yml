@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/etzelm/openclaw-memory-hindsight/security/advisories/new
+    about: Report privately through GitHub. Do not open a public issue. See SECURITY.md.
+  - name: OpenClaw support
+    url: https://community.openclaw.ai/
+    about: Questions about OpenClaw itself, not this plugin.

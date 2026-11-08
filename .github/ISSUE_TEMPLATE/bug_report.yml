@@ -1,0 +1,95 @@
+name: Bug report
+description: Something in the plugin does not work as documented.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One problem per issue, please. Stick to what you observed.
+        Security problems go to private reporting (see SECURITY.md), not here.
+        Remove tokens, hostnames and private conversation text from everything you paste.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence on what is broken.
+      placeholder: Auto-recall adds no memories on owner direct chats after upgrading to 0.2.0.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The shortest steps that show the problem.
+      placeholder: |
+        1. Set plugins.slots.memory to hindsight-native with the config below.
+        2. Send a message in an owner direct chat.
+        3. Look for the recall log line in the Gateway log.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen, and where that is documented or when it last worked.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead, including any error text.
+    validations:
+      required: true
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version
+      description: From `openclaw plugins list --verbose` or your package manager.
+      placeholder: 0.2.0
+    validations:
+      required: true
+  - type: input
+    id: openclaw_version
+    attributes:
+      label: OpenClaw version
+      description: Output of `openclaw --version`.
+      placeholder: 2026.11.1
+    validations:
+      required: true
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Agent runtime
+      description: CLI runtimes such as `claude-cli` get no memory today; see Limitations in the README.
+      options:
+        - Embedded
+        - CLI runtime (claude-cli or similar)
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: install_source
+    attributes:
+      label: Install source
+      options:
+        - npm
+        - ClawHub
+        - GitHub source
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Plugin config
+      description: The `plugins.entries.hindsight-native` block, with the token removed.
+      render: json5
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant Gateway log lines, redacted.
+      render: shell
