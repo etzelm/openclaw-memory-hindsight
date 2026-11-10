@@ -236,6 +236,40 @@ Host tool listings can therefore show them while the key is off: the manifest's 
 only test that a key is present, not that it is `true`, so they cannot express this key. The
 write tools (create folder, create page, update, delete) are not ported.
 
+### Gateway metrics
+
+The plugin serves Prometheus text at `GET /plugins/hindsight-native/metrics` on the Gateway
+port. The route uses Gateway auth and needs `operator.read` (or `operator.write` /
+`operator.admin`), the same as `diagnostics-prometheus`, so scrape it with the token you use
+for `/api/diagnostics/prometheus`. `diagnostics-prometheus` renders only core diagnostic
+events and has no plugin metric surface, which is why this is a separate path. There is no
+config key; counters live in memory and reset when the Gateway restarts.
+
+| Series (`openclaw_hindsight_` prefix) | Type      | Labels                     |
+| ------------------------------------- | --------- | -------------------------- |
+| `recall_total`                        | counter   | `agent`, `bank`, `outcome` |
+| `recall_duration_seconds`             | histogram | `agent`, `bank`            |
+| `retain_total`                        | counter   | `agent`, `bank`, `outcome` |
+| `retain_duration_seconds`             | histogram | `agent`, `bank`            |
+| `retain_queue_depth`                  | gauge     | `bank`                     |
+| `retain_queue_replays_total`          | counter   | `bank`, `outcome`          |
+| `retain_queue_drops_total`            | counter   | `bank`, `reason`           |
+
+- Recall counts the auto-recall request only: `injected`, `empty` (no results or no bank yet),
+  `timeout`, `error`. A recall the host cancels (audience changed, hook invocation stale) is
+  not counted. Retain counts auto-retain only: `sent`, `queued`, `timeout`, `error`. Tool
+  calls are not counted.
+- The latency histograms cover every outcome, so timeouts and fast `queued` retains are in the
+  same quantiles as successful calls.
+- Replays: `delivered`, or `deferred` (Hindsight unreachable, item kept). Drops count retains
+  that are lost: `limit` (`retainQueueMaxItems`, `retainQueueMaxAgeMs` or the size bound),
+  `too_large` (the live write failed and the item is over the queue's size bound), `rejected`
+  (a 4xx on replay).
+- `agent` is the normalized agent id. `bank` is the owner bank; every conversation bank of
+  that owner shares one `<bank>::conv` label. Values that are not label-safe read `unknown`.
+  Past 200 label sets per metric family, new `agent` and `bank` values fold into `other`;
+  `outcome` and `reason` keep their value. No session ids, document ids or text.
+
 ### Mapping from `@vectorize-io/hindsight-openclaw`
 
 | Vendor key                                                                                                                                                                                                                                                                                                        | Here                                                                                                      |

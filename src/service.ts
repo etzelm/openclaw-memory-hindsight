@@ -1,6 +1,7 @@
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { boundedSignal, HindsightClient, type HindsightRetainItem } from "./client.js";
 import { type HindsightConfig, RETAIN_TIMEOUT_MS } from "./config.js";
+import type { HindsightMetrics } from "./metrics.js";
 import {
   BankSetupError,
   isDroppingRejection,
@@ -35,6 +36,8 @@ export type HindsightService = {
   /** Opens the queue file under the host state dir and replays what an earlier run left. */
   startRetainQueue(stateDir: string | undefined): void;
   retainQueue(): RetainQueueRunner | undefined;
+  /** Queued items per bank id, or undefined when the queue is off. */
+  retainQueueDepth(): Map<string, number> | undefined;
   logger: HindsightLogger;
   stopped(): boolean;
   stop(): void;
@@ -46,7 +49,14 @@ export function createHindsightService(params: {
   logger: HindsightLogger;
   fetch?: (input: string, init?: RequestInit) => Promise<Response>;
   retainQueueRetry?: { baseDelayMs?: number; maxDelayMs?: number };
+  metrics?: HindsightMetrics;
 }): HindsightService {
+  const { metrics } = params;
+  // Queue and replay observers feed the gateway metrics; none when the caller passes no metrics.
+  const queueObserver = metrics ? { onDrop: metrics.recordDrop.bind(metrics) } : {};
+  const runnerObserver = metrics
+    ? { onDrop: metrics.recordDrop.bind(metrics), onReplay: metrics.recordReplay.bind(metrics) }
+    : {};
   const preparedBanks = new Map<string, Promise<void>>();
   let stopped = false;
   let runner: RetainQueueRunner | undefined;
@@ -115,6 +125,10 @@ export function createHindsightService(params: {
         // Read again after the await: the service may have stopped or restarted meanwhile.
         const target = queue;
         if (!target || refused || !isTransportFailure(error)) {
+          // Queue-first path: the queue refused the item and the live write failed, so it is lost.
+          if (target && refused && isTransportFailure(error) && target.isTooLarge(entry)) {
+            metrics?.recordDrop(bankId, "too_large");
+          }
           throw error;
         }
         let queued: boolean;
@@ -127,6 +141,11 @@ export function createHindsightService(params: {
           throw error;
         }
         if (!queued) {
+          // Lost: the live write failed and the queue refused it. A bound that dropped the new item
+          // is already counted as `limit` by the queue.
+          if (target.isTooLarge(entry)) {
+            metrics?.recordDrop(bankId, "too_large");
+          }
           throw error;
         }
         params.logger.warn?.(
@@ -158,7 +177,11 @@ export function createHindsightService(params: {
         return { maxItems: config.retainQueueMaxItems, maxAgeMs: config.retainQueueMaxAgeMs };
       };
       try {
-        queue = sharedRetainQueue(retainQueuePath(stateDir), { limits, logger: params.logger });
+        queue = sharedRetainQueue(retainQueuePath(stateDir), {
+          limits,
+          logger: params.logger,
+          ...queueObserver,
+        });
       } catch (error) {
         queue = undefined;
         params.logger.warn?.(
@@ -184,6 +207,7 @@ export function createHindsightService(params: {
           );
         },
         logger: params.logger,
+        ...runnerObserver,
         ...params.retainQueueRetry,
       });
       if (queue.size() > 0) {
@@ -194,6 +218,7 @@ export function createHindsightService(params: {
       }
     },
     retainQueue: () => runner,
+    retainQueueDepth: () => queue?.depthByBank(),
     stopped: () => stopped,
     stop() {
       stopped = true;

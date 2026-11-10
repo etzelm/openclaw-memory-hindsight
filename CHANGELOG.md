@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0 (2026-11-09)
+
+### Upgrade notes
+
+- No config change is needed. The plugin now serves Prometheus metrics at
+  `GET /plugins/hindsight-native/metrics` on the Gateway port. To collect them, add a scrape job
+  for that path that sends a Gateway token with `operator.read`. Without a scrape job nothing
+  changes.
+
+### Added
+
+- Gateway metrics: Prometheus text at `GET /plugins/hindsight-native/metrics` on the Gateway
+  port (Gateway auth, `operator.read`). Auto-recall and auto-retain counts by outcome with
+  latency histograms, and retain queue depth, replays and drops. Labels are `agent` and `bank`
+  plus fixed outcome and reason values; conversation banks share one label per owner bank.
+  See README, Gateway metrics.
+
 ## 0.3.0 (2026-11-08)
 
 ### Upgrade notes

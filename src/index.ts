@@ -25,6 +25,12 @@ import {
   createProviderFlushPlanResolver,
   RECALL_TOOL_NAMES,
 } from "./memory-capability.js";
+import {
+  createMetricsRouteHandler,
+  HindsightMetrics,
+  isTimeoutError,
+  METRICS_ROUTE_PATH,
+} from "./metrics.js";
 import { createHindsightProviderRuntime } from "./provider-runtime.js";
 import { isMaintenanceTurn, routeAudience, sessionUsesMemory } from "./routing.js";
 import { type MemoryPluginCapability, resolveLearnRegistrar } from "./sdk-types.js";
@@ -132,9 +138,26 @@ export default definePluginEntry({
       }
     };
 
+    const metrics = new HindsightMetrics();
     const service = createHindsightService({
       config: currentConfig,
       logger: api.logger,
+      metrics,
+    });
+    // Gateway-side metrics on the gateway port, behind gateway auth (see metrics.ts for why this
+    // is a plugin route and not diagnostics-prometheus). The floor host has the method; the check
+    // only keeps a host or test double without it from failing registration.
+    if (typeof api.registerHttpRoute !== "function") {
+      api.logger.debug?.(
+        "memory-hindsight: host has no registerHttpRoute; metrics route not served",
+      );
+    }
+    api.registerHttpRoute?.({
+      path: METRICS_ROUTE_PATH,
+      auth: "gateway",
+      match: "exact",
+      gatewayRuntimeScopeSurface: "trusted-operator",
+      handler: createMetricsRouteHandler(metrics, () => service.retainQueueDepth()),
     });
     const flushDeduper = createFlushDeduper();
     // Per session: where the current run started, kept for the whole run (by runId) so a second
@@ -231,17 +254,38 @@ export default definePluginEntry({
       }
       try {
         ctx.assertMemoryAudienceCurrent?.();
-        const results = await service.client.recall(route.bankId, query, {
-          budget: config.recallBudget,
-          maxTokens: RECALL_MAX_TOKENS,
-          ...(config.recallTypes ? { types: config.recallTypes } : {}),
-          ...(config.preferObservations === undefined
-            ? {}
-            : { preferObservations: config.preferObservations }),
-          signal: AbortSignal.timeout(RECALL_TIMEOUT_MS),
-        });
+        // Metrics count the Hindsight request only. A host assert that throws (audience changed,
+        // hook invocation stale) is host lifecycle, not a recall outcome, so it records nothing.
+        const recallStarted = performance.now();
+        let results: Awaited<ReturnType<typeof service.client.recall>>;
+        try {
+          results = await service.client.recall(route.bankId, query, {
+            budget: config.recallBudget,
+            maxTokens: RECALL_MAX_TOKENS,
+            ...(config.recallTypes ? { types: config.recallTypes } : {}),
+            ...(config.preferObservations === undefined
+              ? {}
+              : { preferObservations: config.preferObservations }),
+            signal: AbortSignal.timeout(RECALL_TIMEOUT_MS),
+          });
+        } catch (error) {
+          metrics.recordRecall(
+            ctx.agentId,
+            route.bankId,
+            isBankNotFound(error) ? "empty" : isTimeoutError(error) ? "timeout" : "error",
+            performance.now() - recallStarted,
+          );
+          throw error;
+        }
+        const recallMs = performance.now() - recallStarted;
         ctx.assertMemoryAudienceCurrent?.();
         ctx.hookInvocation?.assertActive();
+        metrics.recordRecall(
+          ctx.agentId,
+          route.bankId,
+          results.length === 0 ? "empty" : "injected",
+          recallMs,
+        );
         if (results.length === 0) {
           return undefined;
         }
@@ -308,6 +352,7 @@ export default definePluginEntry({
       // so a continuation or a re-delivery replaces the document with the whole run.
       const runPart = sanitizeDocumentIdPart(runId, `${Date.now()}`);
       const documentId = `openclaw:${sanitizeDocumentIdPart(sessionKey, "session")}-${sessionKeyDigest(sessionKey)}:run:${runPart}`;
+      const retainStarted = performance.now();
       try {
         // No ctx.assertMemoryAudienceCurrent() here. The host starts agent_end handlers without
         // awaiting them (runAgentEndSideEffectsAsync -> void runAgentEnd, after awaiting the
@@ -338,10 +383,17 @@ export default definePluginEntry({
           },
           signal,
         );
+        metrics.recordRetain(ctx.agentId, route.bankId, outcome, performance.now() - retainStarted);
         api.logger.debug?.(
           `memory-hindsight: ${outcome === "sent" ? "retained" : "queued"} ${retention.messageCount} messages (${route.audience.kind})`,
         );
       } catch (error) {
+        metrics.recordRetain(
+          ctx.agentId,
+          route.bankId,
+          isTimeoutError(error) ? "timeout" : "error",
+          performance.now() - retainStarted,
+        );
         api.logger.warn?.(`memory-hindsight: auto-retain failed: ${formatErrorMessage(error)}`);
       }
     });

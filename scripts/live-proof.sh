@@ -497,7 +497,7 @@ export OPENCLAW_HOME="$L/home" OPENCLAW_STATE_DIR="$L/home/.openclaw"
 export OPENCLAW_CONFIG_PATH="$L/home/.openclaw/openclaw.json" OPENCLAW_GATEWAY_PORT="$PORT"
 export OPENCLAW_SKIP_CHANNELS=1 OPENCLAW_DISABLE_BONJOUR=1
 GW_TOKEN=$(openssl rand -hex 24)
-( umask 077; printf '%s' "$GW_TOKEN" > "$L/gw-token" )
+( umask 077; printf '%s' "$GW_TOKEN" > "$L/gw-token"; printf 'Authorization: Bearer %s\n' "$GW_TOKEN" > "$L/gw-auth.hdr" )
 export OPENCLAW_GATEWAY_TOKEN="$GW_TOKEN"
 export AUDIENCE_PROBE_LOG="$L/probe/probe.jsonl" AUDIENCE_PROBE_HS="$HS" AUDIENCE_PROBE_CODE="$CODE"
 export AUDIENCE_PROBE_QUERY="launch code word" AUDIENCE_PROBE_DELAY_MS="$DELAY_MS"
@@ -919,6 +919,35 @@ sleep 5
 echo "== probe startup self-test"
 grep -E '"op":"startup' "$L/probe/probe.jsonl" 2>/dev/null | sed "s/$BANK/<bank>/g" | cut -c1-300
 
+# ---- gateway metrics (plugin route on the gateway port, gateway auth) ------------------------
+METRICS_PATH=/plugins/hindsight-native/metrics
+metrics() {  # metrics OUTFILE [noauth]: prints the HTTP status; the token stays in a header file
+  if [ "${2:-}" = noauth ]; then
+    curl -s -m 15 -o "$1" -w '%{http_code}' "http://127.0.0.1:$PORT$METRICS_PATH"
+  else
+    curl -s -m 15 -o "$1" -w '%{http_code}' -H @"$L/gw-auth.hdr" "http://127.0.0.1:$PORT$METRICS_PATH"
+  fi
+}
+msum() {  # msum FILE FAMILY: sum of the family's samples, 0 when it has none
+  python3 - "$1" "$2" <<'PY'
+import sys
+total = 0.0
+try:
+    for line in open(sys.argv[1]):
+        if line.startswith(sys.argv[2] + "{") or line.startswith(sys.argv[2] + " "):
+            total += float(line.rsplit(" ", 1)[1])
+except OSError:
+    pass
+print(int(total))
+PY
+}
+echo "== gateway metrics before turns"
+m0=$(metrics "$L/metrics-0.prom"); mu=$(metrics /dev/null noauth)
+fams=$(cat "$L/metrics-0.prom" 2>/dev/null | grep -c -E '^# TYPE openclaw_hindsight_')
+mok=FAIL; [ "$m0" = 200 ] && [ "$fams" = 7 ] && case "$mu" in 401|403) mok=PASS ;; esac
+row G1 "metrics route on the gateway port" "200 with 7 families; 401/403 without auth" "status=$m0 families=$fams noauth=$mu" "$mok"
+sed "s/$BANK/<bank>/g" "$L/metrics-0.prom" > "$OUT/metrics-before.prom" 2>/dev/null
+
 # ---- turns ----------------------------------------------------------------------------------
 : > "$OUT/marks.tsv"
 mark() { printf '%s\t%s\n' "$1" "$(python3 -c 'import datetime as d; print(d.datetime.now(d.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")')" >> "$OUT/marks.tsv"; }
@@ -995,6 +1024,27 @@ except Exception: sys.exit(1)' "$L/conv.history" && break
   sleep $(( DELAY_MS / 1000 + 10 ))
 else
   echo "== turns skipped: $SKIP_REASON"
+fi
+
+echo "== gateway metrics after turns"
+m1=$(metrics "$L/metrics-1.prom")
+if [ "$TURNS" = 1 ]; then
+  # agent_end runs unawaited: give the last of the 3 turns' retains up to 30 s to show up.
+  tw=$(( $(msum "$L/metrics-0.prom" openclaw_hindsight_retain_total) + 3 ))
+  for _ in $(seq 1 15); do
+    [ "$(msum "$L/metrics-1.prom" openclaw_hindsight_retain_total)" -ge "$tw" ] && break
+    sleep 2; m1=$(metrics "$L/metrics-1.prom")
+  done
+fi
+sed "s/$BANK/<bank>/g" "$L/metrics-1.prom" > "$OUT/metrics-after.prom" 2>/dev/null
+r0=$(msum "$L/metrics-0.prom" openclaw_hindsight_recall_total); r1=$(msum "$L/metrics-1.prom" openclaw_hindsight_recall_total)
+t0=$(msum "$L/metrics-0.prom" openclaw_hindsight_retain_total); t1=$(msum "$L/metrics-1.prom" openclaw_hindsight_retain_total)
+mgot="status=$m1 recall $r0->$r1 retain $t0->$t1"
+if [ "$TURNS" = 1 ]; then
+  m2=FAIL; [ "$m1" = 200 ] && [ "$r1" -gt "$r0" ] && [ "$t1" -gt "$t0" ] && m2=PASS
+  row G2 "metrics change after turns" "recall_total and retain_total grow" "$mgot" "$m2"
+else
+  row G2 "metrics change after turns" "recall_total and retain_total grow" "$SKIP_REASON; $mgot" SKIP
 fi
 
 # ---- collect --------------------------------------------------------------------------------

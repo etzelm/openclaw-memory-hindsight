@@ -15,6 +15,7 @@ import {
 import { dirname, join } from "node:path";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { type HindsightRetainItem, HindsightHttpError } from "./client.js";
+import type { DropReason, ReplayOutcome } from "./metrics.js";
 
 /** One auto-retain that could not reach Hindsight. Holds no URL and no credentials. */
 export type QueuedRetain = {
@@ -33,6 +34,9 @@ type QueueLogger = {
   warn?: (message: string) => void;
   debug?: (message: string) => void;
 };
+
+/** Called once per item that leaves the queue without being delivered. */
+export type OnQueueDrop = (bankId: string, reason: DropReason) => void;
 
 export const RETAIN_QUEUE_DIR = "hindsight-native";
 export const RETAIN_QUEUE_FILE = "retain-queue.jsonl";
@@ -178,18 +182,21 @@ export class RetainQueue {
   private fileBytes = 0;
   private limits: () => RetainQueueLimits;
   private logger: QueueLogger;
+  private onDrop: OnQueueDrop | undefined;
 
   constructor(
     private readonly options: {
       filePath: string;
       limits: () => RetainQueueLimits;
       logger: QueueLogger;
+      onDrop?: OnQueueDrop;
       now?: () => number;
       maxBytes?: number;
     },
   ) {
     this.limits = options.limits;
     this.logger = options.logger;
+    this.onDrop = options.onDrop;
   }
 
   get filePath(): string {
@@ -197,9 +204,14 @@ export class RetainQueue {
   }
 
   /** A restarted service reuses this queue with its own config and logger. */
-  configure(params: { limits: () => RetainQueueLimits; logger: QueueLogger }): void {
+  configure(params: {
+    limits: () => RetainQueueLimits;
+    logger: QueueLogger;
+    onDrop?: OnQueueDrop;
+  }): void {
     this.limits = params.limits;
     this.logger = params.logger;
+    this.onDrop = params.onDrop;
   }
 
   private now(): number {
@@ -287,6 +299,23 @@ export class RetainQueue {
     return this.stored[0]?.entry;
   }
 
+  /**
+   * True when the item alone is over the size bound, so `enqueue` refuses it. Not reported as a
+   * drop here: the caller may still send it live, and reports it only when it is lost.
+   */
+  isTooLarge(entry: Omit<QueuedRetain, "queuedAt">): boolean {
+    return stored({ ...entry, queuedAt: this.now() }).size > this.maxBytes();
+  }
+
+  /** Queued items per bank id. */
+  depthByBank(): Map<string, number> {
+    const depth = new Map<string, number>();
+    for (const { entry } of this.stored) {
+      depth.set(entry.bankId, (depth.get(entry.bankId) ?? 0) + 1);
+    }
+    return depth;
+  }
+
   /** Bank and document id of every queued item, oldest first. */
   list(): Array<Pick<QueuedRetain, "bankId" | "documentId">> {
     return this.stored.map(({ entry }) => ({ bankId: entry.bankId, documentId: entry.documentId }));
@@ -330,8 +359,11 @@ export class RetainQueue {
     }
     let rewriteError: unknown;
     try {
+      // Drops are reported only once the write that makes them stick succeeds; the fallback below
+      // restores memory and prunes again, and reports then.
+      const pruned = this.pruneStored();
       if (
-        this.prune(false) === 0 &&
+        pruned.length === 0 &&
         index < 0 &&
         existsSync(this.filePath) &&
         this.canAppend(next.size)
@@ -340,6 +372,7 @@ export class RetainQueue {
         return true;
       }
       this.persist();
+      this.reportDrops(pruned);
       // False when the bound dropped the item just added or replaced.
       return this.stored.includes(next);
     } catch (error) {
@@ -352,7 +385,8 @@ export class RetainQueue {
     // older one, and a tombstone for every item the bounds drop, so no dropped line can come back
     // on a restart (say, after a later tombstone brings the count under maxItems).
     this.stored = [...kept, next];
-    this.prune(false);
+    // Reported only if the append below sticks; otherwise memory goes back to `kept`.
+    const prunedAgain = this.pruneStored();
     const keepsNext = this.stored.includes(next);
     const dead = kept.filter((s) => !this.stored.includes(s)).map((s) => s.entry);
     if (!keepsNext && index >= 0) {
@@ -369,6 +403,7 @@ export class RetainQueue {
         if (text) {
           this.append(text);
         }
+        this.reportDrops(prunedAgain);
         return keepsNext;
       } catch {
         // Neither write worked; handled below.
@@ -413,9 +448,18 @@ export class RetainQueue {
    * stays quiet until the queue is empty again.
    */
   prune(persist = true): number {
+    const dropped = this.pruneStored();
+    this.reportDrops(dropped);
+    if (dropped.length > 0 && persist) {
+      this.persist();
+    }
+    return dropped.length;
+  }
+
+  /** The bounds step of `prune()`: updates memory and warns, but neither reports nor writes. */
+  private pruneStored(): Stored[] {
     const { maxItems, maxAgeMs } = this.limits();
     const cutoff = this.now() - maxAgeMs;
-    const before = this.stored.length;
     let kept = this.stored.filter((s) => s.entry.queuedAt >= cutoff);
     if (kept.length > maxItems) {
       kept = kept.slice(kept.length - maxItems);
@@ -424,20 +468,22 @@ export class RetainQueue {
     while (kept.length > 0 && bytes > this.maxBytes()) {
       bytes -= kept.shift()!.size;
     }
+    const keptSet = new Set(kept);
+    const dropped = this.stored.filter((s) => !keptSet.has(s));
     this.stored = kept;
-    const dropped = before - kept.length;
-    if (dropped > 0) {
-      if (!this.dropWarned) {
-        this.dropWarned = true;
-        this.logger.warn?.(
-          `memory-hindsight: retain queue dropped ${dropped} item(s) over retainQueueMaxItems (${maxItems}), retainQueueMaxAgeMs (${maxAgeMs}) or the ${this.maxBytes()}-byte size bound; further drops are not logged until the queue is empty`,
-        );
-      }
-      if (persist) {
-        this.persist();
-      }
+    if (dropped.length > 0 && !this.dropWarned) {
+      this.dropWarned = true;
+      this.logger.warn?.(
+        `memory-hindsight: retain queue dropped ${dropped.length} item(s) over retainQueueMaxItems (${maxItems}), retainQueueMaxAgeMs (${maxAgeMs}) or the ${this.maxBytes()}-byte size bound; further drops are not logged until the queue is empty`,
+      );
     }
     return dropped;
+  }
+
+  private reportDrops(dropped: Stored[]): void {
+    for (const s of dropped) {
+      this.onDrop?.(s.entry.bankId, "limit");
+    }
   }
 
   private ensureDir(): void {
@@ -509,7 +555,7 @@ const sharedQueues = new Map<string, RetainQueue>();
 
 export function sharedRetainQueue(
   filePath: string,
-  params: { limits: () => RetainQueueLimits; logger: QueueLogger },
+  params: { limits: () => RetainQueueLimits; logger: QueueLogger; onDrop?: OnQueueDrop },
 ): RetainQueue {
   const existing = sharedQueues.get(filePath);
   if (existing) {
@@ -545,6 +591,8 @@ export class RetainQueueRunner {
     private readonly options: {
       send: (entry: QueuedRetain, signal: AbortSignal) => Promise<void>;
       logger: QueueLogger;
+      onReplay?: (bankId: string, outcome: ReplayOutcome) => void;
+      onDrop?: OnQueueDrop;
       baseDelayMs?: number;
       maxDelayMs?: number;
     },
@@ -624,6 +672,7 @@ export class RetainQueueRunner {
           return delivered;
         }
         if (!isDroppingRejection(error)) {
+          this.options.onReplay?.(entry.bankId, "deferred");
           // Not an answer about this item (outage, auth, rate limit, ambiguous 404, refused
           // redirect, or an unexpected error): keep it and back off.
           if (!isTransportFailure(error) && !this.rejectionWarned) {
@@ -645,6 +694,7 @@ export class RetainQueueRunner {
         }
         // Hindsight answered 4xx about this item: retrying cannot help, so it leaves the queue.
         this.queue.remove(entry, { persist: false });
+        this.options.onDrop?.(entry.bankId, "rejected");
         logger.warn?.(
           `memory-hindsight: queued retain rejected and dropped: ${formatErrorMessage(error)}`,
         );
@@ -655,6 +705,7 @@ export class RetainQueueRunner {
         return delivered;
       }
       this.queue.remove(entry, { persist: false });
+      this.options.onReplay?.(entry.bankId, "delivered");
       this.rejectionWarned = false;
       delivered += 1;
       if (delivered % SAVE_EVERY === 0) {
