@@ -119,12 +119,26 @@ tool conflict.
 | `retainTags`                | `[]`                 | Tags added to every retained memory (auto-retain, `hindsight_retain`, pre-compaction flush)           |
 | `excludeProviders`          | `[]`                 | Message providers that never recall or retain (for example `heartbeat`)                               |
 | `skipOperationalSessions`   | `true`               | Skip cron, heartbeat and subagent sessions                                                            |
+| `ignoreSessionPatterns`     | `[]`                 | Session-key globs with no recall, retain or `hindsight_*` tools (see below)                           |
+| `recallOnlySessionPatterns` | `[]`                 | Session-key globs that recall and read but never retain (see below)                                   |
 | `agentBankMap`              | `{}`                 | Agent id to bank id, so several agents share one owner bank                                           |
 | `allowInsecureHttp`         | `false`              | Allow plain http to a non-loopback `hindsightApiUrl` (token and conversation text unencrypted)        |
 | `retainQueueEnabled`        | `true`               | Queue auto-retains that fail because Hindsight is unreachable and send them later (see below)         |
 | `retainQueueMaxItems`       | `500`                | Most queued retains kept (1 to 10000); the oldest are dropped first                                   |
 | `retainQueueMaxAgeMs`       | `604800000` (7 days) | Queued retains older than this are dropped                                                            |
+| `recallCacheTtlMs`          | `0` (off)            | Auto-recall cache per session and bank, 0 to 3600000 ms; a repeated query skips the API call          |
+| `recallFollowupMaxWords`    | `0` (off)            | At most N words, no URL or path: skip after a recent recall with hits, else add the prior user turn   |
 | `knowledgeReadTools`        | `false`              | Offer the read-only knowledge-base tools (see below); turning it on needs a gateway restart           |
+| `listToolsWithoutAudience`  | `false`              | List the `hindsight_*` tools when the host builds the tool list without an audience (see below)       |
+
+Session patterns: `*` matches any run of characters except `:`, `**` matches anything including
+`:`, everything else is literal. Patterns match the trimmed session key. `ignoreSessionPatterns`
+sessions get no auto-recall, no auto-retain and no `hindsight_*` tools. `recallOnlySessionPatterns`
+sessions (for example `agent:dev:subagent:**`) get auto-recall, `hindsight_recall`,
+`hindsight_reflect` and, with `knowledgeReadTools`, the knowledge-base read tools, even when
+`skipOperationalSessions` would skip them, but never auto-retain and no `hindsight_retain`.
+`excludeProviders`, `temp:` and incognito sessions win over both lists, and ignore wins over
+recall-only. A pattern never selects a bank; the bank still comes from the memory audience.
 
 Fixed values (not configurable): recall max tokens 1024, query cap 800 characters, recall
 timeout 10 s, retain and reflect timeout 30 s, memory get and knowledge-base tool timeout 10 s
@@ -134,6 +148,15 @@ prompt, so the cached prefix stays stable). Knowledge-base tool caps: a response
 1 MiB fails; a page shows its first 32000 characters, then `(truncated, N more characters)`;
 the tree shows 500 entries, then `(truncated, N more entries)`; search shows at most 50 hits
 with snippets cut at 500 characters and names and ids at 200.
+
+`listToolsWithoutAudience`: the claude-cli runtime on OpenClaw 2026.11.x builds a turn's MCP tool
+list before it attaches the turn's memory audience, so every tool factory sees no audience, returns
+null, and `hindsight_*` never reach claude-cli sessions (auto-recall still works; it reads the
+audience from the hook context). With this key on, an agent session with a session key gets the
+tools listed anyway. The host then builds the callable copy with the audience from the run's grant,
+and that copy alone reaches Hindsight; a call that still has no audience fails with an error before
+any request. The session filters (`memoryMode`, incognito, `excludeProviders`,
+`skipOperationalSessions`) apply as before, and an audience for another agent is still refused.
 
 Config changes apply without a restart: the plugin re-reads its entry from the host's current
 config snapshot (`api.runtime.config.current()`), falling back to the register-time

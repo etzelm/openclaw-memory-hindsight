@@ -3,6 +3,7 @@ import { hindsightConfigSchema } from "./config.js";
 import {
   conversationBankId,
   isMaintenanceTurn,
+  matchesSessionPattern,
   ownerBankId,
   type MemoryAudience,
   routeAudience,
@@ -121,5 +122,92 @@ describe("isMaintenanceTurn", () => {
       false,
     );
     expect(isMaintenanceTurn({})).toBe(false);
+  });
+});
+
+describe("session patterns", () => {
+  const parse = (extra: Record<string, unknown>) =>
+    hindsightConfigSchema.parse({
+      hindsightApiUrl: "http://h",
+      allowInsecureHttp: true,
+      ...extra,
+    });
+  const use = (
+    cfg: ReturnType<typeof parse>,
+    sessionKey: string | undefined,
+    purpose: "recall" | "retain",
+    messageProvider?: string,
+  ) => sessionUsesMemory(cfg, { sessionKey, messageProvider, purpose });
+
+  it("matches `*` within one segment and `**` across colons", () => {
+    expect(matchesSessionPattern("agent:dev:main", ["agent:*:main"])).toBe(true);
+    expect(matchesSessionPattern("agent:dev:subagent:abc", ["agent:dev:*"])).toBe(false);
+    expect(matchesSessionPattern("agent:dev:subagent:abc", ["agent:dev:**"])).toBe(true);
+    expect(matchesSessionPattern("agent:dev:subagent:abc", ["agent:dev:subagent:*"])).toBe(true);
+    expect(matchesSessionPattern("agent:dev:subagent:a:b", ["agent:dev:subagent:*"])).toBe(false);
+    expect(matchesSessionPattern("anything:at:all", ["**"])).toBe(true);
+    expect(matchesSessionPattern("a:b", ["*"])).toBe(false);
+  });
+
+  it("treats everything else literally and escapes regex characters", () => {
+    expect(matchesSessionPattern("agent:dev.main", ["agent:dev.main"])).toBe(true);
+    expect(matchesSessionPattern("agent:devXmain", ["agent:dev.main"])).toBe(false);
+    expect(matchesSessionPattern("a+b(c)[d]{1}|e^$", ["a+b(c)[d]{1}|e^$"])).toBe(true);
+    expect(matchesSessionPattern("aab", ["a+b"])).toBe(false);
+    expect(matchesSessionPattern("x:agent:dev:main", ["agent:dev:main"])).toBe(false);
+    expect(matchesSessionPattern("agent:dev:main:x", ["agent:dev:main"])).toBe(false);
+  });
+
+  it("matches the trimmed key and never matches a missing or blank key", () => {
+    expect(matchesSessionPattern("  agent:dev:main \n", ["agent:dev:main"])).toBe(true);
+    expect(matchesSessionPattern(undefined, ["**"])).toBe(false);
+    expect(matchesSessionPattern("   ", ["**"])).toBe(false);
+    expect(matchesSessionPattern("agent:dev:main", [])).toBe(false);
+  });
+
+  it("ignore patterns block recall and retain", () => {
+    const cfg = parse({ ignoreSessionPatterns: ["agent:dev:telegram:**"] });
+    expect(use(cfg, "agent:dev:telegram:group:-1", "recall")).toBe(false);
+    expect(use(cfg, "agent:dev:telegram:group:-1", "retain")).toBe(false);
+    expect(use(cfg, "agent:dev:main", "recall")).toBe(true);
+  });
+
+  it("ignore beats recall-only", () => {
+    const cfg = parse({
+      ignoreSessionPatterns: ["agent:dev:subagent:secret*"],
+      recallOnlySessionPatterns: ["agent:dev:subagent:**"],
+    });
+    expect(use(cfg, "agent:dev:subagent:secret1", "recall")).toBe(false);
+    expect(use(cfg, "agent:dev:subagent:other", "recall")).toBe(true);
+  });
+
+  it("recall-only recalls through skipOperationalSessions but never retains", () => {
+    const cfg = parse({ recallOnlySessionPatterns: ["agent:dev:subagent:**"] });
+    expect(cfg.skipOperationalSessions).toBe(true);
+    expect(use(cfg, "agent:dev:subagent:abc", "recall")).toBe(true);
+    expect(use(cfg, "agent:dev:subagent:abc", "retain")).toBe(false);
+  });
+
+  it("excludeProviders, temp: and the default filters still apply first", () => {
+    const cfg = parse({
+      excludeProviders: ["heartbeat"],
+      recallOnlySessionPatterns: ["**"],
+    });
+    expect(use(cfg, "agent:dev:main", "recall", "heartbeat")).toBe(false);
+    expect(use(cfg, "temp:x", "recall")).toBe(false);
+  });
+
+  it("leaves unmatched sessions on today's behaviour", () => {
+    const cfg = parse({ recallOnlySessionPatterns: ["agent:other:**"] });
+    expect(use(cfg, "agent:dev:subagent:abc", "recall")).toBe(false);
+    expect(use(cfg, "agent:dev:cron:n:r", "retain")).toBe(false);
+    expect(use(cfg, "agent:dev:main", "recall")).toBe(true);
+    expect(use(cfg, "agent:dev:main", "retain")).toBe(true);
+    expect(use(cfg, undefined, "retain")).toBe(true);
+    const open = parse({
+      skipOperationalSessions: false,
+      recallOnlySessionPatterns: ["agent:other:**"],
+    });
+    expect(use(open, "agent:dev:subagent:abc", "retain")).toBe(true);
   });
 });

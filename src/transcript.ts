@@ -145,21 +145,97 @@ export function isEphemeralOperationalText(text: string): boolean {
 
 const MIN_QUERY_CHARS = 5;
 
+// Optional host timestamp prefix some of these lines carry, as in `[Wed 2026-10-28 19:24 PDT] `.
+const BOILERPLATE_TS = "(?:\\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\\]\\n]*\\]\\s*)?";
+const BOILERPLATE_PATTERNS: readonly RegExp[] = [
+  // Inter-session header, routed-by line, subagent tags, banners and scheduler notices.
+  /^\[Inter-session message\][^\n]*(?:\n|$)/gm,
+  /^This content was routed by OpenClaw[^\n]*(?:\n|$)/gm,
+  /^\[OpenClaw: \d+ (?:messages recorded|earlier messages|messages occurred)[^\n]*\](?:\n|$)/gm,
+  /^\[Subagent Context\][^\n]*(?:\n|$)/gm,
+  /^Every subagent in this batch[^\n]*(?:\n|$)/gm,
+  // Only the tag goes; the reminder text after it stays.
+  /^\[cron:[0-9a-f-]{8,} [^\]\n]*\][ \t]*/gm,
+  new RegExp(`^${BOILERPLATE_TS}OpenClaw resumed this CLI session[^\\n]*(?:\\n|$)`, "gm"),
+  new RegExp(
+    `^${BOILERPLATE_TS}Automation repair request from the scheduler, not a user message\\.[^\\n]*(?:\\n|$)`,
+    "gm",
+  ),
+];
+
+/** Removes host-generated boilerplate lines that carry no user intent. */
+export function stripRecallBoilerplate(text: string): string {
+  let out = text;
+  for (const pattern of BOILERPLATE_PATTERNS) {
+    out = out.replace(pattern, "");
+  }
+  return out.trim();
+}
+
+/** Cleaned recall text for one message, or null when too short or not user text. */
+function cleanRecallCandidate(candidate: string): string | null {
+  let cleaned = stripRecallBoilerplate(cleanMessageText(candidate));
+  cleaned = cleaned.replace(/^(?:System:.*\n)+\n?/, "");
+  cleaned = cleaned.replace(/\n\[from:[^\]]*\]\s*$/, "").trim();
+  if (cleaned.length >= MIN_QUERY_CHARS && !/^\s*system:/i.test(cleaned)) {
+    return cleaned.slice(0, RECALL_MAX_QUERY_CHARS);
+  }
+  return null;
+}
+
 /** The user's current request with host envelopes removed and capped, or null when too short. */
 export function extractRecallQuery(currentUserMessage: string | undefined, prompt: string) {
-  const candidates = [currentUserMessage, prompt];
-  for (const candidate of candidates) {
+  for (const candidate of [currentUserMessage, prompt]) {
     if (!candidate) {
       continue;
     }
-    let cleaned = cleanMessageText(candidate);
-    cleaned = cleaned.replace(/^(?:System:.*\n)+\n?/, "");
-    cleaned = cleaned.replace(/\n\[from:[^\]]*\]\s*$/, "").trim();
-    if (cleaned.length >= MIN_QUERY_CHARS && !/^\s*system:/i.test(cleaned)) {
-      return cleaned.slice(0, RECALL_MAX_QUERY_CHARS);
+    const cleaned = cleanRecallCandidate(candidate);
+    if (cleaned) {
+      return cleaned;
     }
   }
   return null;
+}
+
+/** True for a short message with no URL or path: it leans on the turn before it. */
+export function isShortFollowup(query: string, maxWords: number): boolean {
+  if (maxWords < 1 || /\/|~\/|http/i.test(query)) {
+    return false;
+  }
+  return query.split(/\s+/).filter(Boolean).length <= maxWords;
+}
+
+/**
+ * The user message before the current one, cleaned like the query. The host may or may not list
+ * the current message last, so a trailing user message equal to the query is skipped.
+ */
+export function previousUserQuery(messages: unknown, query: string): string | null {
+  if (!Array.isArray(messages)) {
+    return null;
+  }
+  let skippedCurrent = false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message: unknown = messages[i];
+    if (asMessage(message)?.role !== "user") {
+      continue;
+    }
+    const cleaned = cleanRecallCandidate(messageText(message));
+    if (!cleaned) {
+      continue;
+    }
+    if (!skippedCurrent && cleaned === query) {
+      skippedCurrent = true;
+      continue;
+    }
+    return isEphemeralOperationalText(cleaned) ? null : cleaned;
+  }
+  return null;
+}
+
+/** Previous user message plus the follow-up, capped with the follow-up kept whole. */
+export function expandFollowupQuery(previous: string, followup: string): string {
+  const room = RECALL_MAX_QUERY_CHARS - followup.length - 1;
+  return room > 0 ? `${previous.slice(0, room)}\n${followup}` : followup;
 }
 
 function formatOccurred(start?: string | null, end?: string | null): string {

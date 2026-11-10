@@ -1148,3 +1148,246 @@ describe("offline retain queue", () => {
     service.stop();
   });
 });
+
+describe("session patterns in the hooks", () => {
+  const messages = [{ role: "user", content: "remember this please" }];
+  const prompt = {
+    prompt: "where does hindsight run?",
+    currentUserMessage: "where does hindsight run?",
+    messages: [],
+  };
+  const subagentCtx = {
+    agentId: "dev",
+    sessionKey: "agent:dev:subagent:abc",
+    memoryAudience: OWNER,
+    runId: "r1",
+  };
+
+  it("recall-only subagent recalls from the owner bank and never retains", async () => {
+    const { fake, hook, registerTool } = setup({
+      recallOnlySessionPatterns: ["agent:dev:subagent:**"],
+    });
+    const result = await hook("before_prompt_build")(prompt, subagentCtx);
+    expect(result.prependContext).toContain("- Studio hosts Hindsight [world]");
+    expect(fake.requests[0]?.url).toBe(
+      "http://hindsight.test/v1/default/banks/dev/memories/recall",
+    );
+    fake.requests.length = 0;
+    await hook("agent_end")({ success: true, runId: "r1", messages }, subagentCtx);
+    expect(retained(fake.requests)).toEqual([]);
+    expect(fake.requests).toEqual([]);
+    // Tools are registered as factories; the retain factory yields null for this session.
+    const factories = registerTool.mock.calls.map(([factory, opts]) => [opts.name, factory]);
+    const byName = Object.fromEntries(factories) as Record<string, AnyFn | undefined>;
+    expect(byName.hindsight_retain!(subagentCtx)).toBeNull();
+    expect(byName.hindsight_recall!(subagentCtx)).not.toBeNull();
+    expect(byName.hindsight_reflect!(subagentCtx)).not.toBeNull();
+  });
+
+  it("ignored sessions neither recall nor retain, even when also recall-only", async () => {
+    const { fake, hook } = setup({
+      ignoreSessionPatterns: ["agent:dev:subagent:abc"],
+      recallOnlySessionPatterns: ["agent:dev:subagent:**"],
+    });
+    expect(await hook("before_prompt_build")(prompt, subagentCtx)).toBeUndefined();
+    await hook("agent_end")({ success: true, runId: "r1", messages }, subagentCtx);
+    expect(fake.requests).toEqual([]);
+  });
+
+  it("leaves an unmatched subagent skipped and an unmatched main session retaining", async () => {
+    const { fake, hook } = setup({ recallOnlySessionPatterns: ["agent:other:**"] });
+    expect(await hook("before_prompt_build")(prompt, subagentCtx)).toBeUndefined();
+    await hook("agent_end")({ success: true, runId: "r1", messages }, subagentCtx);
+    expect(fake.requests).toEqual([]);
+    const main = { agentId: "dev", sessionKey: "agent:dev:main", memoryAudience: OWNER };
+    await hook("agent_end")({ success: true, runId: "r2", messages }, main);
+    expect(retained(fake.requests)).toHaveLength(1);
+  });
+});
+
+const FACT = [{ id: "m1", text: "Studio hosts Hindsight", type: "world" }];
+
+function recallCtx(sessionKey = "agent:dev:main", audience = OWNER, agentId = "dev") {
+  return { agentId, sessionKey, memoryAudience: audience };
+}
+
+function recallEv(text: string, messages: unknown[] = []) {
+  return { prompt: text, currentUserMessage: text, messages };
+}
+
+describe("auto-recall cache and follow-ups", () => {
+  const RECALL_DEV = "POST /v1/default/banks/dev/memories/recall";
+  const RECALL_OPS = "POST /v1/default/banks/ops/memories/recall";
+  const OPS = { kind: "owner-private" as const, agentId: "ops" };
+
+  function setupRecall(extra: Record<string, unknown>, devResults: () => unknown[]) {
+    const fake = createFakeHindsight({
+      [RECALL_DEV]: () => ({ json: { results: devResults() } }),
+      [RECALL_OPS]: () => ({ json: { results: [{ id: "o1", text: "ops fact", type: "world" }] } }),
+    });
+    vi.stubGlobal("fetch", fake.fetch);
+    const pluginConfig = {
+      hindsightApiUrl: "http://hindsight.test",
+      allowInsecureHttp: true,
+      hindsightApiToken: "t",
+      ...extra,
+    };
+    const on = vi.fn<AnyFn>();
+    const api = createFakePluginApi({ pluginConfig, config: {}, on });
+    memoryPlugin.register(api);
+    const run = on.mock.calls.find(([name]) => name === "before_prompt_build")![1];
+    const recalls = () => fake.requests.filter((r) => r.url.endsWith("/memories/recall"));
+    const sources = () =>
+      (api.logger.debug as unknown as ReturnType<typeof vi.fn<AnyFn>>).mock.calls
+        .map(([msg]) => /auto-recall source=(\S+)/.exec(String(msg))?.[1])
+        .filter(Boolean);
+    return { run, recalls, sources, fake };
+  }
+
+  it("with both keys off every call is fresh", async () => {
+    const { run, recalls, sources } = setupRecall({}, () => FACT);
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    await run(recallEv("and the mini"), recallCtx());
+    expect(recalls()).toHaveLength(3);
+    expect(sources()).toEqual(["fresh", "fresh", "fresh"]);
+  });
+
+  it("serves the same query from cache within the TTL and recalls after it", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { run, recalls, sources } = setupRecall({ recallCacheTtlMs: 1000 }, () => FACT);
+      const first = await run(recallEv("where does hindsight run?"), recallCtx());
+      vi.advanceTimersByTime(999);
+      const second = await run(recallEv("where does hindsight run?"), recallCtx());
+      expect(recalls()).toHaveLength(1);
+      expect(first.prependContext).toContain("Studio hosts Hindsight");
+      expect(second.prependContext).toContain("Studio hosts Hindsight");
+      vi.advanceTimersByTime(2);
+      await run(recallEv("where does hindsight run?"), recallCtx());
+      expect(recalls()).toHaveLength(2);
+      expect(sources()).toEqual(["fresh", "cached", "fresh"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("misses for a different query, session or bank", async () => {
+    const { run, recalls } = setupRecall({ recallCacheTtlMs: 60_000 }, () => FACT);
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    await run(recallEv("where does the nas live?"), recallCtx());
+    expect(recalls()).toHaveLength(2);
+    await run(recallEv("where does the nas live?"), recallCtx("agent:dev:other"));
+    expect(recalls()).toHaveLength(3);
+    await run(recallEv("where does the nas live?"), recallCtx("agent:dev:other", OPS, "ops"));
+    expect(recalls()).toHaveLength(4);
+    expect(recalls()[3]?.url).toContain("/banks/ops/");
+    // The same session on another bank did not evict or reuse the dev entry.
+    await run(recallEv("where does the nas live?"), recallCtx("agent:dev:other"));
+    expect(recalls()).toHaveLength(5);
+  });
+
+  it("skips a short follow-up only after a recall that returned memories", async () => {
+    const { run, recalls, sources } = setupRecall(
+      { recallCacheTtlMs: 60_000, recallFollowupMaxWords: 6 },
+      () => FACT,
+    );
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    const result = await run(recallEv("and the mini then"), recallCtx());
+    expect(result).toBeUndefined();
+    expect(recalls()).toHaveLength(1);
+    expect(sources()).toEqual(["fresh", "followup-skip"]);
+  });
+
+  it("an empty recall never enables the skip; the follow-up expands with the previous message", async () => {
+    const { run, recalls, sources } = setupRecall(
+      { recallCacheTtlMs: 60_000, recallFollowupMaxWords: 6 },
+      () => [],
+    );
+    const history = [
+      { role: "user", content: "where does hindsight run?" },
+      { role: "assistant", content: "on the studio" },
+      { role: "user", content: "and the mini then" },
+    ];
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    await run(recallEv("and the mini then", history), recallCtx());
+    expect(recalls()).toHaveLength(2);
+    expect((recalls()[1]!.body as { query: string }).query).toBe(
+      "where does hindsight run?\nand the mini then",
+    );
+    expect(sources()).toEqual(["fresh", "followup-expanded"]);
+  });
+
+  it("with no TTL a follow-up always recalls, expanded", async () => {
+    const { run, recalls, sources } = setupRecall({ recallFollowupMaxWords: 6 }, () => FACT);
+    const history = [
+      { role: "user", content: "where does hindsight run?" },
+      { role: "user", content: "and the mini then" },
+    ];
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    await run(recallEv("and the mini then", history), recallCtx());
+    expect(recalls()).toHaveLength(2);
+    expect(sources()).toEqual(["fresh", "followup-expanded"]);
+  });
+
+  it("a follow-up after the TTL recalls fresh instead of skipping", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { run, recalls } = setupRecall(
+        { recallCacheTtlMs: 1000, recallFollowupMaxWords: 6 },
+        () => FACT,
+      );
+      await run(recallEv("where does hindsight run?"), recallCtx());
+      vi.advanceTimersByTime(1001);
+      await run(recallEv("and the mini then"), recallCtx());
+      expect(recalls()).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never treats a URL or path message as a follow-up", async () => {
+    const { run, recalls, sources } = setupRecall(
+      { recallCacheTtlMs: 60_000, recallFollowupMaxWords: 6 },
+      () => FACT,
+    );
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    await run(recallEv("see http://x.test"), recallCtx());
+    await run(recallEv("open ~/work/x"), recallCtx());
+    await run(recallEv("read src/index.ts"), recallCtx());
+    expect(recalls()).toHaveLength(4);
+    expect(sources()).toEqual(["fresh", "fresh", "fresh", "fresh"]);
+  });
+
+  it("a follow-up skip does not cross sessions", async () => {
+    const { run, recalls } = setupRecall(
+      { recallCacheTtlMs: 60_000, recallFollowupMaxWords: 6 },
+      () => FACT,
+    );
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    const other = await run(recallEv("and the mini then"), recallCtx("agent:dev:other"));
+    expect(recalls()).toHaveLength(2);
+    expect(other.prependContext).toContain("Studio hosts Hindsight");
+  });
+
+  it("incognito and maintenance sessions still do no recall, cache or not", async () => {
+    const { run, recalls } = setupRecall(
+      { recallCacheTtlMs: 60_000, recallFollowupMaxWords: 6 },
+      () => FACT,
+    );
+    await run(recallEv("where does hindsight run?"), recallCtx("agent:dev:dashboard:incognito-x"));
+    await run(recallEv("where does hindsight run?"), {
+      ...recallCtx("agent:dev:cron:job1"),
+      trigger: "heartbeat",
+    });
+    expect(recalls()).toHaveLength(0);
+  });
+
+  it("boilerplate-only messages trigger no recall", async () => {
+    const { run, recalls } = setupRecall({}, () => FACT);
+    const banner =
+      "[Inter-session message] sourceSession=agent:dev:subagent:1 isUser=false\nThis content was routed by OpenClaw from another session.";
+    await expect(run(recallEv(banner), recallCtx())).resolves.toBeUndefined();
+    expect(recalls()).toHaveLength(0);
+  });
+});

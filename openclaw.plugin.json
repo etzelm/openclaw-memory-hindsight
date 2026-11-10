@@ -72,6 +72,16 @@
       "help": "Queued retains older than this are dropped (default 7 days)",
       "advanced": true
     },
+    "recallCacheTtlMs": {
+      "label": "Recall Cache TTL (ms)",
+      "help": "Serve a repeated auto-recall query from a per-session cache for this long; 0 turns the cache off",
+      "advanced": true
+    },
+    "recallFollowupMaxWords": {
+      "label": "Recall Follow-up Max Words",
+      "help": "Messages this short (no URL or path) skip auto-recall while the session has a recent non-empty recall, else recall with the previous user message added; 0 turns it off",
+      "advanced": true
+    },
     "retainMission": {
       "label": "Retain Mission",
       "help": "Applied to each bank before its first write: what Hindsight should extract",
@@ -85,6 +95,11 @@
     "knowledgeReadTools": {
       "label": "Knowledge Base Read Tools",
       "help": "Offer hindsight_get_knowledge_base_tree, hindsight_search_knowledge_base and hindsight_get_knowledge_page on the same bank as hindsight_recall",
+      "advanced": true
+    },
+    "listToolsWithoutAudience": {
+      "label": "List Tools Without Audience",
+      "help": "List the hindsight_* tools when the host builds a session's tool list before it attaches the memory audience (claude-cli sessions on OpenClaw 2026.11.x). Calls still need the audience",
       "advanced": true
     }
   },
@@ -152,6 +167,22 @@
       "skipOperationalSessions": {
         "type": "boolean"
       },
+      "ignoreSessionPatterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "description": "Session-key globs that get no auto-recall, no auto-retain and no hindsight_* tools. `*` matches any run of characters except ':', `**` matches anything including ':'. Checked after excludeProviders, temp: and incognito, and before recallOnlySessionPatterns. Never selects a bank"
+      },
+      "recallOnlySessionPatterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "description": "Session-key globs that get auto-recall and the read tools (hindsight_recall, hindsight_reflect, knowledge-base read tools) even when skipOperationalSessions would skip them, but never auto-retain and no hindsight_retain tool. Same glob syntax as ignoreSessionPatterns. Never selects a bank"
+      },
       "retainQueueEnabled": {
         "type": "boolean",
         "default": true,
@@ -170,10 +201,29 @@
         "default": 604800000,
         "description": "Queued retains older than this many milliseconds are dropped (default 7 days)"
       },
+      "recallCacheTtlMs": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 3600000,
+        "default": 0,
+        "description": "Auto-recall cache lifetime in milliseconds, per session and bank (same query within this time is served without an API call); 0 = off. Also bounds how long a recall counts for recallFollowupMaxWords"
+      },
+      "recallFollowupMaxWords": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+        "default": 0,
+        "description": "A message with at most this many words and no URL or path is a short follow-up. Within recallCacheTtlMs of a recall that returned memories it skips auto-recall; otherwise the query is the previous user message plus the follow-up. Needs recallCacheTtlMs > 0 to skip; 0 = off"
+      },
       "knowledgeReadTools": {
         "type": "boolean",
         "default": false,
         "description": "Offer the read-only knowledge-base tools (tree, search, page) on the session's own memory bank"
+      },
+      "listToolsWithoutAudience": {
+        "type": "boolean",
+        "default": false,
+        "description": "List the hindsight_* tools for an agent session whose tool list the host builds without its memory audience (claude-cli MCP tool projection on OpenClaw 2026.11.x). The bank still comes only from the audience: a call without one fails before any request"
       },
       "agentBankMap": {
         "type": "object",

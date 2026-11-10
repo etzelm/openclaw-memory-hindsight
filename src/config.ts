@@ -23,6 +23,8 @@ export type HindsightConfig = {
   retainTags: string[];
   excludeProviders: string[];
   skipOperationalSessions: boolean;
+  ignoreSessionPatterns: string[];
+  recallOnlySessionPatterns: string[];
   /** Agent id -> owner bank id, so several agents can share one owner-private bank. */
   agentBankMap: Readonly<Record<string, string>>;
   /** Opt-in for plain http to a non-loopback host (token and conversation text unencrypted). */
@@ -33,7 +35,16 @@ export type HindsightConfig = {
   retainQueueMaxAgeMs: number;
   /** Offer the read-only knowledge-base tools (tree, search, page). Off by default. */
   knowledgeReadTools: boolean;
+  /** List the tools when the host builds a session's tool list without its memory audience. */
+  listToolsWithoutAudience: boolean;
+  /** Per-session auto-recall cache lifetime in ms; 0 turns the cache and the follow-up rules off. */
+  recallCacheTtlMs: number;
+  /** A query of at most this many words (no URL or path) is a short follow-up; 0 = off. */
+  recallFollowupMaxWords: number;
 };
+
+export const MAX_RECALL_CACHE_TTL_MS = 3_600_000;
+export const MAX_RECALL_FOLLOWUP_WORDS = 100;
 
 export const DEFAULT_RETAIN_QUEUE_MAX_ITEMS = 500;
 export const MAX_RETAIN_QUEUE_MAX_ITEMS = 10_000;
@@ -70,12 +81,17 @@ const CONFIG_KEYS = [
   "retainTags",
   "excludeProviders",
   "skipOperationalSessions",
+  "ignoreSessionPatterns",
+  "recallOnlySessionPatterns",
   "agentBankMap",
   "allowInsecureHttp",
   "retainQueueEnabled",
   "retainQueueMaxItems",
   "retainQueueMaxAgeMs",
   "knowledgeReadTools",
+  "listToolsWithoutAudience",
+  "recallCacheTtlMs",
+  "recallFollowupMaxWords",
 ] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -146,6 +162,23 @@ function readPositiveInt(
   }
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > max) {
     throw new Error(`${key} must be an integer from 1 to ${max}`);
+  }
+  return value;
+}
+
+/** Integer from 0 to max; 0 means off. */
+function readNonNegativeInt(
+  cfg: Record<string, unknown>,
+  key: string,
+  fallback: number,
+  max: number,
+): number {
+  const value = cfg[key];
+  if (value === undefined) {
+    return fallback;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > max) {
+    throw new Error(`${key} must be an integer from 0 to ${max}`);
   }
   return value;
 }
@@ -268,6 +301,8 @@ export const hindsightConfigSchema = {
       retainTags: readStringList(value, "retainTags") ?? [],
       excludeProviders: readStringList(value, "excludeProviders") ?? [],
       skipOperationalSessions: readBool(value, "skipOperationalSessions", true),
+      ignoreSessionPatterns: readStringList(value, "ignoreSessionPatterns") ?? [],
+      recallOnlySessionPatterns: readStringList(value, "recallOnlySessionPatterns") ?? [],
       agentBankMap: readBankMap(value),
       allowInsecureHttp,
       retainQueueEnabled: readBool(value, "retainQueueEnabled", true),
@@ -283,6 +318,14 @@ export const hindsightConfigSchema = {
         DEFAULT_RETAIN_QUEUE_MAX_AGE_MS,
       ),
       knowledgeReadTools: readBool(value, "knowledgeReadTools", false),
+      listToolsWithoutAudience: readBool(value, "listToolsWithoutAudience", false),
+      recallCacheTtlMs: readNonNegativeInt(value, "recallCacheTtlMs", 0, MAX_RECALL_CACHE_TTL_MS),
+      recallFollowupMaxWords: readNonNegativeInt(
+        value,
+        "recallFollowupMaxWords",
+        0,
+        MAX_RECALL_FOLLOWUP_WORDS,
+      ),
     };
   },
 };

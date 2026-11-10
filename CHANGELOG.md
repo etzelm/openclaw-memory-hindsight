@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.0 (2026-11-10)
+
+### Upgrade notes
+
+- No config change is needed. All new keys default off.
+- The auto-recall query strip is always on. Recall queries change slightly, because host
+  boilerplate is no longer sent.
+- The config schema rejects unknown keys. A config that uses `listToolsWithoutAudience`,
+  `ignoreSessionPatterns`, `recallOnlySessionPatterns`, `recallCacheTtlMs` or
+  `recallFollowupMaxWords` fails validation on 0.3.0 and 0.4.0. Remove those keys before a
+  downgrade.
+
+### Added
+
+- `listToolsWithoutAudience` (default off): list the `hindsight_*` tools for agent sessions whose
+  tool list the host builds without a memory audience. OpenClaw 2026.11.x does this for claude-cli
+  turns (MCP tool projection), so those sessions had no Hindsight tools. A call still resolves its
+  bank only from the host-minted audience and fails without one.
+- `ignoreSessionPatterns` and `recallOnlySessionPatterns` (session-key globs, both default `[]`).
+  An ignored session gets no auto-recall, no auto-retain and no `hindsight_*` tools. A
+  recall-only session gets auto-recall and the read tools (`hindsight_recall`,
+  `hindsight_reflect`, and the knowledge-base read tools when `knowledgeReadTools` is on) even if
+  `skipOperationalSessions` would skip it, but never retains. Ignore wins over recall-only;
+  `excludeProviders`, `temp:` and incognito sessions still win over both. Patterns never select
+  a bank. See README, Configuration.
+- Auto-recall drops host boilerplate from the query (inter-session header, routed-by line,
+  messages-recorded banner, subagent context lines, cron tag, CLI-resumed and automation-repair
+  notices); a message that is only boilerplate no longer triggers a recall.
+- `recallCacheTtlMs` (default `0`, off): per-session cache of auto-recall results, keyed by
+  session, bank and query. Never shared across sessions or banks.
+- `recallFollowupMaxWords` (default `0`, off): short follow-ups skip auto-recall while the session
+  has a recent recall that returned memories, and otherwise recall with the previous user message
+  added to the query. An empty recall never enables the skip. Debug log tags each auto-recall
+  `fresh`, `cached`, `followup-skip` or `followup-expanded`.
+
 ## 0.4.0 (2026-11-09)
 
 ### Upgrade notes

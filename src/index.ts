@@ -8,7 +8,7 @@ import {
 } from "openclaw/plugin-sdk/plugin-entry";
 import { isIncognitoSessionKey } from "openclaw/plugin-sdk/routing";
 import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { isBankNotFound } from "./client.js";
+import { type HindsightRecallResult, isBankNotFound } from "./client.js";
 import {
   type HindsightConfig,
   hasUnresolvedToken,
@@ -52,9 +52,12 @@ import {
 } from "./tools.js";
 import {
   buildRecallContext,
+  expandFollowupQuery,
   extractRecallQuery,
   isEphemeralOperationalText,
+  isShortFollowup,
   prepareRetentionTranscript,
+  previousUserQuery,
   retainStartIndex,
   runStartMarker,
 } from "./transcript.js";
@@ -62,6 +65,21 @@ import {
 export const PLUGIN_ID = "hindsight-native";
 // Bounds per-session run markers; one entry per active session is enough.
 const MAX_RUN_MARKERS = 1_000;
+// Bounds the auto-recall cache; one entry per active session, oldest dropped first.
+const MAX_RECALL_CACHE_SESSIONS = 512;
+
+type RecallResults = HindsightRecallResult[];
+type RecallCacheEntry = {
+  bankId: string;
+  queryHash: string;
+  results: RecallResults;
+  at: number;
+};
+type RecallSource = "fresh" | "cached" | "followup-skip" | "followup-expanded";
+
+function queryDigest(query: string): string {
+  return createHash("sha256").update(query).digest("hex");
+}
 
 /**
  * Reads `plugins.entries[<id>].config` from a runtime config snapshot. Returns undefined when the
@@ -164,6 +182,9 @@ export default definePluginEntry({
     // agent_end for the run (host continuation after a retry, or a re-delivery) re-sends all of it.
     const runStartBySession = new Map<string, { runId?: string; marker: string | null }>();
 
+    // Last auto-recall per session (never shared across sessions; the bank is checked on read).
+    const recallCache = new Map<string, RecallCacheEntry>();
+
     const capability: MemoryPluginCapability = {
       providerRuntime: createHindsightProviderRuntime({
         providerId: PLUGIN_ID,
@@ -239,6 +260,7 @@ export default definePluginEntry({
         !sessionUsesMemory(config, {
           sessionKey,
           messageProvider: ctx.messageProvider,
+          purpose: "recall",
         })
       ) {
         return undefined;
@@ -254,38 +276,79 @@ export default definePluginEntry({
       }
       try {
         ctx.assertMemoryAudienceCurrent?.();
-        // Metrics count the Hindsight request only. A host assert that throws (audience changed,
-        // hook invocation stale) is host lifecycle, not a recall outcome, so it records nothing.
-        const recallStarted = performance.now();
-        let results: Awaited<ReturnType<typeof service.client.recall>>;
-        try {
-          results = await service.client.recall(route.bankId, query, {
-            budget: config.recallBudget,
-            maxTokens: RECALL_MAX_TOKENS,
-            ...(config.recallTypes ? { types: config.recallTypes } : {}),
-            ...(config.preferObservations === undefined
-              ? {}
-              : { preferObservations: config.preferObservations }),
-            signal: AbortSignal.timeout(RECALL_TIMEOUT_MS),
-          });
-        } catch (error) {
+        const ttl = config.recallCacheTtlMs;
+        const now = Date.now();
+        const cached = ttl > 0 && sessionKey ? recallCache.get(sessionKey) : undefined;
+        const live = cached && cached.bankId === route.bankId && now - cached.at < ttl;
+        const followup = isShortFollowup(query, config.recallFollowupMaxWords);
+        if (followup && live && cached.results.length > 0) {
+          api.logger.debug?.("memory-hindsight: auto-recall source=followup-skip");
+          return undefined;
+        }
+        let recallQuery = query;
+        let source: RecallSource = "fresh";
+        if (followup) {
+          const previous = previousUserQuery(event.messages, query);
+          if (previous) {
+            recallQuery = expandFollowupQuery(previous, query);
+            source = "followup-expanded";
+          }
+        }
+        const queryHash = queryDigest(recallQuery);
+        let results: RecallResults;
+        if (live && cached.queryHash === queryHash) {
+          results = cached.results;
+          source = "cached";
+        } else {
+          // Metrics count the Hindsight request only. A host assert that throws (audience changed,
+          // hook invocation stale) is host lifecycle, not a recall outcome, so it records nothing.
+          const recallStarted = performance.now();
+          try {
+            results = await service.client.recall(route.bankId, recallQuery, {
+              budget: config.recallBudget,
+              maxTokens: RECALL_MAX_TOKENS,
+              ...(config.recallTypes ? { types: config.recallTypes } : {}),
+              ...(config.preferObservations === undefined
+                ? {}
+                : { preferObservations: config.preferObservations }),
+              signal: AbortSignal.timeout(RECALL_TIMEOUT_MS),
+            });
+          } catch (error) {
+            metrics.recordRecall(
+              ctx.agentId,
+              route.bankId,
+              isBankNotFound(error) ? "empty" : isTimeoutError(error) ? "timeout" : "error",
+              performance.now() - recallStarted,
+            );
+            throw error;
+          }
+          const recallMs = performance.now() - recallStarted;
+          ctx.assertMemoryAudienceCurrent?.();
+          ctx.hookInvocation?.assertActive();
           metrics.recordRecall(
             ctx.agentId,
             route.bankId,
-            isBankNotFound(error) ? "empty" : isTimeoutError(error) ? "timeout" : "error",
-            performance.now() - recallStarted,
+            results.length === 0 ? "empty" : "injected",
+            recallMs,
           );
-          throw error;
+          if (ttl > 0 && sessionKey) {
+            recallCache.delete(sessionKey);
+            recallCache.set(sessionKey, {
+              bankId: route.bankId,
+              queryHash,
+              results,
+              at: Date.now(),
+            });
+            if (recallCache.size > MAX_RECALL_CACHE_SESSIONS) {
+              recallCache.delete(recallCache.keys().next().value!);
+            }
+          }
         }
-        const recallMs = performance.now() - recallStarted;
-        ctx.assertMemoryAudienceCurrent?.();
-        ctx.hookInvocation?.assertActive();
-        metrics.recordRecall(
-          ctx.agentId,
-          route.bankId,
-          results.length === 0 ? "empty" : "injected",
-          recallMs,
-        );
+        api.logger.debug?.(`memory-hindsight: auto-recall source=${source}`);
+        if (source === "cached") {
+          ctx.assertMemoryAudienceCurrent?.();
+          ctx.hookInvocation?.assertActive();
+        }
         if (results.length === 0) {
           return undefined;
         }
@@ -331,6 +394,7 @@ export default definePluginEntry({
         !sessionUsesMemory(config, {
           sessionKey,
           messageProvider: ctx.messageProvider,
+          purpose: "retain",
         })
       ) {
         return;
@@ -406,6 +470,7 @@ export default definePluginEntry({
       const key = ctx.sessionKey ?? event.sessionKey;
       if (key) {
         runStartBySession.delete(key);
+        recallCache.delete(key);
       }
     });
 
@@ -433,6 +498,7 @@ export default definePluginEntry({
       stop: () => {
         service.stop();
         runStartBySession.clear();
+        recallCache.clear();
         api.logger.info("memory-hindsight: stopped");
       },
     });

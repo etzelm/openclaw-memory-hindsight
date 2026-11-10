@@ -67,17 +67,63 @@ export function routeAudience(
 const OPERATIONAL_SESSION_RE = /^agent:[^:]+:(cron|heartbeat|subagent):/;
 const OPERATIONAL_PROVIDERS = new Set(["cron", "heartbeat", "subagent"]);
 
-/** Session filter shared by auto-recall, auto-retain and tool registration. */
+const globCache = new Map<string, RegExp>();
+
+/**
+ * Session-key glob: `*` matches any run of characters except ":", `**` matches anything
+ * including ":", everything else is literal.
+ */
+function sessionGlobRegExp(glob: string): RegExp {
+  let re = globCache.get(glob);
+  if (!re) {
+    let source = "";
+    for (let i = 0; i < glob.length; i += 1) {
+      const ch = glob[i]!;
+      if (ch === "*") {
+        if (glob[i + 1] === "*") {
+          source += ".*";
+          i += 1;
+        } else {
+          source += "[^:]*";
+        }
+      } else {
+        source += ch.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+      }
+    }
+    re = new RegExp(`^${source}$`, "s");
+    globCache.set(glob, re);
+  }
+  return re;
+}
+
+/** True when the trimmed session key matches any glob; a missing key matches nothing. */
+export function matchesSessionPattern(sessionKey: string | undefined, globs: readonly string[]) {
+  const key = sessionKey?.trim();
+  return Boolean(key) && globs.some((glob) => sessionGlobRegExp(glob).test(key!));
+}
+
+/**
+ * Session filter shared by auto-recall, auto-retain and tool registration. Patterns only
+ * decide whether a session uses memory; they never select a bank.
+ */
 export function sessionUsesMemory(
-  config: Pick<HindsightConfig, "excludeProviders" | "skipOperationalSessions">,
-  params: { sessionKey?: string; messageProvider?: string },
+  config: Pick<HindsightConfig, "excludeProviders" | "skipOperationalSessions"> &
+    Partial<Pick<HindsightConfig, "ignoreSessionPatterns" | "recallOnlySessionPatterns">>,
+  // A missing purpose is treated as "retain", the stricter side.
+  params: { sessionKey?: string; messageProvider?: string; purpose?: "recall" | "retain" },
 ): boolean {
-  const { sessionKey, messageProvider } = params;
+  const { sessionKey, messageProvider, purpose } = params;
   if (messageProvider && config.excludeProviders.includes(messageProvider)) {
     return false;
   }
   if (sessionKey?.startsWith("temp:")) {
     return false;
+  }
+  if (matchesSessionPattern(sessionKey, config.ignoreSessionPatterns ?? [])) {
+    return false;
+  }
+  if (matchesSessionPattern(sessionKey, config.recallOnlySessionPatterns ?? [])) {
+    return purpose === "recall";
   }
   if (!config.skipOperationalSessions) {
     return true;

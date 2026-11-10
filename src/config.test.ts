@@ -291,3 +291,86 @@ describe("retain queue config", () => {
     );
   });
 });
+
+describe("session pattern keys", () => {
+  const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
+
+  it("default to empty lists", () => {
+    const cfg = hindsightConfigSchema.parse(base);
+    expect(cfg.ignoreSessionPatterns).toEqual([]);
+    expect(cfg.recallOnlySessionPatterns).toEqual([]);
+  });
+
+  it("trim, dedupe and drop blanks like other string lists", () => {
+    const cfg = hindsightConfigSchema.parse({
+      ...base,
+      ignoreSessionPatterns: [" agent:a:** ", "agent:a:**", ""],
+      recallOnlySessionPatterns: ["agent:dev:subagent:**"],
+    });
+    expect(cfg.ignoreSessionPatterns).toEqual(["agent:a:**"]);
+    expect(cfg.recallOnlySessionPatterns).toEqual(["agent:dev:subagent:**"]);
+  });
+
+  it("rejects non-string-array values", () => {
+    expect(() => hindsightConfigSchema.parse({ ...base, ignoreSessionPatterns: "x" })).toThrow(
+      /ignoreSessionPatterns must be an array of strings/,
+    );
+    expect(() => hindsightConfigSchema.parse({ ...base, recallOnlySessionPatterns: [1] })).toThrow(
+      /recallOnlySessionPatterns must be an array of strings/,
+    );
+  });
+
+  it("are declared in the manifest schema", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ) as { configSchema: { properties: Record<string, { type: string; default?: unknown }> } };
+    for (const key of ["ignoreSessionPatterns", "recallOnlySessionPatterns"]) {
+      expect(manifest.configSchema.properties[key]).toMatchObject({ type: "array", default: [] });
+    }
+  });
+});
+
+describe("recall cache keys", () => {
+  const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
+
+  it("defaults both to 0 (off)", () => {
+    const cfg = hindsightConfigSchema.parse(base);
+    expect(cfg.recallCacheTtlMs).toBe(0);
+    expect(cfg.recallFollowupMaxWords).toBe(0);
+  });
+
+  it("accepts in-range integers", () => {
+    const cfg = hindsightConfigSchema.parse({
+      ...base,
+      recallCacheTtlMs: 900_000,
+      recallFollowupMaxWords: 6,
+    });
+    expect(cfg.recallCacheTtlMs).toBe(900_000);
+    expect(cfg.recallFollowupMaxWords).toBe(6);
+  });
+
+  it("rejects negative, fractional, oversized and non-number values", () => {
+    for (const bad of [-1, 1.5, 3_600_001, "900000"]) {
+      expect(() => hindsightConfigSchema.parse({ ...base, recallCacheTtlMs: bad })).toThrow(
+        /recallCacheTtlMs must be an integer from 0 to 3600000/,
+      );
+    }
+    for (const bad of [-1, 2.5, 101, "6"]) {
+      expect(() => hindsightConfigSchema.parse({ ...base, recallFollowupMaxWords: bad })).toThrow(
+        /recallFollowupMaxWords must be an integer from 0 to 100/,
+      );
+    }
+  });
+
+  it("declares both keys in the manifest config schema", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ) as {
+      configSchema: { properties: Record<string, { default?: number; description?: string }> };
+    };
+    for (const key of ["recallCacheTtlMs", "recallFollowupMaxWords"]) {
+      expect(manifest.configSchema.properties[key]?.default).toBe(0);
+      expect(manifest.configSchema.properties[key]?.description).toBeTruthy();
+    }
+  });
+});

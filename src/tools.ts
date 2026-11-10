@@ -38,6 +38,22 @@ function requiredString(params: Record<string, unknown>, name: string): string {
   return value.trim();
 }
 
+export const NO_AUDIENCE_AT_CALL =
+  "This session has no host memory audience for this call, so Hindsight memory is unavailable.";
+
+/**
+ * A tool listed for a session whose tool list the host built without a memory audience. Reading
+ * `bankId` throws, so `execute` fails before any request; the host builds the callable tool again
+ * with the session's audience, and that copy gets a real bank.
+ */
+function deferredBank(): { readonly bankId: string } {
+  return {
+    get bankId(): string {
+      throw new Error(NO_AUDIENCE_AT_CALL);
+    },
+  };
+}
+
 /**
  * Resolves the bank for one tool context, or null when the session must not get the tool.
  * The bank comes only from the host-minted audience; the model never names a bank.
@@ -45,14 +61,30 @@ function requiredString(params: Record<string, unknown>, name: string): string {
 function resolveToolBank(
   service: HindsightService,
   ctx: OpenClawPluginToolContext,
-): { bankId: string } | null {
+  purpose: "recall" | "retain",
+): { readonly bankId: string } | null {
   const config = service.config();
   if (
     config.memoryMode === "context" ||
     isIncognitoSessionKey(ctx.sessionKey) ||
-    !sessionUsesMemory(config, { sessionKey: ctx.sessionKey, messageProvider: ctx.messageChannel })
+    !sessionUsesMemory(config, {
+      sessionKey: ctx.sessionKey,
+      messageProvider: ctx.messageChannel,
+      purpose,
+    })
   ) {
     return null;
+  }
+  // Some hosts list a session's tools before they attach its audience (claude-cli MCP tool
+  // projection on OpenClaw 2026.11.x). Opt-in: list the tool for an agent session with a key, and
+  // let only the audience-bearing copy built for the call reach Hindsight.
+  if (
+    config.listToolsWithoutAudience &&
+    !ctx.memoryAudience &&
+    ctx.agentId?.trim() &&
+    ctx.sessionKey?.trim()
+  ) {
+    return deferredBank();
   }
   const route = routeAudience(ctx.agentId, ctx.memoryAudience, config.agentBankMap);
   return route.ok ? { bankId: route.bankId } : null;
@@ -100,7 +132,7 @@ export function createRetainTool(
   deduper: FlushDeduper,
   ctx: OpenClawPluginToolContext,
 ): ToolBody | null {
-  const bank = resolveToolBank(service, ctx);
+  const bank = resolveToolBank(service, ctx, "retain");
   if (!bank) {
     return null;
   }
@@ -182,7 +214,7 @@ export function createRecallTool(
   service: HindsightService,
   ctx: OpenClawPluginToolContext,
 ): ToolBody | null {
-  const bank = resolveToolBank(service, ctx);
+  const bank = resolveToolBank(service, ctx, "recall");
   if (!bank) {
     return null;
   }
@@ -231,7 +263,7 @@ export function createReflectTool(
   service: HindsightService,
   ctx: OpenClawPluginToolContext,
 ): ToolBody | null {
-  const bank = resolveToolBank(service, ctx);
+  const bank = resolveToolBank(service, ctx, "recall");
   if (!bank) {
     return null;
   }
@@ -280,8 +312,8 @@ const KB_TREE_MAX_DEPTH = 32;
 function resolveKnowledgeBank(
   service: HindsightService,
   ctx: OpenClawPluginToolContext,
-): { bankId: string } | null {
-  return service.config().knowledgeReadTools ? resolveToolBank(service, ctx) : null;
+): { readonly bankId: string } | null {
+  return service.config().knowledgeReadTools ? resolveToolBank(service, ctx, "recall") : null;
 }
 
 /** Server text as one line, so a name or snippet cannot forge extra list entries. */
