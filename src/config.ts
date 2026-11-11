@@ -35,8 +35,6 @@ export type HindsightConfig = {
   retainQueueMaxAgeMs: number;
   /** Offer the read-only knowledge-base tools (tree, search, page). Off by default. */
   knowledgeReadTools: boolean;
-  /** List the tools when the host builds a session's tool list without its memory audience. */
-  listToolsWithoutAudience: boolean;
   /** Per-session auto-recall cache lifetime in ms; 0 turns the cache and the follow-up rules off. */
   recallCacheTtlMs: number;
   /** A query of at most this many words (no URL or path) is a short follow-up; 0 = off. */
@@ -89,6 +87,7 @@ const CONFIG_KEYS = [
   "retainQueueMaxItems",
   "retainQueueMaxAgeMs",
   "knowledgeReadTools",
+  // Deprecated in 0.6.0 and ignored: accepted so a config that still sets it keeps validating.
   "listToolsWithoutAudience",
   "recallCacheTtlMs",
   "recallFollowupMaxWords",
@@ -318,7 +317,6 @@ export const hindsightConfigSchema = {
         DEFAULT_RETAIN_QUEUE_MAX_AGE_MS,
       ),
       knowledgeReadTools: readBool(value, "knowledgeReadTools", false),
-      listToolsWithoutAudience: readBool(value, "listToolsWithoutAudience", false),
       recallCacheTtlMs: readNonNegativeInt(value, "recallCacheTtlMs", 0, MAX_RECALL_CACHE_TTL_MS),
       recallFollowupMaxWords: readNonNegativeInt(
         value,

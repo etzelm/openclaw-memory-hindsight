@@ -1,6 +1,6 @@
 {
   "name": "@etzelm/openclaw-memory-hindsight",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Native Hindsight memory engine for OpenClaw: memory slot provider runtime, auto-recall, auto-retain, pre-compaction flush and hindsight_* agent tools.",
   "keywords": [
     "hindsight",
@@ -37,7 +37,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "lint": "oxlint src",
+    "lint": "oxlint --deny-warnings src",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
     "prepack": "npm run build"

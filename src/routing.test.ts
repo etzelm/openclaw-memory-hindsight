@@ -125,20 +125,21 @@ describe("isMaintenanceTurn", () => {
   });
 });
 
-describe("session patterns", () => {
-  const parse = (extra: Record<string, unknown>) =>
-    hindsightConfigSchema.parse({
-      hindsightApiUrl: "http://h",
-      allowInsecureHttp: true,
-      ...extra,
-    });
-  const use = (
-    cfg: ReturnType<typeof parse>,
-    sessionKey: string | undefined,
-    purpose: "recall" | "retain",
-    messageProvider?: string,
-  ) => sessionUsesMemory(cfg, { sessionKey, messageProvider, purpose });
+const parse = (extra: Record<string, unknown>) =>
+  hindsightConfigSchema.parse({
+    hindsightApiUrl: "http://h",
+    allowInsecureHttp: true,
+    ...extra,
+  });
 
+const use = (
+  cfg: ReturnType<typeof parse>,
+  sessionKey: string | undefined,
+  purpose: "recall" | "retain",
+  messageProvider?: string,
+) => sessionUsesMemory(cfg, { sessionKey, messageProvider, purpose });
+
+describe("session patterns", () => {
   it("matches `*` within one segment and `**` across colons", () => {
     expect(matchesSessionPattern("agent:dev:main", ["agent:*:main"])).toBe(true);
     expect(matchesSessionPattern("agent:dev:subagent:abc", ["agent:dev:*"])).toBe(false);

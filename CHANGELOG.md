@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0 (2026-11-11)
+
+### Upgrade notes
+
+- Needs an OpenClaw build with openclaw/openclaw#197274 (merged 2026-11-11) for `hindsight_*`
+  tools on claude-cli sessions. That host change passes the turn's memory audience when it lists
+  claude-cli MCP tools, so the tools list through the normal audience route. On an older
+  2026.11.x host, claude-cli sessions keep auto-recall but lose the `hindsight_*` tools; stay on
+  0.5.0 there.
+- `listToolsWithoutAudience` is deprecated and ignored. The key still validates, so an existing
+  config keeps loading; remove it. A later major release rejects it.
+
+### Removed
+
+- The `listToolsWithoutAudience` workaround from 0.5.0: a tool context without a memory audience
+  gets no `hindsight_*` tools again, whatever the config says.
+
 ## 0.5.0 (2026-11-10)
 
 ### Upgrade notes

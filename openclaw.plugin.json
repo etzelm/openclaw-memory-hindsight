@@ -96,11 +96,6 @@
       "label": "Knowledge Base Read Tools",
       "help": "Offer hindsight_get_knowledge_base_tree, hindsight_search_knowledge_base and hindsight_get_knowledge_page on the same bank as hindsight_recall",
       "advanced": true
-    },
-    "listToolsWithoutAudience": {
-      "label": "List Tools Without Audience",
-      "help": "List the hindsight_* tools when the host builds a session's tool list before it attaches the memory audience (claude-cli sessions on OpenClaw 2026.11.x). Calls still need the audience",
-      "advanced": true
     }
   },
   "configSchema": {
@@ -223,7 +218,7 @@
       "listToolsWithoutAudience": {
         "type": "boolean",
         "default": false,
-        "description": "List the hindsight_* tools for an agent session whose tool list the host builds without its memory audience (claude-cli MCP tool projection on OpenClaw 2026.11.x). The bank still comes only from the audience: a call without one fails before any request"
+        "description": "Deprecated since 0.6.0 and ignored. The host now passes the memory audience when it lists claude-cli tools (openclaw/openclaw#197274). Remove this key; a later major release rejects it"
       },
       "agentBankMap": {
         "type": "object",

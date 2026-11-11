@@ -23,7 +23,6 @@ import {
   createReflectTool,
   createRetainTool,
   flushDocumentId,
-  NO_AUDIENCE_AT_CALL,
 } from "./tools.js";
 
 const ownerCtx = (extra: Partial<OpenClawPluginToolContext> = {}): OpenClawPluginToolContext => ({
@@ -319,80 +318,65 @@ describe("hindsight tool timeouts", () => {
   });
 });
 
-const listing = (extra: Partial<OpenClawPluginToolContext> = {}) =>
-  ownerCtx({ memoryAudience: undefined, ...extra });
+// A claude-cli turn: since openclaw/openclaw#197274 the host lists MCP tools with the turn's
+// audience (the same value the loopback grant mints), so the factories see it at listing time.
+const claudeCliTurn = (extra: Partial<OpenClawPluginToolContext> = {}) =>
+  ownerCtx({ sessionKey: "agent:dev:dashboard:5f1c2b7e", ...extra });
 
-describe("listToolsWithoutAudience", () => {
-  it("is off by default: a context without an audience gets no tools", () => {
+describe("claude-cli tool listing through the host audience", () => {
+  it("lists the tools when the host projection passes the turn's audience", () => {
     const { service, deduper } = harness();
-    expect(service.config().listToolsWithoutAudience).toBe(false);
-    expect(createRetainTool(service, deduper, listing())).toBeNull();
-    expect(createRecallTool(service, listing())).toBeNull();
-    expect(createReflectTool(service, listing())).toBeNull();
+    expect(createRetainTool(service, deduper, claudeCliTurn())).not.toBeNull();
+    expect(createRecallTool(service, claudeCliTurn())).not.toBeNull();
+    expect(createReflectTool(service, claudeCliTurn())).not.toBeNull();
   });
 
-  it("lists the tools for an agent session whose tool list has no audience", () => {
-    const { service, deduper } = harness({ listToolsWithoutAudience: true });
-    expect(createRetainTool(service, deduper, listing())).not.toBeNull();
-    expect(createRecallTool(service, listing())).not.toBeNull();
-    expect(createReflectTool(service, listing())).not.toBeNull();
-  });
-
-  it("fails a call without an audience before any request", async () => {
-    const { fake, service, deduper } = harness({ listToolsWithoutAudience: true });
-    const ctx = listing({ memoryFlush: { flushId: "f1" } } as Partial<OpenClawPluginToolContext>);
-    await expect(
-      createRetainTool(service, deduper, ctx)!.execute("c1", { content: "x" }),
-    ).rejects.toThrow(NO_AUDIENCE_AT_CALL);
-    await expect(
-      createRecallTool(service, listing())!.execute("c2", { query: "q" }),
-    ).rejects.toThrow(NO_AUDIENCE_AT_CALL);
-    await expect(
-      createReflectTool(service, listing())!.execute("c3", { query: "q" }),
-    ).rejects.toThrow(NO_AUDIENCE_AT_CALL);
-    expect(fake.requests).toHaveLength(0);
-    // The failed flush retain claimed nothing, so the audience-bearing call is not deduped away.
-    const real = createRetainTool(
-      service,
-      deduper,
-      ownerCtx({ memoryFlush: { flushId: "f1" } } as Partial<OpenClawPluginToolContext>),
-    )!;
-    const result = await real.execute("c4", { content: "x" });
-    expect(result.details).toEqual({ status: "queued" });
-  });
-
-  it("keeps the session filters and refuses another agent's audience", () => {
-    const { service } = harness({ listToolsWithoutAudience: true });
-    expect(createRecallTool(service, listing({ sessionKey: "agent:dev:cron:x:y" }))).toBeNull();
-    expect(createRecallTool(service, listing({ sessionKey: "agent:dev:subagent:x" }))).toBeNull();
-    expect(
-      createRecallTool(service, listing({ sessionKey: "agent:dev:dashboard:incognito-x" })),
-    ).toBeNull();
-    expect(createRecallTool(service, listing({ messageChannel: "heartbeat" }))).toBeNull();
-    expect(createRecallTool(service, listing({ sessionKey: undefined }))).toBeNull();
-    expect(createRecallTool(service, listing({ agentId: undefined }))).toBeNull();
-    expect(
-      createRecallTool(
-        service,
-        ownerCtx({ memoryAudience: { kind: "owner-private", agentId: "main" } }),
-      ),
-    ).toBeNull();
-    const context = harness({ memoryMode: "context", listToolsWithoutAudience: true });
-    expect(createRetainTool(context.service, context.deduper, listing())).toBeNull();
-  });
-
-  it("uses the audience bank when the call context has one", async () => {
-    const { fake, service } = harness({ listToolsWithoutAudience: true });
-    await createRecallTool(service, ownerCtx())!.execute("c1", { query: "language" });
+  it("calls the audience bank with the listed tool", async () => {
+    const { fake, service } = harness();
+    await createRecallTool(service, claudeCliTurn())!.execute("c1", { query: "language" });
     expect(fake.requests.map((r) => new URL(r.url).pathname)).toContain(
       "/v1/default/banks/dev/memories/recall",
     );
   });
+
+  it("lists no tools without an audience, even with the deprecated key on", () => {
+    const { fake, service, deduper } = harness({ listToolsWithoutAudience: true });
+    const noAudience = claudeCliTurn({ memoryAudience: undefined });
+    expect(createRetainTool(service, deduper, noAudience)).toBeNull();
+    expect(createRecallTool(service, noAudience)).toBeNull();
+    expect(createReflectTool(service, noAudience)).toBeNull();
+    expect(fake.requests).toHaveLength(0);
+  });
+
+  it("still accepts the deprecated key so an existing config validates", () => {
+    const cfg = hindsightConfigSchema.parse({
+      hindsightApiUrl: "https://hindsight.example",
+      listToolsWithoutAudience: true,
+    });
+    expect(cfg).not.toHaveProperty("listToolsWithoutAudience");
+  });
+
+  it("keeps the session filters and refuses another agent's audience", () => {
+    const { service } = harness();
+    expect(
+      createRecallTool(service, claudeCliTurn({ sessionKey: "agent:dev:cron:x:y" })),
+    ).toBeNull();
+    expect(
+      createRecallTool(service, claudeCliTurn({ sessionKey: "agent:dev:dashboard:incognito-x" })),
+    ).toBeNull();
+    expect(createRecallTool(service, claudeCliTurn({ messageChannel: "heartbeat" }))).toBeNull();
+    expect(
+      createRecallTool(
+        service,
+        claudeCliTurn({ memoryAudience: { kind: "owner-private", agentId: "main" } }),
+      ),
+    ).toBeNull();
+  });
 });
 
-describe("session pattern tool gating", () => {
-  const subagent = () => ownerCtx({ sessionKey: "agent:dev:subagent:abc" });
+const subagent = () => ownerCtx({ sessionKey: "agent:dev:subagent:abc" });
 
+describe("session pattern tool gating", () => {
   it("gives a recall-only subagent the read tools but not retain", () => {
     const { service, deduper } = harness({
       recallOnlySessionPatterns: ["agent:dev:subagent:**"],

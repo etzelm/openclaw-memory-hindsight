@@ -129,7 +129,6 @@ tool conflict.
 | `recallCacheTtlMs`          | `0` (off)            | Auto-recall cache per session and bank, 0 to 3600000 ms; a repeated query skips the API call          |
 | `recallFollowupMaxWords`    | `0` (off)            | At most N words, no URL or path: skip after a recent recall with hits, else add the prior user turn   |
 | `knowledgeReadTools`        | `false`              | Offer the read-only knowledge-base tools (see below); turning it on needs a gateway restart           |
-| `listToolsWithoutAudience`  | `false`              | List the `hindsight_*` tools when the host builds the tool list without an audience (see below)       |
 
 Session patterns: `*` matches any run of characters except `:`, `**` matches anything including
 `:`, everything else is literal. Patterns match the trimmed session key. `ignoreSessionPatterns`
@@ -149,14 +148,10 @@ prompt, so the cached prefix stays stable). Knowledge-base tool caps: a response
 the tree shows 500 entries, then `(truncated, N more entries)`; search shows at most 50 hits
 with snippets cut at 500 characters and names and ids at 200.
 
-`listToolsWithoutAudience`: the claude-cli runtime on OpenClaw 2026.11.x builds a turn's MCP tool
-list before it attaches the turn's memory audience, so every tool factory sees no audience, returns
-null, and `hindsight_*` never reach claude-cli sessions (auto-recall still works; it reads the
-audience from the hook context). With this key on, an agent session with a session key gets the
-tools listed anyway. The host then builds the callable copy with the audience from the run's grant,
-and that copy alone reaches Hindsight; a call that still has no audience fails with an error before
-any request. The session filters (`memoryMode`, incognito, `excludeProviders`,
-`skipOperationalSessions`) apply as before, and an audience for another agent is still refused.
+`hindsight_*` tools on claude-cli sessions need an OpenClaw build that passes the turn's memory
+audience when it lists MCP tools (openclaw/openclaw#197274). On older 2026.11.x builds those
+sessions get auto-recall but no `hindsight_*` tools. `listToolsWithoutAudience` (0.5.0) is
+deprecated and ignored since 0.6.0; remove it from your config.
 
 Config changes apply without a restart: the plugin re-reads its entry from the host's current
 config snapshot (`api.runtime.config.current()`), falling back to the register-time
