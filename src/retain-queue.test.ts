@@ -977,3 +977,138 @@ describe("RetainQueueRunner", () => {
     expect(queue.size()).toBe(1);
   });
 });
+
+const rateLimited = (retryAfterMs?: number) => {
+  const error = new HindsightHttpError("HTTP 429", 429);
+  if (retryAfterMs !== undefined) {
+    Object.assign(error, { retryAfterMs });
+  }
+  return error;
+};
+
+describe("RetainQueueRunner holds a refusing bank (F3)", () => {
+  it("turn-triggered passes send nothing to a refusing bank until its hold ends", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      sent.push(e.bankId);
+      throw rateLimited();
+    });
+    for (let i = 0; i < 8; i++) {
+      queue.enqueue(entry(`b${i}`, "d"));
+    }
+    await runner.flush();
+    expect(sent).toHaveLength(8);
+    for (let i = 0; i < 10; i++) {
+      await runner.nudge();
+    }
+    expect(sent).toHaveLength(8);
+    // The hold is the backoff in force when the bank refused (1 s here).
+    vi.setSystemTime(Date.now() + 1_000);
+    await runner.nudge();
+    expect(sent).toHaveLength(16);
+    runner.stop();
+  });
+
+  it("a nudge still delivers other banks, and a delivery ends that bank's hold", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    let locked = true;
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      if (e.bankId === "locked" && locked) {
+        throw rateLimited();
+      }
+      sent.push(`${e.bankId}/${e.documentId}`);
+    });
+    queue.enqueue(entry("locked", "l1"));
+    await runner.flush();
+    queue.enqueue(entry("dev", "a"));
+    locked = false;
+    await runner.nudge();
+    expect(sent).toEqual(["dev/a"]);
+    // A full pass (the timer, or a start) tries a backoff hold anyway.
+    await runner.flush();
+    expect(sent).toEqual(["dev/a", "locked/l1"]);
+    queue.enqueue(entry("locked", "l2"));
+    await runner.nudge();
+    expect(sent).toEqual(["dev/a", "locked/l1", "locked/l2"]);
+    runner.stop();
+  });
+
+  it("honors Retry-After on a 429, also in a full pass, and times the retry by it", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    let refusing = true;
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      sent.push(e.documentId);
+      if (refusing) {
+        throw rateLimited(3_000);
+      }
+    });
+    queue.enqueue(entry("dev", "a"));
+    await runner.flush();
+    expect(sent).toEqual(["a"]);
+    refusing = false;
+    // Past the 1 s backoff, inside the 3 s Retry-After: a full pass still waits.
+    await vi.advanceTimersByTimeAsync(1_500);
+    await runner.flush();
+    expect(sent).toEqual(["a"]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sent).toEqual(["a"]);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(sent).toEqual(["a", "a"]);
+    expect(queue.size()).toBe(0);
+    runner.stop();
+  });
+
+  it("caps a Retry-After hold at the longest backoff", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    let refuse = true;
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      sent.push(e.documentId);
+      if (refuse) {
+        throw rateLimited(3_600_000);
+      }
+    });
+    queue.enqueue(entry("dev", "a"));
+    await runner.flush();
+    refuse = false;
+    // maxDelayMs is 4 s in makeRunner.
+    await vi.advanceTimersByTimeAsync(4_100);
+    expect(sent).toEqual(["a", "a"]);
+    runner.stop();
+  });
+});
+
+describe("RetainQueueRunner backoff after a failed final save (D1)", () => {
+  it("doubles the wait while the save keeps failing, and resets after a good save", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      return realSetTimeout(fn, ms);
+    }) as typeof setTimeout);
+    const { queue, runner } = makeRunner(async () => {});
+    queue.enqueue(entry("dev", "a"));
+    let failures = 3;
+    const realSave = queue.save.bind(queue);
+    vi.spyOn(queue, "save").mockImplementation(() => {
+      if (failures > 0) {
+        failures -= 1;
+        throw new Error("EACCES: permission denied, open");
+      }
+      realSave();
+    });
+    await runner.flush();
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+    runner.stop();
+    // 1 s base, 4 s cap in makeRunner.
+    expect(delays.slice(0, 3)).toEqual([1_000, 2_000, 4_000]);
+    expect(queue.size()).toBe(0);
+    expect(queue.hasUnsaved()).toBe(false);
+  });
+});

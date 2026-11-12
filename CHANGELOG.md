@@ -1,5 +1,89 @@
 # Changelog
 
+## 0.8.0 (2026-11-11)
+
+### Upgrade notes
+
+- Six config keys are added: `recallTimeoutMs`, `recallTagGroups`, `recallHistoryPattern`,
+  `recallTopK`, `recallMinScore` and `recallQueryShaping`. Their defaults keep requests as they
+  were: the timeout stays 10 s, no tag filter is sent, every result is injected, no score floor
+  is sent and the query is built as before. No key is
+  removed or renamed.
+- New default behavior: a recall circuit breaker. After 3 auto-recalls in a row end in a timeout,
+  a network error or an HTTP 5xx, auto-recall skips for 60 s without a request (one warning in the
+  log), then sends one probe; any answer closes it. A 4xx, a missing bank or an empty result never
+  counts. Before, every turn waited up to 10 s while Hindsight was slow or down. The
+  `hindsight_*` tools are not affected.
+- New metrics: `openclaw_hindsight_recall_skipped_total{agent, reason}` and the
+  `openclaw_hindsight_recall_injected_memories` and `_chars` histograms. A skipped auto-recall
+  turn now records a skip sample (it recorded nothing before); `recall_total` and the latency
+  histogram are unchanged.
+- The manifest declares `cliCommands`, so `openclaw hindsight` appears as a root command once the
+  plugin owns the memory slot.
+- Document ids, the retain queue file format and bank routing are unchanged.
+
+### Added
+
+- `recallTimeoutMs` (250 to 30000 ms, default 10000) bounds the auto-recall request, and the
+  circuit breaker described above protects the reply path.
+- `recallTagGroups` is passed through as Hindsight's recall `tag_groups` on auto-recall and
+  `hindsight_recall`, validated against the Hindsight 1.2.1 shape (leaf `{tags, match, resolve}`,
+  `and`, `or`, `not`; 32 groups, 32 tags per leaf, 8 levels). `recallHistoryPattern` (a
+  case-insensitive regex) lifts the filter for a matching query. Example in the README: keep
+  `kind:status` units out of recall unless the question asks about history.
+- `recallTopK` (1 to 50) caps the memories auto-recall injects, best first; `recallMinScore`
+  (0 to 1) is sent as Hindsight's `min_scores.final`. Both are off by default and do not apply to
+  `hindsight_recall`. `docs/recall-ab.md` has the A/B plan, and `scripts/recall-ab.sh` (not in the
+  package) runs an eval harness once per arm.
+- `recallQueryShaping` (`off`, the default, or `strip`). `strip` removes OpenClaw's
+  internal-context envelope (run notes, spawning rules, session keys) from a message before the
+  800-character query cap, for the current message and the previous one a follow-up adds. Text
+  without the envelope is unchanged, and an envelope-only message gives no query. On 40 real
+  subagent tasks against a restored copy of the maintainer's bank, the junk rate of injected
+  memories went from 0.546 to 0.315; the curated eval set has no envelope and is unchanged. See
+  `docs/recall-query-shaping.md`.
+- Metrics for skipped auto-recalls by reason (`filter`, `no_audience`, `empty_query`, `followup`,
+  `cache_hit`, `breaker_open`) and for the count and size of every injected block.
+- `openclaw hindsight status`, `doctor` and `forget`. `forget --session <key>` deletes a session's
+  auto-retained documents and their memory units after listing them; `--dry-run` deletes nothing,
+  it asks before deleting (outside a terminal it needs `--yes`), and it refuses while the retain
+  queue still holds a copy of the session. `--token-file` covers a SecretRef token, which the CLI
+  process does not resolve.
+- Documentation (not in the package): SUPPORT.md, the release and support policy (release
+  cadence, which versions get fixes, deprecation notice, the supported OpenClaw window, the road
+  to 1.0); RELEASING.md "Before a release" (CI, the compat matrix, the recall release gate and 48
+  hours on the maintainer's Gateway for a minor); SECURITY.md points to SUPPORT.md.
+- Tests and tooling (not in the package): seeded model tests of the retain queue with disk-full,
+  failed-rename and torn-write faults and concurrent replays; `scripts/host-types.sh`, which
+  type-checks and unit-tests the plugin against the floor host, the latest release or a built
+  `main` (CI runs the latest release); `scripts/api-contract.mjs` with a contract recorded from
+  Hindsight 1.2.1, a client test against it, and an optional live check in the compat nightly
+  (`HS_COMPAT_API_URL`, exit 5 on drift).
+
+### Changed
+
+- The auto-recall cache key includes the tag filter and the score floor, so a live change to
+  either recalls fresh. A live `recallTopK` change applies to a cached result.
+
+### Fixed
+
+- Retain queue replay: a bank that refuses (auth, rate limit, bank setup) is held for the
+  current backoff, and the passes a turn starts (a retain queued behind its bank, a live retain
+  delivered while items wait) skip it. Before, every such turn sent one request to each
+  refusing bank with queued items. The startup pass and the backoff timer still try it. A 429 or
+  503 with `Retry-After` holds the bank for that long in every pass, at most 15 minutes.
+- Retain queue replay: after a pass that delivered every item, a failing save was retried every
+  30 s. The wait now grows while the save keeps failing, as 0.7.1 described, and goes back to the
+  base after a pass and its save both succeed.
+- Retain queue: parking in-flight live writes at a stop no longer evicts queued items when the
+  queue is at `retainQueueMaxItems` or its size bound. What does not fit is not parked, and one
+  warning says how many.
+- Retain queue: appended items are fsynced, so a retain survives a power loss right after it was
+  queued (about 2 ms per queued item, only while Hindsight is unreachable). Every queue write
+  loops until all bytes are written and fails on a write that makes no progress.
+- Tests (not in the package): the short-write test now exercises the write loop it guards; before,
+  it mocked a call the queue no longer made.
+
 ## 0.7.1 (2026-11-11)
 
 ### Upgrade notes
@@ -43,7 +127,8 @@
   queued at the stop, so a Gateway exit does not lose it. A write that then succeeds removes it.
 - Retain queue: a replay pass that a write error ended is retried after the backoff, with the
   wait growing while the error lasts, instead of waiting for the next retain or a restart. That
-  includes a pass that delivered every item and then could not save.
+  includes a pass that delivered every item and then could not save, though for that case the
+  wait stayed at the 30 s base until 0.8.0.
 - Retain queue: repeated too-large or unwritable retains of the same document write one
   tombstone instead of one each. A tombstone that could not be written is tried again on the next
   attempt.

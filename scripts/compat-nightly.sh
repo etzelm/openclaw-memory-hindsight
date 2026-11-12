@@ -18,6 +18,10 @@
 #                      success, exit code. Rewritten by every start except one that finds another
 #                      run holding the lock (that start leaves it alone); a start that cannot
 #                      write WORK_ROOT writes it with exit code 4 before it reaches the lock.
+#   HS_COMPAT_API_URL  optional Hindsight base URL. After the matrix, its /openapi.json is compared
+#                      with the recorded API contract (scripts/api-contract.mjs in the tested ref).
+#                      Drift in something the plugin uses turns an all-green run into exit 5; an
+#                      unreachable URL, or a ref without the script, only logs.
 #   WORK_ROOT          scratch parent (default ~/work)
 #   RESULTS_PUT        copy command for the results (default cp -R)
 # One run at a time per WORK_ROOT: a second start while one runs (the agent loaded in two launchd
@@ -26,7 +30,8 @@
 # path) or when it is older than HS_COMPAT_LOCK_MAX_MIN minutes (default 720, 12 h).
 #   HS_COMPAT_LOCK_MAX_MIN  lock age after which it counts as stale
 # Exit: the compat-matrix.sh exit code, 2 when the checkout could not be fetched, 4 when
-# WORK_ROOT cannot be written (on macOS often a privacy denial, see docs/compat-matrix.md).
+# WORK_ROOT cannot be written (on macOS often a privacy denial, see docs/compat-matrix.md), 5 when
+# the matrix passed but the Hindsight API drifted from the recorded contract.
 set -u
 umask 077
 : "${HS_COMPAT_REPO:?set HS_COMPAT_REPO}" "${HS_COMPAT_RESULTS:?set HS_COMPAT_RESULTS}"
@@ -47,7 +52,7 @@ write_status() {
   now=$(date +%s)
   prev_run=$(sed -n 's/^hs_compat_nightly_last_run_timestamp_seconds \([0-9][0-9]*\)$/\1/p' "$STATUS" 2>/dev/null)
   prev_ok=$(sed -n 's/^hs_compat_nightly_last_success_timestamp_seconds \([0-9][0-9]*\)$/\1/p' "$STATUS" 2>/dev/null)
-  case "$st" in 0|1|3) prev_run=$now ;; esac
+  case "$st" in 0|1|3|5) prev_run=$now ;; esac
   [ "$st" = 0 ] && prev_ok=$now
   tmp="$STATUS.tmp"
   mkdir -p "$(dirname "$STATUS")" 2>/dev/null
@@ -61,7 +66,7 @@ write_status() {
     echo "# HELP hs_compat_nightly_last_success_timestamp_seconds Unix time the compat matrix last had every cell as expected (exit 0)."
     echo "# TYPE hs_compat_nightly_last_success_timestamp_seconds gauge"
     echo "hs_compat_nightly_last_success_timestamp_seconds ${prev_ok:-0}"
-    echo "# HELP hs_compat_nightly_last_exit_code Exit code of the last compat-nightly.sh start (0 ok, 1 unexpected cell, 2 fetch or usage, 3 partial, 4 WORK_ROOT not writable)."
+    echo "# HELP hs_compat_nightly_last_exit_code Exit code of the last compat-nightly.sh start (0 ok, 1 unexpected cell, 2 fetch or usage, 3 partial, 4 WORK_ROOT not writable, 5 API drift)."
     echo "# TYPE hs_compat_nightly_last_exit_code gauge"
     echo "hs_compat_nightly_last_exit_code $st"
   } > "$tmp" 2>/dev/null; then
@@ -130,3 +135,18 @@ fi
 echo "package commit $(git -C "$D/repo" rev-parse --short=10 HEAD) version $(sed -n 's/^  "version": "\(.*\)",$/\1/p' "$D/repo/package.json")"
 # shellcheck disable=SC2086 # HS_COMPAT_ARGS is a space-separated argument list by design
 "$D/repo/scripts/compat-matrix.sh" --plugin "$D/repo" --results-dest "$HS_COMPAT_RESULTS" ${HS_COMPAT_ARGS:-}
+matrix=$?
+if [ -n "${HS_COMPAT_API_URL:-}" ]; then
+  if [ -f "$D/repo/scripts/api-contract.mjs" ]; then
+    node "$D/repo/scripts/api-contract.mjs" check "${HS_COMPAT_API_URL%/}/openapi.json"
+    drift=$?
+    case "$drift" in
+      0) ;;
+      1) [ "$matrix" = 0 ] && matrix=5 ;;
+      *) echo "warning: the API contract check could not run (exit $drift)" ;;
+    esac
+  else
+    echo "API contract check skipped: the tested ref has no scripts/api-contract.mjs"
+  fi
+fi
+exit "$matrix"

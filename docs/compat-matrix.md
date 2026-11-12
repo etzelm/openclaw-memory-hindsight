@@ -167,6 +167,36 @@ first release with the fix. `CLI_AUDIENCE_FIXED_IN=main` is for the time between
 upstream main (closed 2026-11-09) but in no release yet (2026.11.3 and 2026.11.5-beta.2 still
 give CLI hooks no audience), so main must pass and every release still fails as expected.
 
+## Offline checks: host types, API contract, retain queue model
+
+Three checks that need no Hindsight, model or Gateway:
+
+- `scripts/host-types.sh` type-checks the plugin (and with `--tests` runs the unit tests) against
+  other OpenClaw hosts, in a scratch copy whose `node_modules` swaps only `openclaw`. Hosts:
+  `floor` (the `>=` version in `peerDependencies`), `latest`, any npm version or dist-tag, or a
+  path to a built OpenClaw package dir (how to check `main`: build it as the matrix does and pass
+  the path; its types break often, so treat that result as advisory). Default:
+  `--host floor --host latest`. `--self-test` runs offline against the installed dev host and a
+  copy of it with one SDK subpath emptied.
+- `scripts/api-contract.mjs` holds the slice of the Hindsight OpenAPI document the client uses:
+  the routes it calls, their parameters, the request fields it sends (plus every required one)
+  and the response fields it reads. `scripts/fixtures/hindsight-api-contract.json` is that slice
+  recorded from Hindsight 1.2.1. `node scripts/api-contract.mjs check <url>/openapi.json`
+  compares a server with it and exits 1 when something the plugin relies on is gone or changed
+  type; `extract` re-records it. `src/api-contract.test.ts` runs every client call and fails when
+  the client sends a field or parameter the recording does not have, so a new field means a new
+  recording against a server that accepts it.
+- `src/retain-queue-model.test.ts` drives the retain queue with seeded random runs: retains
+  through the service's queue-or-live protocol, replay, saves, crashes (a fresh queue loads the
+  file), disk-full windows, failed renames and torn writes followed by a crash, and the replay
+  runner with concurrent `flush()` calls. After every step it checks: one copy per document, the
+  item and byte bounds, no copy older than one the server already has, and no accepted retain
+  lost; at the end every document reaches the newest version it was owed. A failure names the
+  seed and the last steps. `HS_QUEUE_FUZZ_RUNS=2000` runs that many seeds per test. One accepted
+  gap is pinned there: a tombstone written after a failed rewrite skips the byte check (dropping
+  it could let a restart replay an old copy), so only tombstone lines can take the file past the
+  bound.
+
 ## Nightly schedule (macOS launchd)
 
 `scripts/compat-nightly.sh` fetches the package at `HS_COMPAT_REF` from `HS_COMPAT_REPO` into a
@@ -182,7 +212,10 @@ so pin it to a protected branch or tag that only maintainers can push. With
 `HS_COMPAT_REF=latest-release` that means whoever can push a `vX.Y.Z` tag to `HS_COMPAT_REPO`:
 keep the tag ruleset from RELEASING.md (one-time setup, step 4) on, or point `HS_COMPAT_REPO` at
 a mirror only you can write. A tag listing that fails exits 2 with "could not list tags"; a repo
-with no release tag exits 2 with "no vX.Y.Z tag found". To install it for the
+with no release tag exits 2 with "no vX.Y.Z tag found". With `HS_COMPAT_API_URL` set to the
+Hindsight base URL, the run also checks the server's `/openapi.json` against the recorded API
+contract after the matrix: drift turns an all-green run into exit 5, and an unreachable URL or a
+tested ref without `scripts/api-contract.mjs` only logs. To install it for the
 account that owns the Hindsight token and the `claude` login:
 
 ```sh

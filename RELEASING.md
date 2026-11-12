@@ -78,6 +78,26 @@ vulnerability reporting". `SECURITY.md` and the issue chooser link to its report
 does not exist until this is on. Enable it before you push the release commit that ships
 `SECURITY.md`, so the link works from the first moment it is public.
 
+## Before a release
+
+[SUPPORT.md](SUPPORT.md) is the policy; check it before step 1:
+
+- **Cadence**: at most one minor release a week. A patch carries fixes only: no new keys, no
+  changed defaults, no removals.
+- **Deprecations**: a minor removes only what an earlier minor deprecated at least two minor
+  releases and 30 days ago. A newly deprecated key keeps working and logs a warning.
+- **Host floor**: raise `openclaw.install.minHostVersion` and the peer range only in a minor
+  release that the previous release announced. The new floor must be a stable release that is
+  at least 30 days old.
+- **Compat matrix**: the floor and latest stable cells pass (`scripts/compat-matrix.sh`, see
+  [docs/compat-matrix.md](docs/compat-matrix.md)).
+- **Recall release gate**: the maintainer runs the candidate tarball against the previous
+  release on the live memory banks (claw-configs `scripts/hindsight-recall-gate.sh`, private
+  infrastructure). It must not be worse on hit@5, MRR@10 or the junk rate. A failed gate blocks
+  the tag. Record the result in the release MR.
+- **Soak**: for a minor release, run the candidate on the maintainer's Gateway for 48 hours
+  before tagging. A security patch may skip this.
+
 ## Release steps
 
 1. On GitLab, branch from `develop` and bump the version:

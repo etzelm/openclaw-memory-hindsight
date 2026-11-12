@@ -128,6 +128,12 @@ tool conflict.
 | `retainQueueMaxAgeMs`       | `604800000` (7 days) | Queued retains older than this are dropped                                                            |
 | `recallCacheTtlMs`          | `0` (off)            | Auto-recall cache per session and bank, 0 to 3600000 ms; a repeated query skips the API call          |
 | `recallFollowupMaxWords`    | `0` (off)            | At most N words, no URL or path: skip after a recent recall with hits, else add the prior user turn   |
+| `recallQueryShaping`        | `off`                | `strip` removes the subagent envelope from the query; see `docs/recall-query-shaping.md`              |
+| `recallTopK`                | none (all)           | Most memories auto-recall injects, 1 to 50, best first                                                |
+| `recallMinScore`            | none                 | Final-score floor for auto-recall, 0 to 1 (Hindsight `min_scores.final`)                              |
+| `recallTagGroups`           | none                 | Hindsight `tag_groups` for auto-recall and `hindsight_recall` (see below)                             |
+| `recallHistoryPattern`      | none                 | Regex; a matching query recalls without `recallTagGroups`                                             |
+| `recallTimeoutMs`           | `10000`              | Auto-recall timeout, 250 to 30000 ms; see the recall circuit breaker below                            |
 | `knowledgeReadTools`        | `false`              | Offer the read-only knowledge-base tools (see below); turning it on needs a gateway restart           |
 
 Session patterns: `*` matches any run of characters except `:`, `**` matches anything including
@@ -139,8 +145,8 @@ sessions (for example `agent:dev:subagent:**`) get auto-recall, `hindsight_recal
 `excludeProviders`, `temp:` and incognito sessions win over both lists, and ignore wins over
 recall-only. A pattern never selects a bank; the bank still comes from the memory audience.
 
-Fixed values (not configurable): recall max tokens 1024, query cap 800 characters, recall
-timeout 10 s, retain and reflect timeout 30 s, memory get and knowledge-base tool timeout 10 s
+Fixed values (not configurable): recall max tokens 1024, query cap 800 characters,
+`hindsight_recall` timeout 10 s, retain and reflect timeout 30 s, memory get and knowledge-base tool timeout 10 s
 (each combined with the host's abort signal when there is one), retained roles user and
 assistant, JSON transcript format, recall injected before the user message (outside the system
 prompt, so the cached prefix stays stable). A recall, reflect or memory-get response body over
@@ -160,6 +166,38 @@ With `recallCacheTtlMs` set, a `hindsight_retain` call drops the calling session
 recall, so its next turn recalls fresh. Hindsight extracts memories in the background, so that
 recall can miss a memory Hindsight has not processed yet, and its result is cached like any
 other. The new memory shows up once Hindsight has processed it and that cache entry has expired.
+
+Recall cap and floor: both are off by default, so every result Hindsight returns is injected.
+`recallTopK` keeps the first N results (Hindsight ranks best first) and is applied at injection,
+so a cached recall follows a live change. `recallMinScore` is sent as Hindsight's
+`min_scores.final`; Hindsight documents its reranker scores as not calibrated across queries, so
+prefer the cap. Neither applies to `hindsight_recall`. Pick values with an eval run; see
+[docs/recall-ab.md](docs/recall-ab.md).
+
+Recall tag filter: `recallTagGroups` is passed through as Hindsight's recall `tag_groups` (groups
+are AND-ed; each is a leaf `{tags, match, resolve}` or `{and: [...]}`, `{or: [...]}`,
+`{not: ...}`, the Hindsight 1.2.1 shape, at most 32 groups per list and 8 levels deep). It applies
+to auto-recall and `hindsight_recall`, not to the provider runtime's search. When the recall query
+matches `recallHistoryPattern` (case-insensitive), that recall runs without the filter. Example
+that keeps status units ("waiting on CI") out of recall unless the question asks about history:
+
+```json
+"recallTagGroups": [{ "not": { "tags": ["kind:status"], "match": "any_strict" } }],
+"recallHistoryPattern": "\\b(history|timeline|status|progress|what happened|when did|so far|previous|earlier|changed|still)\\b"
+```
+
+`any_strict` inside `not` keeps untagged memories, which matters because Hindsight observations
+carry no tags. A filter only helps if the tags exist at retain time; check the bank before turning
+it on, and measure it with an eval run, since a filter can hide the answer.
+
+Recall circuit breaker: auto-recall waits on the reply path, so a slow or unreachable Hindsight
+would cost every turn up to `recallTimeoutMs`. After 3 auto-recalls in a row end in a timeout, a
+network error or an HTTP 5xx, auto-recall skips for 60 s without sending a request (one warning in
+the log), then lets one probe through while other turns keep skipping. Any answer to the probe
+closes the breaker (`auto-recall resumed` in the log); another failure pauses it for 60 s more. A
+4xx, a missing bank or an empty result never counts, and a live cached recall is still served
+while the breaker is open. The breaker is global (one server), resets when `hindsightApiUrl`
+changes or the service restarts, and does not apply to the `hindsight_*` tools.
 
 Config changes apply without a restart: the plugin re-reads its entry from the host's current
 config snapshot (`api.runtime.config.current()`), falling back to the register-time
@@ -281,6 +319,9 @@ config key; counters live in memory and reset when the Gateway restarts.
 | ------------------------------------- | --------- | -------------------------- |
 | `recall_total`                        | counter   | `agent`, `bank`, `outcome` |
 | `recall_duration_seconds`             | histogram | `agent`, `bank`            |
+| `recall_skipped_total`                | counter   | `agent`, `reason`          |
+| `recall_injected_memories`            | histogram | `agent`, `bank`            |
+| `recall_injected_chars`               | histogram | `agent`, `bank`            |
 | `retain_total`                        | counter   | `agent`, `bank`, `outcome` |
 | `retain_duration_seconds`             | histogram | `agent`, `bank`            |
 | `retain_queue_depth`                  | gauge     | `bank`                     |
@@ -291,6 +332,14 @@ config key; counters live in memory and reset when the Gateway restarts.
   `timeout`, `error`. A recall the host cancels (audience changed, hook invocation stale) is
   not counted. Retain counts auto-retain only: `sent`, `queued`, `timeout`, `error`. Tool
   calls are not counted.
+- Skips count eligible auto-recall turns that sent no request, by `reason`: `filter` (excluded
+  provider, operational session, ignore pattern, incognito), `no_audience`, `empty_query` (no
+  usable text after boilerplate stripping), `followup` (the follow-up rule), `cache_hit` (memories
+  injected from the cache) and `breaker_open` (the recall circuit breaker). Recall turned off and
+  host maintenance turns are not counted.
+- `recall_injected_memories` and `recall_injected_chars` observe each injected block, fresh or
+  from the cache: how many memories and how many characters reached the prompt. Buckets: 1, 2,
+  3, 5, 8, 10, 15, 20, 30, 50 memories; 250 to 32000 characters.
 - The latency histograms cover every outcome, so timeouts and fast `queued` retains are in the
   same quantiles as successful calls.
 - Replays: `delivered`, or `deferred` (Hindsight unreachable, item kept). Drops count retains
@@ -302,13 +351,39 @@ config key; counters live in memory and reset when the Gateway restarts.
   Past 200 label sets per metric family, new `agent` and `bank` values fold into `other`;
   `outcome` and `reason` keep their value. No session ids, document ids or text.
 
+### `openclaw hindsight` CLI
+
+Operator commands that run in the CLI process, not the Gateway. They read this plugin's config from
+the host config, talk to Hindsight directly and never print the token.
+
+- `openclaw hindsight status [--json]`: plugin version, Hindsight URL with reachability and API
+  version, the memory slot owner, mode, and the retain queue depth per bank. Exit 1 when Hindsight
+  is unreachable.
+- `openclaw hindsight doctor`: checks the config, the memory slot, the token, reachability, the
+  server version (warns below 1.2.1), auth (one bank-list request) and the retain queue, and prints
+  a fix under each failure. Exit 1 when a check fails. It also runs while the plugin is disabled by
+  a bad config, to say why.
+- `openclaw hindsight forget --session <key> [--agent <id>] [--bank <id>] [--dry-run] [--yes]`:
+  deletes the session's auto-retained run documents, and the memory units Hindsight extracted from
+  them, from the agent's owner bank and the session's conversation bank (or only `--bank`). It
+  lists them first, and `--dry-run` stops there. Otherwise it asks for confirmation; outside a
+  terminal it needs `--yes`. It refuses while the Gateway's retain queue still holds a copy of the
+  session, because replay would bring the text back. Memories saved with `hindsight_retain` or by
+  the pre-compaction flush carry no session id and are not removed. Observations Hindsight already
+  consolidated from those memories may outlive them until it consolidates again.
+
+The CLI does not resolve SecretRefs the way the Gateway does (checked on 2026.10.10), so with a
+SecretRef token pass `--token-file <path>` to any of the three commands; the file holds the token
+alone, is read for that run only and is never printed. Without it `doctor` warns and requests from
+the CLI go unauthenticated.
+
 ### Mapping from `@vectorize-io/hindsight-openclaw`
 
 | Vendor key                                                                                                                                                                                                                                                                                                        | Here                                                                                                      |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `hindsightApiUrl`, `hindsightApiToken`, `memoryMode`, `autoRecall`, `autoRetain`, `recallBudget`, `recallTypes`, `preferObservations`, `recallPromptPreamble`, `retainMission`, `retainContext`, `retainTags`, `excludeProviders`, `skipOperationalSessions`, `agentBankMap`                                      | Same key, same meaning                                                                                    |
+| `hindsightApiUrl`, `hindsightApiToken`, `memoryMode`, `autoRecall`, `autoRetain`, `recallBudget`, `recallTypes`, `preferObservations`, `recallPromptPreamble`, `retainMission`, `retainContext`, `retainTags`, `excludeProviders`, `skipOperationalSessions`, `agentBankMap`, `recallTimeoutMs`                   | Same key, same meaning                                                                                    |
 | `dynamicBankId`, `dynamicBankGranularity`, `bankIdPrefix`                                                                                                                                                                                                                                                         | Replaced by audience routing: owner bank = agent id (or `agentBankMap`), conversations get their own bank |
-| `retainRoles`, `recallRoles`, `retainFormat`, `recallMaxTokens`, `recallMaxQueryChars`, `recallTimeoutMs`, `recallInjectionPosition`, `retainSource`                                                                                                                                                              | Fixed values (see above)                                                                                  |
+| `retainRoles`, `recallRoles`, `retainFormat`, `recallMaxTokens`, `recallMaxQueryChars`, `recallInjectionPosition`, `retainSource`                                                                                                                                                                                 | Fixed values (see above)                                                                                  |
 | `retainQueueMaxAgeMs`                                                                                                                                                                                                                                                                                             | Same key; must be a positive number of ms (the vendor's `-1` for no limit is rejected)                    |
 | `retainToolCalls`, `retainEveryNTurns`, `retainOverlapTurns`, `recallContextTurns`, `retainQueuePath`, `retainQueueFlushIntervalMs`, `enableKnowledgeTools`, `allowKnowledgeDelete`, daemon keys (`apiPort`, `embedPort`, `embedVersion`, `daemonIdleTimeout`), `llm*`, `debug*`, `log*`, `skipStatelessSessions` | Not supported; remove them (unknown keys are rejected)                                                    |
 
@@ -433,7 +508,8 @@ deprecated on npm once the fix ships, as 0.1.1 is.
 - Flush dedupe is per process; a restart mid-cycle can repeat a flush write, which the stable
   document id plus `update_mode: replace` turns into an overwrite.
 - Conversation banks are never pruned by the plugin, and `openclaw memory forget` does not reach
-  slot owners (no host seam yet).
+  slot owners (no host seam yet); `openclaw hindsight forget` removes one session's auto-retained
+  documents (see the CLI section).
 
 Not ported from the vendor plugin: knowledge-base write tools (create, update, delete; the
 read tools are opt-in, see above), tool-call retention

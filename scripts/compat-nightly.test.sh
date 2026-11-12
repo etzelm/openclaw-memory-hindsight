@@ -28,6 +28,13 @@ for v in 0.9.0 0.10.0 0.11.0-rc.1; do
   git -C "$R" add -A; git -C "$R" commit -q -m "$v"; git -C "$R" tag "v$v"
 done
 printf '{\n  "version": "0.12.0-dev",\n  "name": "x"\n}\n' > "$R/package.json"
+# Only develop has the API contract check; its stub records the URL and exits STUB_DRIFT.
+cat > "$R/scripts/api-contract.mjs" <<'EOF'
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.STUB_DRIFT_OUT, process.argv.slice(2).join(" "));
+process.exit(Number(process.env.STUB_DRIFT ?? 0));
+EOF
+git -C "$R" add -A
 git -C "$R" commit -q -am dev
 git -C "$R" branch -q -M develop
 
@@ -79,6 +86,31 @@ HS_COMPAT_REPO=$T/notags HS_COMPAT_REF=latest-release HS_COMPAT_RESULTS=$T/resul
 check "no-tag repo exit" "$st" 2
 check "no-tag repo message" "$(grep -c 'no vX.Y.Z tag found' "$T/log")" 1
 check "matrix not run without a tag" "$([ -e "$T/ran" ] && echo ran || echo no)" no
+
+# Optional API contract check after the matrix (HS_COMPAT_API_URL).
+drift_run() { # REF STUB_EXIT STUB_DRIFT -> exit code
+  rm -f "$T/drift-arg"
+  HS_COMPAT_REPO=$R HS_COMPAT_REF=$1 HS_COMPAT_RESULTS=$T/results HS_COMPAT_STATUS_FILE=$T/state/nightly.prom \
+    HS_COMPAT_API_URL=http://hindsight.test:8888/ STUB_EXIT=$2 STUB_DRIFT=$3 STUB_DRIFT_OUT=$T/drift-arg \
+    STUB_OUT=$T/ran WORK_ROOT=$T/work bash "$NIGHTLY" > "$T/log" 2>&1
+}
+drift_run develop 0 0; st=$?
+check "contract clean exit" "$st" 0
+check "contract checks the openapi URL" "$(cat "$T/drift-arg")" "check http://hindsight.test:8888/openapi.json"
+drift_run develop 0 1; st=$?
+check "contract drift exit" "$st" 5
+check "status exit code 5" "$(metric hs_compat_nightly_last_exit_code "$T/state/nightly.prom")" 5
+run5=$(metric hs_compat_nightly_last_run_timestamp_seconds "$T/state/nightly.prom")
+check "run time set on exit 5" "$([ "${run5:-0}" -gt 0 ] && echo yes)" yes
+drift_run develop 1 1; st=$?
+check "matrix failure wins over drift" "$st" 1
+drift_run develop 0 2; st=$?
+check "unreachable API only warns" "$st" 0
+check "unreachable API warning" "$(grep -c 'contract check could not run' "$T/log")" 1
+drift_run latest-release 0 1; st=$?
+check "ref without the script still passes" "$st" 0
+check "ref without the script says so" "$(grep -c 'API contract check skipped' "$T/log")" 1
+check "no contract check without the script" "$([ -e "$T/drift-arg" ] && echo ran || echo no)" no
 
 echo "compat-nightly tests: $([ "$fails" = 0 ] && echo PASS || echo "FAIL ($fails)")"
 [ "$fails" = 0 ]

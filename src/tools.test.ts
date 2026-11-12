@@ -472,3 +472,41 @@ describe("session pattern tool gating", () => {
     expect(createRetainTool(service, deduper, ownerCtx())).not.toBeNull();
   });
 });
+
+describe("hindsight_recall tag filter", () => {
+  const STATUS_FILTER = [{ not: { tags: ["kind:status"], match: "any_strict" } }];
+
+  it("passes recallTagGroups, and drops it for a history query", async () => {
+    const { fake, service } = harness({
+      recallTagGroups: STATUS_FILTER,
+      recallHistoryPattern: "\\bhistory\\b",
+    });
+    const tool = createRecallTool(service, ownerCtx())!;
+    await tool.execute("c1", { query: "which host runs hindsight" });
+    await tool.execute("c2", { query: "history of the retain queue" });
+    const bodies = fake.requests.map((r) => r.body as Record<string, unknown>);
+    expect(bodies[0]?.tag_groups).toEqual(STATUS_FILTER);
+    expect(bodies[1]).not.toHaveProperty("tag_groups");
+  });
+});
+
+describe("hindsight_recall and the auto-recall cap and floor", () => {
+  it("sends no min_scores and keeps every result", async () => {
+    const { fake, service } = harness({ recallTopK: 1, recallMinScore: 0.5 });
+    fake.fetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          results: [
+            { id: "a", text: "first" },
+            { id: "b", text: "second" },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    const tool = createRecallTool(service, ownerCtx())!;
+    const result = await tool.execute("c1", { query: "which host runs hindsight" });
+    expect(fake.fetch.mock.calls[0]?.[1]?.body).not.toContain("min_scores");
+    expect(JSON.stringify(result)).toContain("2. second");
+  });
+});

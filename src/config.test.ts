@@ -5,6 +5,7 @@ import {
   hasUnresolvedToken,
   hindsightConfigSchema,
   isPlainHttpRemote,
+  recallFilterFor,
 } from "./config.js";
 
 describe("hindsightConfigSchema", () => {
@@ -448,5 +449,202 @@ describe("recall cache keys", () => {
       expect(manifest.configSchema.properties[key]?.default).toBe(0);
       expect(manifest.configSchema.properties[key]?.description).toBeTruthy();
     }
+  });
+});
+
+describe("recallTimeoutMs", () => {
+  const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
+
+  it("defaults to the previous fixed 10 s", () => {
+    expect(hindsightConfigSchema.parse(base).recallTimeoutMs).toBe(10_000);
+  });
+
+  it("accepts 250 to 30000 ms", () => {
+    for (const ms of [250, 2_000, 30_000]) {
+      expect(hindsightConfigSchema.parse({ ...base, recallTimeoutMs: ms }).recallTimeoutMs).toBe(
+        ms,
+      );
+    }
+  });
+
+  it("rejects values outside the range and non-integers", () => {
+    for (const bad of [0, 249, 30_001, 1.5, "2000"]) {
+      expect(() => hindsightConfigSchema.parse({ ...base, recallTimeoutMs: bad })).toThrow(
+        /recallTimeoutMs must be an integer from 250 to 30000/,
+      );
+    }
+  });
+
+  it("is declared in the manifest config schema with the same bounds", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ) as { configSchema: { properties: Record<string, Record<string, unknown>> } };
+    expect(manifest.configSchema.properties.recallTimeoutMs).toMatchObject({
+      type: "integer",
+      minimum: 250,
+      maximum: 30_000,
+      default: 10_000,
+    });
+  });
+});
+
+describe("recallTagGroups and recallHistoryPattern", () => {
+  const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
+  const STAGED = [{ not: { tags: ["kind:status"], match: "any_strict" } }];
+  const HISTORY =
+    "\\b(history|timeline|status|progress|what happened|when did|so far|previous|earlier|changed|still)\\b";
+
+  it("are unset by default", () => {
+    const cfg = hindsightConfigSchema.parse(base);
+    expect(cfg.recallTagGroups).toBeUndefined();
+    expect(cfg.recallHistoryPattern).toBeUndefined();
+  });
+
+  it("accept the staged status filter and history pattern", () => {
+    const cfg = hindsightConfigSchema.parse({
+      ...base,
+      recallTagGroups: STAGED,
+      recallHistoryPattern: HISTORY,
+    });
+    expect(cfg.recallTagGroups).toEqual(STAGED);
+    expect(cfg.recallHistoryPattern?.test("What is the STATUS of !47?")).toBe(true);
+    expect(cfg.recallHistoryPattern?.test("where does hindsight run?")).toBe(false);
+  });
+
+  it("accept every Hindsight 1.2.1 group form: leaf, and, or, not, match and resolve", () => {
+    const groups = [
+      { tags: ["source:gitlab"] },
+      { tags: ["typescript"], match: "any", resolve: "fuzzy" },
+      { and: [{ tags: ["a"], match: "all_strict" }, { or: [{ tags: ["b"] }, { tags: ["c"] }] }] },
+      { not: { or: [{ tags: ["kind:status"], match: "exact" }] } },
+    ];
+    expect(
+      hindsightConfigSchema.parse({ ...base, recallTagGroups: groups }).recallTagGroups,
+    ).toEqual(groups);
+  });
+
+  it("reject malformed groups with the path of the bad entry", () => {
+    const bad: Array<[unknown, RegExp]> = [
+      [{ tags: ["a"] }, /recallTagGroups must be an array of tag groups/],
+      [[], /recallTagGroups must hold 1 to 32 groups/],
+      [["a"], /recallTagGroups\[0\] must be an object/],
+      [[{ tags: [] }], /recallTagGroups\[0\]\.tags must be 1 to 32 non-empty strings/],
+      [[{ tags: ["a", 1] }], /recallTagGroups\[0\]\.tags must be 1 to 32 non-empty strings/],
+      [[{ tags: ["a"], match: "some" }], /recallTagGroups\[0\]\.match must be one of/],
+      [[{ tags: ["a"], resolve: "loose" }], /recallTagGroups\[0\]\.resolve must be exact or fuzzy/],
+      [[{ tags: ["a"], extra: 1 }], /recallTagGroups\[0\] has unknown keys: extra/],
+      [[{ tags: ["a"], not: { tags: ["b"] } }], /recallTagGroups\[0\] has unknown keys: not/],
+      [[{ not: { tags: ["b"] }, or: [] }], /recallTagGroups\[0\] must have exactly one of/],
+      [[{}], /recallTagGroups\[0\] must have exactly one of/],
+      [[{ and: [] }], /recallTagGroups\[0\]\.and must hold 1 to 32 groups/],
+      [[{ or: [{ tags: ["a"] }, { bogus: 1 }] }], /recallTagGroups\[0\]\.or\[1\] must have/],
+    ];
+    for (const [value, message] of bad) {
+      expect(() => hindsightConfigSchema.parse({ ...base, recallTagGroups: value })).toThrow(
+        message,
+      );
+    }
+  });
+
+  it("reject groups nested deeper than 8 levels", () => {
+    let group: Record<string, unknown> = { tags: ["a"] };
+    for (let i = 0; i < 8; i++) {
+      group = { not: group };
+    }
+    expect(() => hindsightConfigSchema.parse({ ...base, recallTagGroups: [group] })).toThrow(
+      /recallTagGroups nests deeper than 8 levels/,
+    );
+    expect(() =>
+      hindsightConfigSchema.parse({ ...base, recallTagGroups: [(group as { not: unknown }).not] }),
+    ).not.toThrow();
+  });
+
+  it("reject a history pattern without groups, a bad regex, or one over 500 characters", () => {
+    expect(() => hindsightConfigSchema.parse({ ...base, recallHistoryPattern: HISTORY })).toThrow(
+      /recallHistoryPattern needs recallTagGroups/,
+    );
+    for (const [value, message] of [
+      ["(unclosed", /recallHistoryPattern is not a valid regular expression/],
+      ["a".repeat(501), /recallHistoryPattern must be at most 500 characters/],
+      [42, /recallHistoryPattern must be a string/],
+    ] as const) {
+      expect(() =>
+        hindsightConfigSchema.parse({
+          ...base,
+          recallTagGroups: STAGED,
+          recallHistoryPattern: value,
+        }),
+      ).toThrow(message);
+    }
+  });
+
+  it("are declared in the manifest config schema", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ) as { configSchema: { properties: Record<string, Record<string, unknown>> } };
+    expect(manifest.configSchema.properties.recallTagGroups).toMatchObject({ type: "array" });
+    expect(manifest.configSchema.properties.recallHistoryPattern).toMatchObject({
+      type: "string",
+      maxLength: 500,
+    });
+  });
+});
+
+describe("recallFilterFor", () => {
+  const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
+  it("returns the groups unless the query matches the history pattern", () => {
+    const cfg = hindsightConfigSchema.parse({
+      ...base,
+      recallTagGroups: [{ not: { tags: ["kind:status"] } }],
+      recallHistoryPattern: "\\bhistory\\b",
+    });
+    expect(recallFilterFor(cfg, "which host runs hindsight")).toEqual({
+      tagGroups: [{ not: { tags: ["kind:status"] } }],
+    });
+    expect(recallFilterFor(cfg, "the HISTORY of the queue")).toEqual({});
+    expect(recallFilterFor(hindsightConfigSchema.parse(base), "anything")).toEqual({});
+  });
+});
+
+describe("recallTopK and recallMinScore", () => {
+  const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
+
+  it("are off by default", () => {
+    const cfg = hindsightConfigSchema.parse(base);
+    expect(cfg.recallTopK).toBeUndefined();
+    expect(cfg.recallMinScore).toBeUndefined();
+  });
+
+  it("accept a cap of 1 to 50 and a floor of 0 to 1", () => {
+    const cfg = hindsightConfigSchema.parse({ ...base, recallTopK: 6, recallMinScore: 0.15 });
+    expect(cfg.recallTopK).toBe(6);
+    expect(cfg.recallMinScore).toBe(0.15);
+    expect(hindsightConfigSchema.parse({ ...base, recallTopK: 50 }).recallTopK).toBe(50);
+    expect(hindsightConfigSchema.parse({ ...base, recallMinScore: 0 }).recallMinScore).toBe(0);
+    expect(hindsightConfigSchema.parse({ ...base, recallMinScore: 1 }).recallMinScore).toBe(1);
+  });
+
+  it("reject values out of range or of the wrong type", () => {
+    for (const bad of [0, 51, 2.5, "5"]) {
+      expect(() => hindsightConfigSchema.parse({ ...base, recallTopK: bad })).toThrow(
+        /recallTopK must be an integer from 1 to 50/,
+      );
+    }
+    for (const bad of [-0.1, 1.01, Number.NaN, "0.2"]) {
+      expect(() => hindsightConfigSchema.parse({ ...base, recallMinScore: bad })).toThrow(
+        /recallMinScore must be a number from 0 to 1/,
+      );
+    }
+  });
+
+  it("are declared in the manifest config schema with the same bounds and no default", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ) as { configSchema: { properties: Record<string, Record<string, unknown>> } };
+    const props = manifest.configSchema.properties;
+    expect(props.recallTopK).toMatchObject({ type: "integer", minimum: 1, maximum: 50 });
+    expect(props.recallMinScore).toMatchObject({ type: "number", minimum: 0, maximum: 1 });
+    expect(props.recallTopK).not.toHaveProperty("default");
+    expect(props.recallMinScore).not.toHaveProperty("default");
   });
 });

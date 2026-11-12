@@ -688,7 +688,7 @@ describe("service start warnings", () => {
   });
 });
 
-const logs = (api: OpenClawPluginApi, level: "warn" | "debug") =>
+const logs = (api: OpenClawPluginApi, level: "warn" | "debug" | "info") =>
   (api.logger[level] as ReturnType<typeof vi.fn<AnyFn>>).mock.calls.map(([m]) => String(m));
 
 describe("auto-recall on a bank that does not exist yet", () => {
@@ -1577,5 +1577,364 @@ describe("recall cache and same-session retains", () => {
     // Another session's entry is untouched.
     await run(ask, recallCtx("agent:dev:other"));
     expect(cacheRecalls(fake)).toHaveLength(3);
+  });
+});
+
+function setupBreaker(extra: Record<string, unknown>, answer: () => Promise<Response> | Response) {
+  const fetch = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(async (url, init) => {
+    if (!url.endsWith("/memories/recall")) {
+      return new Response("{}", { status: 200 });
+    }
+    const pending = answer();
+    return pending instanceof Response
+      ? pending
+      : new Promise<Response>((resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+            once: true,
+          });
+          pending.then(resolve, reject);
+        });
+  });
+  vi.stubGlobal("fetch", fetch);
+  const pluginConfig = {
+    hindsightApiUrl: "http://hindsight.test",
+    allowInsecureHttp: true,
+    hindsightApiToken: "t",
+    ...extra,
+  };
+  const on = vi.fn<AnyFn>();
+  const registerService = vi.fn<AnyFn>();
+  const api = createFakePluginApi({ pluginConfig, config: {}, on, registerService });
+  memoryPlugin.register(api);
+  const run = on.mock.calls.find(([name]) => name === "before_prompt_build")![1];
+  const recalls = () => fetch.mock.calls.filter(([url]) => url.endsWith("/memories/recall"));
+  const ask = (text = "where does hindsight run?") => run(recallEv(text), recallCtx());
+  return { api, run, ask, recalls, registerService };
+}
+const hangRecall = () => new Promise<Response>(() => undefined);
+const okRecall = () =>
+  new Response(JSON.stringify({ results: FACT }), {
+    status: 200,
+  });
+
+describe("auto-recall timeout and circuit breaker", () => {
+  it("bounds auto-recall with recallTimeoutMs (default 10 s)", async () => {
+    for (const [extra, expected] of [
+      [{}, 10_000],
+      [{ recallTimeoutMs: 2_000 }, 2_000],
+    ] as const) {
+      const timeouts = spyOnTimeouts();
+      try {
+        const { ask } = setupBreaker(extra, hangRecall);
+        await expect(ask()).resolves.toBeUndefined();
+        expect(timeouts.requested).toContain(expected);
+      } finally {
+        timeouts.restore();
+        vi.unstubAllGlobals();
+      }
+    }
+  });
+
+  it("after 3 timeouts in a row skips auto-recall without a request, with one warning", async () => {
+    const timeouts = spyOnTimeouts();
+    try {
+      const { api, ask, recalls } = setupBreaker({}, hangRecall);
+      for (let i = 0; i < 3; i++) {
+        await ask();
+      }
+      expect(recalls()).toHaveLength(3);
+      const started = performance.now();
+      for (let i = 0; i < 5; i++) {
+        await expect(ask()).resolves.toBeUndefined();
+      }
+      expect(performance.now() - started).toBeLessThan(15);
+      expect(recalls()).toHaveLength(3);
+      const pauses = logs(api, "warn").filter((m) => m.includes("auto-recall paused"));
+      expect(pauses).toEqual([
+        "memory-hindsight: auto-recall paused for 60 s after 3 failed recalls (Hindsight slow or unreachable)",
+      ]);
+      expect(logs(api, "debug")).toContain("memory-hindsight: auto-recall skipped: breaker open");
+    } finally {
+      timeouts.restore();
+    }
+  });
+
+  it("probes once after the cool-down and resumes when Hindsight answers", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const timeouts = spyOnTimeouts();
+    try {
+      let healthy = false;
+      const { api, ask, recalls } = setupBreaker({}, () => (healthy ? okRecall() : hangRecall()));
+      for (let i = 0; i < 3; i++) {
+        await ask();
+      }
+      vi.advanceTimersByTime(59_999);
+      await ask();
+      expect(recalls()).toHaveLength(3);
+      vi.advanceTimersByTime(1);
+      healthy = true;
+      const probed = await ask();
+      expect(recalls()).toHaveLength(4);
+      expect(probed.prependContext).toContain("Studio hosts Hindsight");
+      expect(logs(api, "info")).toContain("memory-hindsight: auto-recall resumed");
+      await ask();
+      expect(recalls()).toHaveLength(5);
+    } finally {
+      timeouts.restore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a failed probe pauses again for a full cool-down", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const timeouts = spyOnTimeouts();
+    try {
+      const { ask, recalls } = setupBreaker({}, hangRecall);
+      for (let i = 0; i < 3; i++) {
+        await ask();
+      }
+      vi.advanceTimersByTime(60_000);
+      await ask();
+      expect(recalls()).toHaveLength(4);
+      vi.advanceTimersByTime(59_999);
+      await ask();
+      expect(recalls()).toHaveLength(4);
+      vi.advanceTimersByTime(1);
+      await ask();
+      expect(recalls()).toHaveLength(5);
+    } finally {
+      timeouts.restore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("5xx and network errors count; 4xx, a missing bank and empty results never open it", async () => {
+    const cases: Array<[() => Response | Promise<Response>, boolean]> = [
+      [() => new Response("", { status: 503 }), true],
+      [() => Promise.reject(new TypeError("fetch failed")), true],
+      [() => new Response("", { status: 401 }), false],
+      [() => new Response("", { status: 429 }), false],
+      [
+        () => new Response(JSON.stringify({ detail: "Bank 'dev' not found" }), { status: 404 }),
+        false,
+      ],
+      [() => new Response(JSON.stringify({ results: [] }), { status: 200 }), false],
+    ];
+    for (const [answer, opens] of cases) {
+      const { ask, recalls } = setupBreaker({}, answer);
+      for (let i = 0; i < 4; i++) {
+        await ask();
+      }
+      expect(recalls()).toHaveLength(opens ? 3 : 4);
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("serves a live cached recall while the breaker is open", async () => {
+    const timeouts = spyOnTimeouts();
+    try {
+      let healthy = true;
+      const { ask, recalls } = setupBreaker({ recallCacheTtlMs: 600_000 }, () =>
+        healthy ? okRecall() : hangRecall(),
+      );
+      await ask("where does hindsight run?");
+      healthy = false;
+      for (const q of ["first other question", "second other question", "third other one"]) {
+        await ask(q);
+      }
+      expect(recalls()).toHaveLength(4);
+      const cached = await ask("where does hindsight run?");
+      expect(recalls()).toHaveLength(4);
+      expect(cached.prependContext).toContain("Studio hosts Hindsight");
+    } finally {
+      timeouts.restore();
+    }
+  });
+
+  it("starts closed again after a service restart", async () => {
+    const timeouts = spyOnTimeouts();
+    try {
+      const { ask, recalls, registerService } = setupBreaker({}, hangRecall);
+      const svc = registerService.mock.calls[0]![0];
+      svc.start();
+      for (let i = 0; i < 3; i++) {
+        await ask();
+      }
+      svc.stop();
+      svc.start();
+      await ask();
+      expect(recalls()).toHaveLength(4);
+    } finally {
+      timeouts.restore();
+    }
+  });
+});
+
+describe("auto-recall circuit breaker and live config", () => {
+  it("starts closed again when hindsightApiUrl changes", async () => {
+    const timeouts = spyOnTimeouts();
+    const fetch = createHangingFetch();
+    vi.stubGlobal("fetch", fetch);
+    try {
+      const entry = {
+        hindsightApiUrl: "http://hindsight.test",
+        allowInsecureHttp: true,
+        hindsightApiToken: "t",
+      } as Record<string, unknown>;
+      const config = { plugins: { entries: { [PLUGIN_ID]: { config: entry } } } };
+      const on = vi.fn<AnyFn>();
+      const api = createFakePluginApi({ pluginConfig: { ...entry }, config, on });
+      memoryPlugin.register(api);
+      const run = on.mock.calls.find(([name]) => name === "before_prompt_build")![1];
+      const recalls = () => fetch.mock.calls.filter(([url]) => url.endsWith("/memories/recall"));
+      for (let i = 0; i < 4; i++) {
+        await run(recallEv("where does hindsight run?"), recallCtx());
+      }
+      expect(recalls()).toHaveLength(3);
+      config.plugins.entries[PLUGIN_ID].config = { ...entry, hindsightApiUrl: "http://other.test" };
+      await run(recallEv("where does hindsight run?"), recallCtx());
+      expect(recalls()).toHaveLength(4);
+      expect(recalls()[3]?.[0]).toMatch(/^http:\/\/other\.test\//);
+    } finally {
+      timeouts.restore();
+    }
+  });
+});
+
+const STATUS_FILTER = [{ not: { tags: ["kind:status"], match: "any_strict" } }];
+
+function setupFilter(extra: Record<string, unknown>) {
+  const fake = createFakeHindsight({
+    "POST /v1/default/banks/dev/memories/recall": () => ({ json: { results: FACT } }),
+  });
+  vi.stubGlobal("fetch", fake.fetch);
+  const entry: Record<string, unknown> = {
+    hindsightApiUrl: "http://hindsight.test",
+    allowInsecureHttp: true,
+    hindsightApiToken: "t",
+    ...extra,
+  };
+  const config = { plugins: { entries: { [PLUGIN_ID]: { config: entry } } } };
+  const on = vi.fn<AnyFn>();
+  const api = createFakePluginApi({ pluginConfig: { ...entry }, config, on });
+  memoryPlugin.register(api);
+  const run = on.mock.calls.find(([name]) => name === "before_prompt_build")![1];
+  const bodies = () =>
+    fake.requests
+      .filter((r) => r.url.endsWith("/memories/recall"))
+      .map((r) => r.body as Record<string, unknown>);
+  return { run, bodies, config };
+}
+
+describe("auto-recall tag filter", () => {
+  it("sends no tag_groups when recallTagGroups is unset", async () => {
+    const { run, bodies } = setupFilter({});
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    expect(bodies()[0]).not.toHaveProperty("tag_groups");
+  });
+
+  it("passes recallTagGroups through as tag_groups", async () => {
+    const { run, bodies } = setupFilter({ recallTagGroups: STATUS_FILTER });
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    expect(bodies()[0]?.tag_groups).toEqual(STATUS_FILTER);
+  });
+
+  it("recalls without the filter when the query matches recallHistoryPattern (any case)", async () => {
+    const { run, bodies } = setupFilter({
+      recallTagGroups: STATUS_FILTER,
+      recallHistoryPattern: "\\b(history|status)\\b",
+    });
+    await run(recallEv("What is the Status of the release?"), recallCtx());
+    await run(recallEv("where does hindsight run?"), recallCtx("agent:dev:other"));
+    expect(bodies()[0]).not.toHaveProperty("tag_groups");
+    expect(bodies()[1]?.tag_groups).toEqual(STATUS_FILTER);
+  });
+
+  it("does not serve a cached recall made under another filter", async () => {
+    const { run, bodies, config } = setupFilter({ recallCacheTtlMs: 600_000 });
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    config.plugins.entries[PLUGIN_ID].config = {
+      ...config.plugins.entries[PLUGIN_ID].config,
+      recallTagGroups: STATUS_FILTER,
+    };
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    expect(bodies()).toHaveLength(2);
+    expect(bodies()[1]?.tag_groups).toEqual(STATUS_FILTER);
+  });
+});
+
+const TEN = Array.from({ length: 10 }, (_, i) => ({
+  id: `m${i}`,
+  text: `fact number ${i}`,
+  type: "world",
+}));
+
+const injectedLines = (result: { prependContext?: string } | undefined) =>
+  (result?.prependContext ?? "").split("\n").filter((l) => l.startsWith("- fact number"));
+
+function setupCap(extra: Record<string, unknown>) {
+  const fake = createFakeHindsight({
+    "POST /v1/default/banks/dev/memories/recall": () => ({ json: { results: TEN } }),
+  });
+  vi.stubGlobal("fetch", fake.fetch);
+  const entry: Record<string, unknown> = {
+    hindsightApiUrl: "http://hindsight.test",
+    allowInsecureHttp: true,
+    hindsightApiToken: "t",
+    ...extra,
+  };
+  const config = { plugins: { entries: { [PLUGIN_ID]: { config: entry } } } };
+  const on = vi.fn<AnyFn>();
+  const api = createFakePluginApi({ pluginConfig: { ...entry }, config, on });
+  memoryPlugin.register(api);
+  const run = on.mock.calls.find(([name]) => name === "before_prompt_build")![1];
+  const bodies = () =>
+    fake.requests
+      .filter((r) => r.url.endsWith("/memories/recall"))
+      .map((r) => r.body as Record<string, unknown>);
+  return { run, bodies, injected: injectedLines, config, api };
+}
+
+describe("auto-recall cap and score floor", () => {
+  it("injects every result and sends no min_scores by default", async () => {
+    const { run, bodies, injected } = setupCap({});
+    const result = await run(recallEv("where does hindsight run?"), recallCtx());
+    expect(injected(result)).toHaveLength(10);
+    expect(bodies()[0]).not.toHaveProperty("min_scores");
+  });
+
+  it("injects only the first recallTopK results, in server order", async () => {
+    const { run, injected, api } = setupCap({ recallTopK: 3 });
+    const result = await run(recallEv("where does hindsight run?"), recallCtx());
+    expect(injected(result)).toEqual([
+      "- fact number 0 [world]",
+      "- fact number 1 [world]",
+      "- fact number 2 [world]",
+    ]);
+    expect(logs(api, "info")).toContain("memory-hindsight: injecting 3 memories");
+  });
+
+  it("applies a live recallTopK change to a cached recall", async () => {
+    const { run, injected, config } = setupCap({ recallCacheTtlMs: 600_000 });
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    config.plugins.entries[PLUGIN_ID].config = {
+      ...config.plugins.entries[PLUGIN_ID].config,
+      recallTopK: 2,
+    };
+    const second = await run(recallEv("where does hindsight run?"), recallCtx());
+    expect(injected(second)).toHaveLength(2);
+  });
+
+  it("sends recallMinScore as the final-score floor, and keys the cache on it", async () => {
+    const { run, bodies, config } = setupCap({ recallMinScore: 0.2, recallCacheTtlMs: 600_000 });
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    expect(bodies()[0]?.min_scores).toEqual({ final: 0.2 });
+    config.plugins.entries[PLUGIN_ID].config = {
+      ...config.plugins.entries[PLUGIN_ID].config,
+      recallMinScore: 0.3,
+    };
+    await run(recallEv("where does hindsight run?"), recallCtx());
+    expect(bodies()).toHaveLength(2);
+    expect(bodies()[1]?.min_scores).toEqual({ final: 0.3 });
   });
 });

@@ -18,6 +18,15 @@ vi.mock("node:fs", async (importOriginal) => {
       }
       return real.appendFileSync(...args);
     },
+    // The queue appends through openSync(path, "a") and a write loop.
+    openSync: (...args: Parameters<typeof real.openSync>) => {
+      if (fsState.failAppend && args[1] === "a") {
+        throw Object.assign(new Error("ENOSPC: no space left on device, open"), {
+          code: "ENOSPC",
+        });
+      }
+      return real.openSync(...args);
+    },
   };
 });
 

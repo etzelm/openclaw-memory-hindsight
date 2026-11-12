@@ -38,8 +38,15 @@ jobs:
       - run: npm run lint
       - run: npm run format:check
 
-      - name: Pack guard tests
-        run: node --test scripts/pack-guard.test.mjs
+      - name: Pack guard and API contract tests
+        run: node --test scripts/pack-guard.test.mjs scripts/api-contract.test.mjs
+
+      - name: Host types self-test
+        run: bash scripts/host-types.sh --self-test
+
+      # The plugin against the latest OpenClaw release, besides the floor host above.
+      - name: Latest OpenClaw host
+        run: bash scripts/host-types.sh --host latest --tests
 
       # Shell tests for the compat nightly and matrix scripts (bash, git and python3 are on the
       # runner image; the runner user is not root, which the unwritable WORK_ROOT case needs).
@@ -48,6 +55,7 @@ jobs:
           bash -n scripts/*.sh
           bash scripts/compat-nightly.test.sh
           bash scripts/compat-matrix.sh --self-test
+          bash scripts/recall-ab.test.sh
 
       # The published file list must never carry tests, helpers or local state.
       - name: Pack guard

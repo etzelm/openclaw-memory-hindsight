@@ -8,6 +8,10 @@ const fsState = vi.hoisted(() => ({
   failChmod: false,
   failAppend: false,
   shortWrite: false,
+  /** writeSync stores nothing and reports 0 bytes. */
+  zeroWrite: false,
+  /** Short writes the mock actually performed, so a test can prove the path was taken. */
+  shortWrites: 0,
   calls: [] as string[],
 }));
 vi.mock("node:fs", async (importOriginal) => {
@@ -20,12 +24,30 @@ vi.mock("node:fs", async (importOriginal) => {
       }
       return real.chmodSync(...args);
     },
-    // A nearly full disk: one write stores only part of the text and reports no error.
+    // A nearly full disk: one write stores only part of what it was asked to write, returns that
+    // count and reports no error. The queue must loop until every byte is out.
     writeSync: (fd: number, data: unknown, ...rest: unknown[]) => {
-      if (fsState.shortWrite && typeof data === "string") {
-        return real.writeSync(fd, data.slice(0, Math.floor(data.length / 2)));
+      if (fsState.zeroWrite) {
+        return 0;
+      }
+      if (fsState.shortWrite) {
+        const buf = typeof data === "string" ? Buffer.from(data) : (data as Uint8Array);
+        const offset = typeof rest[0] === "number" ? rest[0] : 0;
+        const length = typeof rest[1] === "number" ? rest[1] : buf.length - offset;
+        if (length > 1) {
+          fsState.shortWrites += 1;
+          return real.writeSync(fd, buf, offset, Math.ceil(length / 2));
+        }
       }
       return (real.writeSync as (...a: unknown[]) => number)(fd, data, ...rest);
+    },
+    openSync: (...args: Parameters<typeof real.openSync>) => {
+      if (fsState.failAppend && args[1] === "a") {
+        throw Object.assign(new Error("ENOSPC: no space left on device, open"), {
+          code: "ENOSPC",
+        });
+      }
+      return real.openSync(...args);
     },
     appendFileSync: (...args: Parameters<typeof real.appendFileSync>) => {
       if (fsState.failAppend) {
@@ -56,6 +78,8 @@ afterEach(() => {
   fsState.failChmod = false;
   fsState.failAppend = false;
   fsState.shortWrite = false;
+  fsState.zeroWrite = false;
+  fsState.shortWrites = 0;
   fsState.calls = [];
   rmSync(stateDir, { recursive: true, force: true });
 });
@@ -133,6 +157,8 @@ describe("RetainQueue on a nearly full disk", () => {
       wrote = false;
     }
     fsState.shortWrite = false;
+    // The rewrite really went through short writes (a mock the code never calls proves nothing).
+    expect(fsState.shortWrites).toBeGreaterThan(0);
     const restarted = newQueue();
     // Whatever the queue reported, a restart must find every item it still holds.
     expect(wrote).toBe(true);
@@ -156,5 +182,49 @@ describe("RetainQueue on a nearly full disk", () => {
         .list()
         .map((e) => e.documentId),
     ).toEqual(["b"]);
+  });
+});
+
+describe("RetainQueue append durability (F5)", () => {
+  it("fsyncs an appended item, with no rename", () => {
+    const queue = newQueue();
+    queue.enqueue(item("a"));
+    fsState.calls = [];
+    // A new document on an existing file is an append.
+    expect(queue.enqueue(item("b"))).toBe(true);
+    expect(fsState.calls).toEqual(["fsync"]);
+    expect(
+      newQueue()
+        .list()
+        .map((e) => e.documentId),
+    ).toEqual(["a", "b"]);
+  });
+
+  it("writes the whole line of an append through short writes", () => {
+    const queue = newQueue();
+    queue.enqueue(item("a"));
+    fsState.shortWrite = true;
+    expect(queue.enqueue(item("b", "b".repeat(5_000)))).toBe(true);
+    fsState.shortWrite = false;
+    expect(fsState.shortWrites).toBeGreaterThan(1);
+    expect(
+      newQueue()
+        .list()
+        .map((e) => e.documentId),
+    ).toEqual(["a", "b"]);
+  });
+
+  it("fails a write that makes no progress instead of looping, and keeps the old file", () => {
+    const queue = newQueue();
+    queue.enqueue(item("a"));
+    queue.enqueue(item("b"));
+    fsState.zeroWrite = true;
+    expect(() => queue.enqueue(item("a", "a2"))).toThrow(/no progress/);
+    fsState.zeroWrite = false;
+    expect(
+      newQueue()
+        .list()
+        .map((e) => e.documentId),
+    ).toEqual(["a", "b"]);
   });
 });

@@ -5,8 +5,11 @@ import {
   bankLabel,
   createMetricsRouteHandler,
   HindsightMetrics,
+  INJECTED_CHARS_BUCKETS,
+  INJECTED_COUNT_BUCKETS,
   isTimeoutError,
   MAX_SERIES_PER_FAMILY,
+  RECALL_SKIP_REASONS,
 } from "./metrics.js";
 
 function sampleLines(text: string): string[] {
@@ -267,5 +270,75 @@ describe("metrics route handler", () => {
   it("denies by default outside a gateway request scope", () => {
     const handler = createMetricsRouteHandler(new HindsightMetrics(), () => undefined);
     expect(call(handler, "GET").res.statusCode).toBe(403);
+  });
+});
+
+describe("recall skip and injection metrics", () => {
+  it("counts skips by agent and reason, with no bank label", () => {
+    const m = new HindsightMetrics();
+    m.recordRecallSkip("dev", "cache_hit");
+    m.recordRecallSkip("dev", "cache_hit");
+    m.recordRecallSkip("main", "breaker_open");
+    const text = m.render();
+    expect(text).toContain("# TYPE openclaw_hindsight_recall_skipped_total counter");
+    const lines = sampleLines(text);
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_skipped_total{agent="dev",reason="cache_hit"} 2',
+    );
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_skipped_total{agent="main",reason="breaker_open"} 1',
+    );
+  });
+
+  it("declares every skip reason", () => {
+    expect(RECALL_SKIP_REASONS).toEqual([
+      "filter",
+      "no_audience",
+      "empty_query",
+      "followup",
+      "cache_hit",
+      "breaker_open",
+    ]);
+  });
+
+  it("observes injected memory count and characters in their own buckets", () => {
+    const m = new HindsightMetrics();
+    m.recordInjection("dev", "dev::conv::0123456789abcdef", 3, 1200);
+    const lines = sampleLines(m.render());
+    expect(INJECTED_COUNT_BUCKETS).toEqual([1, 2, 3, 5, 8, 10, 15, 20, 30, 50]);
+    expect(INJECTED_CHARS_BUCKETS).toEqual([250, 500, 1000, 2000, 4000, 8000, 16000, 32000]);
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_injected_memories_bucket{agent="dev",bank="dev::conv",le="2"} 0',
+    );
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_injected_memories_bucket{agent="dev",bank="dev::conv",le="3"} 1',
+    );
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_injected_memories_sum{agent="dev",bank="dev::conv"} 3',
+    );
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_injected_chars_bucket{agent="dev",bank="dev::conv",le="1000"} 0',
+    );
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_injected_chars_bucket{agent="dev",bank="dev::conv",le="2000"} 1',
+    );
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_injected_chars_bucket{agent="dev",bank="dev::conv",le="+Inf"} 1',
+    );
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_injected_chars_count{agent="dev",bank="dev::conv"} 1',
+    );
+  });
+
+  it("keeps the latency histogram in seconds", () => {
+    const m = new HindsightMetrics();
+    m.recordRecall("dev", "dev", "injected", 1500);
+    const lines = sampleLines(m.render());
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_duration_seconds_sum{agent="dev",bank="dev"} 1.5',
+    );
+    expect(lines).toContain(
+      'openclaw_hindsight_recall_duration_seconds_bucket{agent="dev",bank="dev",le="2.5"} 1',
+    );
   });
 });

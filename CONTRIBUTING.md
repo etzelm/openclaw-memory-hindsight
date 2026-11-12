@@ -38,7 +38,11 @@ npm run format:check
 ```
 
 `npm run format` fixes formatting. Add or update tests in `src/*.test.ts` for any behavior change;
-`test:coverage` fails if coverage drops below the floor in `vitest.config.ts`.
+`test:coverage` fails if coverage drops below the floor in `vitest.config.ts`. CI also runs the
+script tests (`node --test scripts/*.test.mjs`, `bash scripts/*.test.sh`), the host type
+self-test (`bash scripts/host-types.sh --self-test`) and the latest OpenClaw release
+(`bash scripts/host-types.sh --host latest --tests`); see
+[docs/compat-matrix.md](docs/compat-matrix.md#offline-checks-host-types-api-contract-retain-queue-model).
 
 Keep changes small and focused. TypeScript ESM only, no new runtime dependencies without
 discussion, and no secrets, tokens or private hostnames in code, tests or logs.

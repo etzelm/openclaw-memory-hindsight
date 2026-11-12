@@ -1,7 +1,24 @@
 import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
+import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { RECALL_QUERY_SHAPING_MODES, type RecallQueryShaping } from "./query-shaping.js";
 
 /** The id normalizeAgentId falls back to for an id with no usable characters. */
 const DEFAULT_AGENT_ID = "main";
+
+export const PLUGIN_ID = "hindsight-native";
+
+/**
+ * Reads `plugins.entries[<id>].config` from a runtime config snapshot. Returns undefined when the
+ * snapshot has no entry, so callers fall back to the register-time `api.pluginConfig`.
+ */
+export function readPluginConfigEntry(
+  config: unknown,
+  pluginId: string,
+): Record<string, unknown> | undefined {
+  const plugins = asOptionalRecord(asOptionalRecord(config)?.plugins);
+  const entry = asOptionalRecord(asOptionalRecord(plugins?.entries)?.[pluginId]);
+  return asOptionalRecord(entry?.config);
+}
 
 export const RECALL_BUDGETS = ["low", "mid", "high"] as const;
 export const RECALL_TYPES = ["world", "experience", "observation"] as const;
@@ -10,6 +27,16 @@ export const MEMORY_MODES = ["hybrid", "context", "tools"] as const;
 export type RecallBudget = (typeof RECALL_BUDGETS)[number];
 export type RecallType = (typeof RECALL_TYPES)[number];
 export type MemoryMode = (typeof MEMORY_MODES)[number];
+
+/** Hindsight 1.2.1 `TagsMatch` and the leaf `resolve` modes (engine/search/tags.py). */
+export const TAGS_MATCH_MODES = ["any", "all", "any_strict", "all_strict", "exact"] as const;
+export type TagsMatch = (typeof TAGS_MATCH_MODES)[number];
+/** One entry of Hindsight's recall `tag_groups`: a leaf, or an and/or/not of groups. */
+export type RecallTagGroup =
+  | { tags: string[]; match?: TagsMatch; resolve?: "exact" | "fuzzy" }
+  | { and: RecallTagGroup[] }
+  | { or: RecallTagGroup[] }
+  | { not: RecallTagGroup };
 
 export type HindsightConfig = {
   apiUrl: string;
@@ -44,10 +71,28 @@ export type HindsightConfig = {
   recallCacheTtlMs: number;
   /** A query of at most this many words (no URL or path) is a short follow-up; 0 = off. */
   recallFollowupMaxWords: number;
+  /** How a host-wrapped message becomes the auto-recall query; "off" = cleaned text, first 800 chars. */
+  recallQueryShaping: RecallQueryShaping;
+  /** Most memories auto-recall injects (server order); unset = every result. */
+  recallTopK?: number;
+  /** Hindsight `min_scores.final` floor for auto-recall; unset = no floor. */
+  recallMinScore?: number;
+  /** Sent as Hindsight's `tag_groups` on auto-recall and hindsight_recall; unset = no filter. */
+  recallTagGroups?: RecallTagGroup[];
+  /** A query matching this (case-insensitive) recalls without recallTagGroups. */
+  recallHistoryPattern?: RegExp;
+  /** Auto-recall request timeout in ms; a slow Hindsight then costs a turn at most this long. */
+  recallTimeoutMs: number;
 };
 
 export const MAX_RECALL_CACHE_TTL_MS = 3_600_000;
 export const MAX_RECALL_FOLLOWUP_WORDS = 100;
+export const MAX_RECALL_TOP_K = 50;
+export const MAX_TAG_GROUPS = 32;
+export const MAX_TAG_GROUP_DEPTH = 8;
+export const MAX_RECALL_HISTORY_PATTERN_CHARS = 500;
+export const MIN_RECALL_TIMEOUT_MS = 250;
+export const MAX_RECALL_TIMEOUT_MS = 30_000;
 
 export const DEFAULT_RETAIN_QUEUE_MAX_ITEMS = 500;
 export const MAX_RETAIN_QUEUE_MAX_ITEMS = 10_000;
@@ -62,6 +107,7 @@ export const DEFAULT_RETAIN_CONTEXT =
 /** Fixed behavior that the third-party plugin exposed as options; kept out of the config surface. */
 export const RECALL_MAX_TOKENS = 1024;
 export const RECALL_MAX_QUERY_CHARS = 800;
+/** Default for recallTimeoutMs, and the fixed timeout of the hindsight_recall tool. */
 export const RECALL_TIMEOUT_MS = 10_000;
 export const RETAIN_TIMEOUT_MS = 30_000;
 export const REFLECT_TIMEOUT_MS = 30_000;
@@ -96,6 +142,12 @@ const CONFIG_KEYS = [
   "listToolsWithoutAudience",
   "recallCacheTtlMs",
   "recallFollowupMaxWords",
+  "recallTimeoutMs",
+  "recallTagGroups",
+  "recallHistoryPattern",
+  "recallTopK",
+  "recallMinScore",
+  "recallQueryShaping",
 ] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -170,6 +222,36 @@ function readPositiveInt(
   return value;
 }
 
+/** Integer from min to max. */
+function readIntInRange(
+  cfg: Record<string, unknown>,
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const value = cfg[key];
+  if (value === undefined) {
+    return fallback;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${key} must be an integer from ${min} to ${max}`);
+  }
+  return value;
+}
+
+/** Optional number from 0 to 1 (a score floor); undefined when unset. */
+function readOptionalUnitNumber(cfg: Record<string, unknown>, key: string): number | undefined {
+  const value = cfg[key];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${key} must be a number from 0 to 1`);
+  }
+  return value;
+}
+
 /** Integer from 0 to max; 0 means off. */
 function readNonNegativeInt(
   cfg: Record<string, unknown>,
@@ -218,6 +300,122 @@ function readBankMap(cfg: Record<string, unknown>): Record<string, string> {
     map[key] = bank;
   }
   return map;
+}
+
+function readGroupList(value: unknown, path: string, depth: number): RecallTagGroup[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_TAG_GROUPS) {
+    throw new Error(`${path} must hold 1 to ${MAX_TAG_GROUPS} groups`);
+  }
+  return value.map((item, i) => readTagGroup(item, `${path}[${i}]`, depth));
+}
+
+const COMPOUND_KEYS = ["and", "or", "not"] as const;
+
+/** Validates one group against Hindsight's TagGroup union and returns a clean copy. */
+function readTagGroup(value: unknown, path: string, depth: number): RecallTagGroup {
+  if (depth > MAX_TAG_GROUP_DEPTH) {
+    throw new Error(`recallTagGroups nests deeper than ${MAX_TAG_GROUP_DEPTH} levels`);
+  }
+  if (!isRecord(value)) {
+    throw new Error(`${path} must be an object`);
+  }
+  const keys = Object.keys(value);
+  if ("tags" in value) {
+    const extra = keys.filter((k) => k !== "tags" && k !== "match" && k !== "resolve");
+    if (extra.length > 0) {
+      throw new Error(`${path} has unknown keys: ${extra.join(", ")}`);
+    }
+    const tags = value.tags;
+    if (
+      !Array.isArray(tags) ||
+      tags.length === 0 ||
+      tags.length > MAX_TAG_GROUPS ||
+      tags.some((t) => typeof t !== "string" || !t.trim())
+    ) {
+      throw new Error(`${path}.tags must be 1 to ${MAX_TAG_GROUPS} non-empty strings`);
+    }
+    const leaf: { tags: string[]; match?: TagsMatch; resolve?: "exact" | "fuzzy" } = {
+      tags: tags.filter((t): t is string => typeof t === "string"),
+    };
+    if (value.match !== undefined) {
+      const match = TAGS_MATCH_MODES.find((m) => m === value.match);
+      if (!match) {
+        throw new Error(`${path}.match must be one of: ${TAGS_MATCH_MODES.join(", ")}`);
+      }
+      leaf.match = match;
+    }
+    if (value.resolve !== undefined) {
+      if (value.resolve !== "exact" && value.resolve !== "fuzzy") {
+        throw new Error(`${path}.resolve must be exact or fuzzy`);
+      }
+      leaf.resolve = value.resolve;
+    }
+    return leaf;
+  }
+  const present = COMPOUND_KEYS.filter((k) => k in value);
+  if (present.length !== 1) {
+    throw new Error(`${path} must have exactly one of: tags, and, or, not`);
+  }
+  const key = present[0]!;
+  const extra = keys.filter((k) => k !== key);
+  if (extra.length > 0) {
+    throw new Error(`${path} has unknown keys: ${extra.join(", ")}`);
+  }
+  if (key === "not") {
+    return { not: readTagGroup(value.not, `${path}.not`, depth + 1) };
+  }
+  const groups = readGroupList(value[key], `${path}.${key}`, depth + 1);
+  return key === "and" ? { and: groups } : { or: groups };
+}
+
+function readTagGroups(cfg: Record<string, unknown>): RecallTagGroup[] | undefined {
+  const value = cfg.recallTagGroups;
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("recallTagGroups must be an array of tag groups");
+  }
+  return readGroupList(value, "recallTagGroups", 1);
+}
+
+function readHistoryPattern(
+  cfg: Record<string, unknown>,
+  tagGroups: RecallTagGroup[] | undefined,
+): RegExp | undefined {
+  const value = cfg.recallHistoryPattern;
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new Error("recallHistoryPattern must be a string");
+  }
+  if (value.length > MAX_RECALL_HISTORY_PATTERN_CHARS) {
+    throw new Error(
+      `recallHistoryPattern must be at most ${MAX_RECALL_HISTORY_PATTERN_CHARS} characters`,
+    );
+  }
+  let pattern: RegExp;
+  try {
+    pattern = new RegExp(value, "i");
+  } catch {
+    throw new Error("recallHistoryPattern is not a valid regular expression");
+  }
+  if (!tagGroups) {
+    throw new Error("recallHistoryPattern needs recallTagGroups (it only lifts that filter)");
+  }
+  return pattern;
+}
+
+/** The tag filter for one recall query: recallTagGroups, unless the query asks for history. */
+export function recallFilterFor(
+  config: Pick<HindsightConfig, "recallTagGroups" | "recallHistoryPattern">,
+  query: string,
+): { tagGroups?: RecallTagGroup[] } {
+  if (!config.recallTagGroups || config.recallHistoryPattern?.test(query)) {
+    return {};
+  }
+  return { tagGroups: config.recallTagGroups };
 }
 
 function normalizeApiUrl(raw: string | undefined): string {
@@ -307,6 +505,18 @@ export const hindsightConfigSchema = {
     const apiToken = readApiToken(value);
     const apiUrl = normalizeApiUrl(readString(value, "hindsightApiUrl"));
     const allowInsecureHttp = readBool(value, "allowInsecureHttp", false);
+    const recallTagGroups = readTagGroups(value);
+    const recallHistoryPattern = readHistoryPattern(value, recallTagGroups);
+    const recallTopK =
+      value.recallTopK === undefined
+        ? undefined
+        : readPositiveInt(value, "recallTopK", 1, MAX_RECALL_TOP_K);
+    const recallMinScore = readOptionalUnitNumber(value, "recallMinScore");
+    if (isPlainHttpRemote(apiUrl) && !allowInsecureHttp) {
+      throw new Error(
+        "hindsightApiUrl is plain http to a non-loopback host, so the bearer token and conversation text would travel unencrypted; use https or a loopback tunnel, or set allowInsecureHttp: true to accept the risk",
+      );
+    }
     if (isPlainHttpRemote(apiUrl) && !allowInsecureHttp) {
       throw new Error(
         "hindsightApiUrl is plain http to a non-loopback host, so the bearer token and conversation text would travel unencrypted; use https or a loopback tunnel, or set allowInsecureHttp: true to accept the risk",
@@ -352,6 +562,18 @@ export const hindsightConfigSchema = {
         0,
         MAX_RECALL_FOLLOWUP_WORDS,
       ),
+      recallQueryShaping: readEnum(value, "recallQueryShaping", RECALL_QUERY_SHAPING_MODES, "off"),
+      recallTimeoutMs: readIntInRange(
+        value,
+        "recallTimeoutMs",
+        RECALL_TIMEOUT_MS,
+        MIN_RECALL_TIMEOUT_MS,
+        MAX_RECALL_TIMEOUT_MS,
+      ),
+      ...(recallTagGroups ? { recallTagGroups } : {}),
+      ...(recallHistoryPattern ? { recallHistoryPattern } : {}),
+      ...(recallTopK === undefined ? {} : { recallTopK }),
+      ...(recallMinScore === undefined ? {} : { recallMinScore }),
     };
   },
 };

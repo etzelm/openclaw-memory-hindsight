@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   HindsightClient,
+  HindsightHttpError,
   isBankMissingBody,
   isBankNotFound,
   MEMORY_MAX_RESPONSE_BYTES,
@@ -156,5 +157,56 @@ describe("memory response body bound", () => {
     await expect(client.getMemory("dev", "m1")).rejects.toThrow(
       /memory lookup failed: response larger than/,
     );
+  });
+});
+
+describe("HindsightClient recall body", () => {
+  it("sends tag_groups only when given", async () => {
+    const fake = createFakeHindsight({
+      "POST /v1/default/banks/dev/memories/recall": () => ({ json: { results: [] } }),
+    });
+    const client = new HindsightClient({
+      resolveEndpoint: () => ({ apiUrl: "http://hindsight.test" }),
+      fetch: fake.fetch,
+    });
+    const groups = [{ not: { tags: ["kind:status"], match: "any_strict" as const } }];
+    await client.recall("dev", "q", { budget: "low", tagGroups: groups });
+    await client.recall("dev", "q", { budget: "low" });
+    expect((fake.requests[0]!.body as Record<string, unknown>).tag_groups).toEqual(groups);
+    expect(fake.requests[1]?.body).not.toHaveProperty("tag_groups");
+  });
+});
+
+const refuse = (status: number, retryAfter?: string) =>
+  new HindsightClient({
+    resolveEndpoint: () => ({ apiUrl: "http://hindsight.test" }),
+    fetch: async () =>
+      new Response("", {
+        status,
+        headers: retryAfter === undefined ? {} : { "Retry-After": retryAfter },
+      }),
+  })
+    .retain("dev", { content: "x" })
+    .then(
+      () => undefined,
+      (error: unknown) => error as HindsightHttpError,
+    );
+
+describe("Retry-After on a refused request", () => {
+  it("reads seconds and an HTTP date on 429 and 503", async () => {
+    expect((await refuse(429, "7"))?.retryAfterMs).toBe(7_000);
+    expect((await refuse(503, "2"))?.retryAfterMs).toBe(2_000);
+    const at = new Date(Date.now() + 60_000).toUTCString();
+    const fromDate = (await refuse(429, at))?.retryAfterMs ?? 0;
+    expect(fromDate).toBeGreaterThan(55_000);
+    expect(fromDate).toBeLessThanOrEqual(60_000);
+  });
+
+  it("ignores a missing, invalid, negative or past value, and other statuses", async () => {
+    expect((await refuse(429))?.retryAfterMs).toBeUndefined();
+    expect((await refuse(429, "soon"))?.retryAfterMs).toBeUndefined();
+    expect((await refuse(429, "-5"))?.retryAfterMs).toBeUndefined();
+    expect((await refuse(429, new Date(0).toUTCString()))?.retryAfterMs).toBeUndefined();
+    expect((await refuse(401, "30"))?.retryAfterMs).toBeUndefined();
   });
 });

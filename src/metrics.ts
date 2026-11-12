@@ -14,6 +14,9 @@ export const METRICS_ROUTE_PATH = "/plugins/hindsight-native/metrics";
 const PREFIX = "openclaw_hindsight_";
 // Seconds. Recall times out at 10 s, retain at 30 s.
 export const LATENCY_BUCKETS = [0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30] as const;
+// Memories and characters in one injected <hindsight_memories> block.
+export const INJECTED_COUNT_BUCKETS = [1, 2, 3, 5, 8, 10, 15, 20, 30, 50] as const;
+export const INJECTED_CHARS_BUCKETS = [250, 500, 1000, 2000, 4000, 8000, 16000, 32000] as const;
 // Label sets per family before new agent and bank values fold into "other"; agents and banks come
 // from config. Outcome and reason keep their value, so the bound grows by the enum size at most.
 export const MAX_SERIES_PER_FAMILY = 200;
@@ -24,6 +27,20 @@ export type RecallOutcome = "injected" | "empty" | "error" | "timeout";
 export type RetainOutcome = "sent" | "queued" | "error" | "timeout";
 export type ReplayOutcome = "delivered" | "deferred";
 export type DropReason = "limit" | "too_large" | "rejected";
+/**
+ * Why an eligible auto-recall turn sent no Hindsight request: a session filter (excluded provider,
+ * operational session, ignore pattern, incognito), no memory audience, no usable query, the
+ * follow-up rule, a cache hit (memories injected from the cache) or the circuit breaker.
+ */
+export const RECALL_SKIP_REASONS = [
+  "filter",
+  "no_audience",
+  "empty_query",
+  "followup",
+  "cache_hit",
+  "breaker_open",
+] as const;
+export type RecallSkipReason = (typeof RECALL_SKIP_REASONS)[number];
 
 /** Agent label: the normalized agent id, or "unknown" when it is missing or not label-safe. */
 export function agentLabel(agentId: string | undefined): string {
@@ -105,10 +122,10 @@ class Series<T> {
   }
 }
 
-type Histogram = { buckets: number[]; sum: number; count: number };
+type Histogram = { bounds: readonly number[]; buckets: number[]; sum: number; count: number };
 
-function newHistogram(): Histogram {
-  return { buckets: LATENCY_BUCKETS.map(() => 0), sum: 0, count: 0 };
+function histogramOf(bounds: readonly number[]): () => Histogram {
+  return () => ({ bounds, buckets: bounds.map(() => 0), sum: 0, count: 0 });
 }
 
 function formatNumber(value: number): string {
@@ -119,9 +136,12 @@ export type QueueDepthSource = () => ReadonlyMap<string, number> | undefined;
 
 export class HindsightMetrics {
   private readonly recalls = new Series(() => ({ n: 0 }));
-  private readonly recallLatency = new Series(newHistogram);
+  private readonly recallLatency = new Series(histogramOf(LATENCY_BUCKETS));
+  private readonly skips = new Series(() => ({ n: 0 }));
+  private readonly injectedCount = new Series(histogramOf(INJECTED_COUNT_BUCKETS));
+  private readonly injectedChars = new Series(histogramOf(INJECTED_CHARS_BUCKETS));
   private readonly retains = new Series(() => ({ n: 0 }));
-  private readonly retainLatency = new Series(newHistogram);
+  private readonly retainLatency = new Series(histogramOf(LATENCY_BUCKETS));
   private readonly replays = new Series(() => ({ n: 0 }));
   private readonly drops = new Series(() => ({ n: 0 }));
   // Kept across scrapes, so a bank whose queue drained reads 0 instead of disappearing.
@@ -130,13 +150,24 @@ export class HindsightMetrics {
   recordRecall(agentId: string | undefined, bankId: string, outcome: RecallOutcome, ms: number) {
     const base = { agent: agentLabel(agentId), bank: bankLabel(bankId) };
     this.recalls.get({ ...base, outcome }).n += 1;
-    observe(this.recallLatency.get(base), ms);
+    observe(this.recallLatency.get(base), Math.max(0, ms) / 1000);
+  }
+
+  recordRecallSkip(agentId: string | undefined, reason: RecallSkipReason) {
+    this.skips.get({ agent: agentLabel(agentId), reason }).n += 1;
+  }
+
+  /** One injected block: how many memories and how many characters reached the prompt. */
+  recordInjection(agentId: string | undefined, bankId: string, count: number, chars: number) {
+    const base = { agent: agentLabel(agentId), bank: bankLabel(bankId) };
+    observe(this.injectedCount.get(base), count);
+    observe(this.injectedChars.get(base), chars);
   }
 
   recordRetain(agentId: string | undefined, bankId: string, outcome: RetainOutcome, ms: number) {
     const base = { agent: agentLabel(agentId), bank: bankLabel(bankId) };
     this.retains.get({ ...base, outcome }).n += 1;
-    observe(this.retainLatency.get(base), ms);
+    observe(this.retainLatency.get(base), Math.max(0, ms) / 1000);
   }
 
   recordReplay(bankId: string, outcome: ReplayOutcome) {
@@ -161,7 +192,7 @@ export class HindsightMetrics {
     const histogram = (name: string, help: string, series: Series<Histogram>) => {
       lines.push(`# HELP ${PREFIX}${name} ${help}`, `# TYPE ${PREFIX}${name} histogram`);
       for (const { labels, value } of series.values()) {
-        LATENCY_BUCKETS.forEach((le, i) => {
+        value.bounds.forEach((le, i) => {
           lines.push(
             `${PREFIX}${name}_bucket${formatLabels(labels, ["le", String(le)])} ${value.buckets[i]}`,
           );
@@ -175,6 +206,21 @@ export class HindsightMetrics {
     };
     counter("recall_total", "Auto-recall attempts by outcome.", this.recalls);
     histogram("recall_duration_seconds", "Auto-recall latency.", this.recallLatency);
+    counter(
+      "recall_skipped_total",
+      "Eligible auto-recall turns that sent no Hindsight request, by reason.",
+      this.skips,
+    );
+    histogram(
+      "recall_injected_memories",
+      "Memories in each injected auto-recall block.",
+      this.injectedCount,
+    );
+    histogram(
+      "recall_injected_chars",
+      "Characters in each injected auto-recall block.",
+      this.injectedChars,
+    );
     counter("retain_total", "Auto-retain attempts by outcome.", this.retains);
     histogram("retain_duration_seconds", "Auto-retain latency.", this.retainLatency);
     lines.push(
@@ -200,14 +246,13 @@ export class HindsightMetrics {
   }
 }
 
-function observe(h: Histogram, ms: number) {
-  const seconds = Math.max(0, ms) / 1000;
-  LATENCY_BUCKETS.forEach((le, i) => {
-    if (seconds <= le) {
+function observe(h: Histogram, value: number) {
+  h.bounds.forEach((le, i) => {
+    if (value <= le) {
       h.buckets[i]! += 1;
     }
   });
-  h.sum += seconds;
+  h.sum += value;
   h.count += 1;
 }
 

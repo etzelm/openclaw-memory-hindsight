@@ -8,6 +8,7 @@ import { boundedSignal, type HindsightKnowledgeNode, isBankNotFound } from "./cl
 import {
   GET_TIMEOUT_MS,
   RECALL_MAX_TOKENS,
+  recallFilterFor,
   RECALL_TIMEOUT_MS,
   REFLECT_TIMEOUT_MS,
   RETAIN_SOURCE,
@@ -220,6 +221,7 @@ export function createRecallTool(
           ...(config.preferObservations === undefined
             ? {}
             : { preferObservations: config.preferObservations }),
+          ...recallFilterFor(config, query),
           // README promises a 10 s recall timeout; the host signal alone may wait far longer.
           signal: boundedSignal(RECALL_TIMEOUT_MS, signal),
         });

@@ -1,6 +1,6 @@
 {
   "name": "@etzelm/openclaw-memory-hindsight",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Native Hindsight memory engine for OpenClaw: memory slot provider runtime, auto-recall, auto-retain, pre-compaction flush and hindsight_* agent tools.",
   "keywords": [
     "hindsight",

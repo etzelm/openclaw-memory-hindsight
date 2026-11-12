@@ -1,4 +1,4 @@
-import type { RecallBudget, RecallType } from "./config.js";
+import type { RecallBudget, RecallTagGroup, RecallType } from "./config.js";
 
 export type RecallMinScores = { final?: number };
 
@@ -30,6 +30,7 @@ export type HindsightRecallOptions = {
   types?: RecallType[];
   preferObservations?: boolean;
   minScores?: RecallMinScores;
+  tagGroups?: RecallTagGroup[];
   signal?: AbortSignal;
 };
 
@@ -52,6 +53,23 @@ export class HindsightHttpError extends Error {
     super(message);
     this.name = "HindsightHttpError";
   }
+
+  /** From a 429 or 503 `Retry-After` header: how long the server asked us to wait. */
+  retryAfterMs?: number;
+}
+
+/** `Retry-After` as delay seconds or an HTTP date; undefined when absent, invalid or past. */
+export function parseRetryAfter(value: string | null, now = Date.now()): number | undefined {
+  const text = value?.trim();
+  if (!text) {
+    return undefined;
+  }
+  if (/^\d+$/.test(text)) {
+    const seconds = Number(text);
+    return seconds > 0 ? seconds * 1000 : undefined;
+  }
+  const at = Date.parse(text);
+  return Number.isFinite(at) && at > now ? at - now : undefined;
 }
 
 export function isBankNotFound(error: unknown): boolean {
@@ -150,6 +168,9 @@ export type HindsightClientOptions = {
 };
 
 const HEALTH_TIMEOUT_MS = 5_000;
+// Operator commands (openclaw hindsight): listing and deleting documents, checking auth.
+const ADMIN_TIMEOUT_MS = 10_000;
+const DELETE_TIMEOUT_MS = 30_000;
 
 /** A fixed timeout, combined with the host signal when there is one (host abort still wins). */
 export function boundedSignal(timeoutMs: number, hostSignal?: AbortSignal): AbortSignal {
@@ -215,13 +236,20 @@ export class HindsightClient {
       const bankMissingExplicit = response.status === 404 && isExplicitBankMissingBody(body);
       const pageMissing = response.status === 404 && isExplicitPageMissingBody(body);
       // Server error bodies can echo request content; keep only the status in the message.
-      throw new HindsightHttpError(
+      const error = new HindsightHttpError(
         `Hindsight ${operation} failed: HTTP ${response.status}`,
         response.status,
         bankMissing,
         bankMissingExplicit,
         pageMissing,
       );
+      if (response.status === 429 || response.status === 503) {
+        const retryAfterMs = parseRetryAfter(response.headers.get("retry-after"));
+        if (retryAfterMs !== undefined) {
+          error.retryAfterMs = retryAfterMs;
+        }
+      }
+      throw error;
     }
     let text: string;
     if (init.maxBodyBytes === undefined) {
@@ -272,6 +300,9 @@ export class HindsightClient {
     }
     if (options.minScores) {
       body.min_scores = options.minScores;
+    }
+    if (options.tagGroups?.length) {
+      body.tag_groups = options.tagGroups;
     }
     const response = await this.request<{ results?: HindsightRecallResult[] }>(
       "recall",
@@ -395,6 +426,85 @@ export class HindsightClient {
       return;
     }
     await this.request("bank setup", this.bankUrl(bankId), { method: "PUT", body, signal });
+  }
+
+  /** Hindsight's `api_version` from GET /version, or undefined when it does not say. */
+  async version(signal?: AbortSignal): Promise<string | undefined> {
+    const { apiUrl } = this.options.resolveEndpoint();
+    const body = await this.request<{ api_version?: unknown }>("version", `${apiUrl}/version`, {
+      method: "GET",
+      signal: signal ?? AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+      maxBodyBytes: KB_MAX_RESPONSE_BYTES,
+    });
+    return typeof body.api_version === "string" ? body.api_version : undefined;
+  }
+
+  /** One page of the bank list; used to check that the token is accepted. */
+  async listBanks(signal?: AbortSignal): Promise<void> {
+    const { apiUrl } = this.options.resolveEndpoint();
+    await this.request("bank list", `${apiUrl}/v1/default/banks?limit=1`, {
+      method: "GET",
+      signal: signal ?? AbortSignal.timeout(ADMIN_TIMEOUT_MS),
+      maxBodyBytes: KB_MAX_RESPONSE_BYTES,
+    });
+  }
+
+  /** One page of a bank's documents; `q` is Hindsight's substring filter on id or text. */
+  async listDocuments(
+    bankId: string,
+    options: { q?: string; limit: number; offset: number },
+    signal?: AbortSignal,
+  ): Promise<Array<{ id: string; memoryUnits: number }>> {
+    const params = new URLSearchParams({
+      limit: String(options.limit),
+      offset: String(options.offset),
+    });
+    if (options.q) {
+      params.set("q", options.q);
+    }
+    const body = await this.request<{
+      items?: Array<{ id?: unknown; memory_unit_count?: unknown }>;
+    }>("document list", this.bankUrl(bankId, `/documents?${params.toString()}`), {
+      method: "GET",
+      signal: signal ?? AbortSignal.timeout(ADMIN_TIMEOUT_MS),
+      maxBodyBytes: MEMORY_MAX_RESPONSE_BYTES,
+    });
+    return (Array.isArray(body.items) ? body.items : [])
+      .filter(
+        (item): item is { id: string; memory_unit_count?: unknown } => typeof item?.id === "string",
+      )
+      .map((item) => ({
+        id: item.id,
+        memoryUnits: typeof item.memory_unit_count === "number" ? item.memory_unit_count : 0,
+      }));
+  }
+
+  /** Deletes a document and the memory units extracted from it; null when it was already gone. */
+  async deleteDocument(
+    bankId: string,
+    documentId: string,
+    signal?: AbortSignal,
+  ): Promise<{ memoryUnitsDeleted: number } | null> {
+    try {
+      const body = await this.request<{ memory_units_deleted?: unknown }>(
+        "delete document",
+        this.bankUrl(bankId, `/documents/${encodeURIComponent(documentId)}`),
+        {
+          method: "DELETE",
+          signal: signal ?? AbortSignal.timeout(DELETE_TIMEOUT_MS),
+          maxBodyBytes: KB_MAX_RESPONSE_BYTES,
+        },
+      );
+      return {
+        memoryUnitsDeleted:
+          typeof body.memory_units_deleted === "number" ? body.memory_units_deleted : 0,
+      };
+    } catch (error) {
+      if (error instanceof HindsightHttpError && error.status === 404 && !error.bankMissing) {
+        return null;
+      }
+      throw error;
+    }
   }
 
   async healthy(): Promise<boolean> {

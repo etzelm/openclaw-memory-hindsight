@@ -1,0 +1,893 @@
+{
+  "hindsight": "1.2.1",
+  "operations": {
+    "POST /v1/default/banks/{bank_id}/memories": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "async": {
+            "type": "boolean"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["content"],
+              "properties": {
+                "content": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "text": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["text", "type"]
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "source": {
+                                "ref": "Base64AttachmentSource"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["source", "type"]
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "filename": {
+                                "type": "string",
+                                "nullable": true
+                              },
+                              "source": {
+                                "ref": "Base64AttachmentSource"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["source", "type"]
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                "context": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "document_id": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "metadata": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "nullable": true
+                },
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "nullable": true
+                },
+                "timestamp": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "string"
+                    }
+                  ],
+                  "nullable": true
+                },
+                "update_mode": {
+                  "type": "string",
+                  "enum": ["append", "replace"],
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "response": null
+    },
+    "POST /v1/default/banks/{bank_id}/memories/recall": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "budget": {
+            "type": "string",
+            "enum": ["high", "low", "mid"]
+          },
+          "max_tokens": {
+            "type": "integer"
+          },
+          "min_scores": {
+            "type": "object",
+            "required": [],
+            "nullable": true,
+            "properties": {
+              "final": {
+                "type": "number",
+                "nullable": true
+              }
+            }
+          },
+          "prefer_observations": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "query": {
+            "type": "string"
+          },
+          "tag_groups": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "match": {
+                      "type": "string",
+                      "enum": ["all", "all_strict", "any", "any_strict", "exact"]
+                    },
+                    "resolve": {
+                      "type": "string",
+                      "enum": ["exact", "fuzzy"]
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": ["tags"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "and": {
+                      "type": "array",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "match": {
+                                "type": "string",
+                                "enum": ["all", "all_strict", "any", "any_strict", "exact"]
+                              },
+                              "resolve": {
+                                "type": "string",
+                                "enum": ["exact", "fuzzy"]
+                              },
+                              "tags": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "required": ["tags"]
+                          },
+                          {
+                            "ref": "TagGroupAnd-Input"
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "or": {
+                                "type": "array",
+                                "items": {
+                                  "anyOf": [
+                                    {
+                                      "ref": "TagGroupLeaf"
+                                    },
+                                    {
+                                      "ref": "TagGroupAnd-Input"
+                                    },
+                                    {
+                                      "ref": "TagGroupOr-Input"
+                                    },
+                                    {
+                                      "ref": "TagGroupNot-Input"
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            "required": ["or"]
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "not": {
+                                "anyOf": [
+                                  {
+                                    "ref": "TagGroupLeaf"
+                                  },
+                                  {
+                                    "ref": "TagGroupAnd-Input"
+                                  },
+                                  {
+                                    "ref": "TagGroupOr-Input"
+                                  },
+                                  {
+                                    "ref": "TagGroupNot-Input"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": ["not"]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "required": ["and"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "or": {
+                      "type": "array",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "match": {
+                                "type": "string",
+                                "enum": ["all", "all_strict", "any", "any_strict", "exact"]
+                              },
+                              "resolve": {
+                                "type": "string",
+                                "enum": ["exact", "fuzzy"]
+                              },
+                              "tags": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "required": ["tags"]
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "and": {
+                                "type": "array",
+                                "items": {
+                                  "anyOf": [
+                                    {
+                                      "ref": "TagGroupLeaf"
+                                    },
+                                    {
+                                      "ref": "TagGroupAnd-Input"
+                                    },
+                                    {
+                                      "ref": "TagGroupOr-Input"
+                                    },
+                                    {
+                                      "ref": "TagGroupNot-Input"
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            "required": ["and"]
+                          },
+                          {
+                            "ref": "TagGroupOr-Input"
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "not": {
+                                "anyOf": [
+                                  {
+                                    "ref": "TagGroupLeaf"
+                                  },
+                                  {
+                                    "ref": "TagGroupAnd-Input"
+                                  },
+                                  {
+                                    "ref": "TagGroupOr-Input"
+                                  },
+                                  {
+                                    "ref": "TagGroupNot-Input"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": ["not"]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "required": ["or"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "not": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "match": {
+                              "type": "string",
+                              "enum": ["all", "all_strict", "any", "any_strict", "exact"]
+                            },
+                            "resolve": {
+                              "type": "string",
+                              "enum": ["exact", "fuzzy"]
+                            },
+                            "tags": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          },
+                          "required": ["tags"]
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "and": {
+                              "type": "array",
+                              "items": {
+                                "anyOf": [
+                                  {
+                                    "ref": "TagGroupLeaf"
+                                  },
+                                  {
+                                    "ref": "TagGroupAnd-Input"
+                                  },
+                                  {
+                                    "ref": "TagGroupOr-Input"
+                                  },
+                                  {
+                                    "ref": "TagGroupNot-Input"
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "required": ["and"]
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "or": {
+                              "type": "array",
+                              "items": {
+                                "anyOf": [
+                                  {
+                                    "ref": "TagGroupLeaf"
+                                  },
+                                  {
+                                    "ref": "TagGroupAnd-Input"
+                                  },
+                                  {
+                                    "ref": "TagGroupOr-Input"
+                                  },
+                                  {
+                                    "ref": "TagGroupNot-Input"
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "required": ["or"]
+                        },
+                        {
+                          "ref": "TagGroupNot-Input"
+                        }
+                      ]
+                    }
+                  },
+                  "required": ["not"]
+                }
+              ]
+            },
+            "nullable": true
+          },
+          "types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "nullable": true
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "required": ["results"],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "text"],
+              "properties": {
+                "document_id": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "id": {
+                  "type": "string"
+                },
+                "mentioned_at": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "occurred_end": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "occurred_start": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "scores": {
+                  "type": "object",
+                  "required": ["final"],
+                  "nullable": true,
+                  "properties": {
+                    "final": {
+                      "type": "number"
+                    }
+                  }
+                },
+                "text": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string",
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /v1/default/banks/{bank_id}/reflect": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "budget": {
+            "type": "string",
+            "enum": ["high", "low", "mid"]
+          },
+          "query": {
+            "type": "string"
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "required": ["text"],
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "GET /v1/default/banks/{bank_id}/memories/{memory_id}": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "path:memory_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": null
+    },
+    "PUT /v1/default/banks/{bank_id}": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": {
+        "type": "object",
+        "required": [],
+        "properties": {
+          "retain_mission": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "response": null
+    },
+    "GET /v1/default/banks/{bank_id}/knowledge-base/tree": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "query:tags": {
+          "required": false,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "nullable": true
+        },
+        "query:tags_match": {
+          "required": false,
+          "type": "string",
+          "enum": ["all", "all_strict", "any", "any_strict", "exact"]
+        },
+        "query:tag_groups": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["roots"],
+        "properties": {
+          "roots": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "kind", "name"],
+              "properties": {
+                "children": {
+                  "type": "array",
+                  "items": {
+                    "ref": "PageNode"
+                  }
+                },
+                "id": {
+                  "type": "string"
+                },
+                "is_stale": {
+                  "type": "boolean",
+                  "nullable": true
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": ["folder", "page"]
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/default/banks/{bank_id}/knowledge-base/search": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "query:q": {
+          "required": true,
+          "type": "string"
+        },
+        "query:limit": {
+          "required": false,
+          "type": "integer"
+        },
+        "query:tags": {
+          "required": false,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "nullable": true
+        },
+        "query:tags_match": {
+          "required": false,
+          "type": "string",
+          "enum": ["all", "all_strict", "any", "any_strict", "exact"]
+        },
+        "query:tag_groups": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["results", "total"],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "name", "score", "snippet"],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "snippet": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "path:page_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["id", "markdown", "name", "type"],
+        "properties": {
+          "markdown": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "GET /health": {
+      "params": {},
+      "request": null,
+      "response": null
+    },
+    "GET /version": {
+      "params": {},
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["api_version", "features"],
+        "properties": {
+          "api_version": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "GET /v1/default/banks": {
+      "params": {
+        "query:q": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        },
+        "query:limit": {
+          "required": false,
+          "type": "integer"
+        },
+        "query:offset": {
+          "required": false,
+          "type": "integer"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": null
+    },
+    "GET /v1/default/banks/{bank_id}/documents": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "query:q": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        },
+        "query:tags": {
+          "required": false,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "nullable": true
+        },
+        "query:tags_match": {
+          "required": false,
+          "type": "string",
+          "enum": ["all", "all_strict", "any", "any_strict", "exact"]
+        },
+        "query:time_field": {
+          "required": false,
+          "type": "string",
+          "enum": ["created_at", "updated_at"],
+          "nullable": true
+        },
+        "query:start_date": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        },
+        "query:end_date": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        },
+        "query:limit": {
+          "required": false,
+          "type": "integer"
+        },
+        "query:offset": {
+          "required": false,
+          "type": "integer"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["items", "limit", "offset", "total"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id"],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "memory_unit_count": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "DELETE /v1/default/banks/{bank_id}/documents/{document_id}": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "path:document_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["document_id", "memory_units_deleted", "message", "success"],
+        "properties": {
+          "memory_units_deleted": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  }
+}

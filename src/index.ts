@@ -7,18 +7,21 @@ import {
   type OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { isIncognitoSessionKey } from "openclaw/plugin-sdk/routing";
-import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { registerHindsightCli } from "./cli.js";
 import { type HindsightRecallResult, isBankNotFound } from "./client.js";
 import {
   type HindsightConfig,
   hasUnresolvedToken,
   hindsightConfigSchema,
   isPlainHttpRemote,
+  PLUGIN_ID,
+  readPluginConfigEntry,
   RECALL_MAX_TOKENS,
-  RECALL_TIMEOUT_MS,
+  recallFilterFor,
   RETAIN_SOURCE,
   RETAIN_TIMEOUT_MS,
 } from "./config.js";
+import { runDocumentId } from "./document-ids.js";
 import {
   createLearnContribution,
   createLegacyLearnFields,
@@ -32,6 +35,7 @@ import {
   METRICS_ROUTE_PATH,
 } from "./metrics.js";
 import { createHindsightProviderRuntime } from "./provider-runtime.js";
+import { type BreakerTransition, RecallBreaker } from "./recall-breaker.js";
 import { isMaintenanceTurn, routeAudience, sessionUsesMemory } from "./routing.js";
 import { type MemoryPluginCapability, resolveLearnRegistrar } from "./sdk-types.js";
 import { createHindsightService } from "./service.js";
@@ -62,7 +66,8 @@ import {
   runStartMarker,
 } from "./transcript.js";
 
-export const PLUGIN_ID = "hindsight-native";
+export { PLUGIN_ID, readPluginConfigEntry } from "./config.js";
+export { sessionKeyDigest } from "./document-ids.js";
 // Bounds per-session run markers; one entry per active session is enough.
 const MAX_RUN_MARKERS = 1_000;
 // Bounds the auto-recall cache; one entry per active session, oldest dropped first.
@@ -81,36 +86,6 @@ function queryDigest(query: string): string {
   return createHash("sha256").update(query).digest("hex");
 }
 
-/**
- * Reads `plugins.entries[<id>].config` from a runtime config snapshot. Returns undefined when the
- * snapshot has no entry, so callers fall back to the register-time `api.pluginConfig`.
- */
-export function readPluginConfigEntry(
-  config: unknown,
-  pluginId: string,
-): Record<string, unknown> | undefined {
-  const plugins = asOptionalRecord(asOptionalRecord(config)?.plugins);
-  const entry = asOptionalRecord(asOptionalRecord(plugins?.entries)?.[pluginId]);
-  return asOptionalRecord(entry?.config);
-}
-
-function sanitizeDocumentIdPart(value: string | undefined, fallback: string): string {
-  const cleaned = (value ?? "")
-    .trim()
-    .replace(/[^a-zA-Z0-9:_-]+/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  return cleaned || fallback;
-}
-
-/** Short stable digest of the raw key, so keys that sanitize to the same text stay distinct. */
-export function sessionKeyDigest(sessionKey: string | undefined): string {
-  return createHash("sha256")
-    .update(sessionKey ?? "")
-    .digest("hex")
-    .slice(0, 12);
-}
-
 export default definePluginEntry({
   id: PLUGIN_ID,
   name: "Memory (Hindsight)",
@@ -119,6 +94,13 @@ export default definePluginEntry({
   configSchema: hindsightConfigSchema,
 
   register(api: OpenClawPluginApi) {
+    // Before the config check, so `openclaw hindsight doctor` can explain a config that keeps the
+    // plugin disabled. Help and routing read the manifest's cliCommands; a metadata load needs
+    // nothing else from this plugin.
+    registerHindsightCli(api);
+    if (api.registrationMode === "cli-metadata") {
+      return;
+    }
     let startupConfig: HindsightConfig;
     try {
       startupConfig = hindsightConfigSchema.parse(api.pluginConfig);
@@ -184,6 +166,23 @@ export default definePluginEntry({
 
     // Last auto-recall per session (never shared across sessions; the bank is checked on read).
     const recallCache = new Map<string, RecallCacheEntry>();
+
+    // Auto-recall is awaited on the reply path. When Hindsight is slow or down, the breaker turns
+    // a timeout on every turn into a skip without a request, then probes once per cool-down.
+    // Reset when the API URL changes, since its state describes one server.
+    const recallBreaker = new RecallBreaker();
+    let breakerApiUrl: string | undefined;
+    const noteBreaker = (transition: BreakerTransition) => {
+      if (transition === "opened") {
+        api.logger.warn?.(
+          `memory-hindsight: auto-recall paused for ${recallBreaker.cooldownSeconds} s after ${recallBreaker.failureThreshold} failed recalls (Hindsight slow or unreachable)`,
+        );
+      } else if (transition === "reopened") {
+        api.logger.debug?.("memory-hindsight: auto-recall probe failed; paused again");
+      } else if (transition === "closed") {
+        api.logger.info?.("memory-hindsight: auto-recall resumed");
+      }
+    };
 
     const capability: MemoryPluginCapability = {
       providerRuntime: createHindsightProviderRuntime({
@@ -259,11 +258,11 @@ export default definePluginEntry({
           runStartBySession.delete(runStartBySession.keys().next().value!);
         }
       }
+      // Recall turned off, and host maintenance turns, are not counted as skips.
+      if (service.stopped() || !config.autoRecall || config.memoryMode === "tools" || maintenance) {
+        return undefined;
+      }
       if (
-        service.stopped() ||
-        !config.autoRecall ||
-        config.memoryMode === "tools" ||
-        maintenance ||
         isIncognitoSessionKey(sessionKey) ||
         !sessionUsesMemory(config, {
           sessionKey,
@@ -271,15 +270,22 @@ export default definePluginEntry({
           purpose: "recall",
         })
       ) {
+        metrics.recordRecallSkip(ctx.agentId, "filter");
         return undefined;
       }
       const route = routeAudience(ctx.agentId, ctx.memoryAudience, config.agentBankMap);
       if (!route.ok) {
+        metrics.recordRecallSkip(ctx.agentId, "no_audience");
         api.logger.debug?.(`memory-hindsight: auto-recall skipped: ${route.reason}`);
         return undefined;
       }
-      const query = extractRecallQuery(event.currentUserMessage, event.prompt);
+      const query = extractRecallQuery(
+        event.currentUserMessage,
+        event.prompt,
+        config.recallQueryShaping,
+      );
       if (!query || isEphemeralOperationalText(query)) {
+        metrics.recordRecallSkip(ctx.agentId, "empty_query");
         return undefined;
       }
       try {
@@ -290,24 +296,43 @@ export default definePluginEntry({
         const live = cached && cached.bankId === route.bankId && now - cached.at < ttl;
         const followup = isShortFollowup(query, config.recallFollowupMaxWords);
         if (followup && live && cached.results.length > 0) {
+          metrics.recordRecallSkip(ctx.agentId, "followup");
           api.logger.debug?.("memory-hindsight: auto-recall source=followup-skip");
           return undefined;
         }
         let recallQuery = query;
         let source: RecallSource = "fresh";
         if (followup) {
-          const previous = previousUserQuery(event.messages, query);
+          const previous = previousUserQuery(event.messages, query, config.recallQueryShaping);
           if (previous) {
             recallQuery = expandFollowupQuery(previous, query);
             source = "followup-expanded";
           }
         }
-        const queryHash = queryDigest(recallQuery);
+        // The tag filter and the score floor change what Hindsight returns, so both are part of
+        // the cache key: a live change never serves a result recalled under the old settings. The
+        // cap is applied at injection, so a cached result honors a live recallTopK change.
+        const filter = recallFilterFor(config, recallQuery);
+        const queryHash = queryDigest(
+          `${recallQuery}\n${JSON.stringify(filter.tagGroups ?? null)}\n${config.recallMinScore ?? ""}`,
+        );
         let results: RecallResults;
         if (live && cached.queryHash === queryHash) {
           results = cached.results;
           source = "cached";
+          metrics.recordRecallSkip(ctx.agentId, "cache_hit");
         } else {
+          if (breakerApiUrl !== config.apiUrl) {
+            recallBreaker.reset();
+            breakerApiUrl = config.apiUrl;
+          }
+          const admission = recallBreaker.admit();
+          if (admission === "skip") {
+            metrics.recordRecallSkip(ctx.agentId, "breaker_open");
+            api.logger.debug?.("memory-hindsight: auto-recall skipped: breaker open");
+            return undefined;
+          }
+          const probe = admission === "probe";
           // Metrics count the Hindsight request only. A host assert that throws (audience changed,
           // hook invocation stale) is host lifecycle, not a recall outcome, so it records nothing.
           const recallStarted = performance.now();
@@ -319,9 +344,14 @@ export default definePluginEntry({
               ...(config.preferObservations === undefined
                 ? {}
                 : { preferObservations: config.preferObservations }),
-              signal: AbortSignal.timeout(RECALL_TIMEOUT_MS),
+              ...filter,
+              ...(config.recallMinScore === undefined
+                ? {}
+                : { minScores: { final: config.recallMinScore } }),
+              signal: AbortSignal.timeout(config.recallTimeoutMs),
             });
           } catch (error) {
+            noteBreaker(recallBreaker.record(error, probe));
             metrics.recordRecall(
               ctx.agentId,
               route.bankId,
@@ -331,6 +361,7 @@ export default definePluginEntry({
             throw error;
           }
           const recallMs = performance.now() - recallStarted;
+          noteBreaker(recallBreaker.record(undefined, probe));
           ctx.assertMemoryAudienceCurrent?.();
           ctx.hookInvocation?.assertActive();
           metrics.recordRecall(
@@ -360,11 +391,13 @@ export default definePluginEntry({
         if (results.length === 0) {
           return undefined;
         }
-        api.logger.info?.(`memory-hindsight: injecting ${results.length} memories`);
+        // Hindsight returns results best first, so the cap keeps the top of the ranking.
+        const injected = config.recallTopK ? results.slice(0, config.recallTopK) : results;
+        api.logger.info?.(`memory-hindsight: injecting ${injected.length} memories`);
+        const prependContext = buildRecallContext(injected, config.recallPromptPreamble);
+        metrics.recordInjection(ctx.agentId, route.bankId, injected.length, prependContext.length);
         // Before the user message, outside the system prompt, so the cached prefix stays stable.
-        return {
-          prependContext: buildRecallContext(results, config.recallPromptPreamble),
-        };
+        return { prependContext };
       } catch (error) {
         if (isBankNotFound(error)) {
           // Nothing was retained to this bank yet: no memories, not a failure.
@@ -431,8 +464,7 @@ export default definePluginEntry({
       const tags = [...new Set([...config.retainTags, ...retention.tags])];
       // One document per run. Every agent_end for the run carries the run from its first start,
       // so a continuation or a re-delivery replaces the document with the whole run.
-      const runPart = sanitizeDocumentIdPart(runId, `${Date.now()}`);
-      const documentId = `openclaw:${sanitizeDocumentIdPart(sessionKey, "session")}-${sessionKeyDigest(sessionKey)}:run:${runPart}`;
+      const documentId = runDocumentId(sessionKey, runId);
       const retainStarted = performance.now();
       try {
         // No ctx.assertMemoryAudienceCurrent() here. The host starts agent_end handlers without
@@ -516,6 +548,7 @@ export default definePluginEntry({
         service.stop();
         runStartBySession.clear();
         recallCache.clear();
+        recallBreaker.reset();
         api.logger.info("memory-hindsight: stopped");
       },
     });

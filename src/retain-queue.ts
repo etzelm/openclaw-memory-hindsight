@@ -1,5 +1,4 @@
 import {
-  appendFileSync,
   chmodSync,
   closeSync,
   existsSync,
@@ -11,7 +10,7 @@ import {
   readSync,
   renameSync,
   rmSync,
-  writeFileSync,
+  writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
@@ -172,6 +171,22 @@ function syncDir(dir: string): void {
   }
 }
 
+/**
+ * Writes all of `text` to `fd`. One write call may store only part of it on a nearly full disk
+ * and report no error, so loop on the count it returns; a write that makes no progress throws.
+ */
+function writeAll(fd: number, text: string): void {
+  const buf = Buffer.from(text, "utf8");
+  let offset = 0;
+  while (offset < buf.length) {
+    const written = writeSync(fd, buf, offset, buf.length - offset);
+    if (written <= 0) {
+      throw Object.assign(new Error("EIO: write made no progress"), { code: "EIO" });
+    }
+    offset += written;
+  }
+}
+
 /** True when the file is empty or its last byte is a newline. */
 function endsWithNewline(filePath: string): boolean {
   const fd = openSync(filePath, "r");
@@ -186,6 +201,69 @@ function endsWithNewline(filePath: string): boolean {
   } finally {
     closeSync(fd);
   }
+}
+
+/**
+ * Parses queue file text as `load()` does: the newest copy per bank and document id, in file
+ * order, without the copies a tombstone removed. Lines that do not parse are counted.
+ */
+export function parseQueueText(text: string): {
+  entries: Array<{ entry: QueuedRetain; line: string }>;
+  skipped: number;
+  tombstones: number;
+  duplicates: number;
+} {
+  // Keyed by bank and document id in file order. A later copy wins and takes the later place:
+  // a crash between replay's batched saves leaves a delivered copy before a newer append.
+  const loaded = new Map<string, { entry: QueuedRetain; line: string }>();
+  let skipped = 0;
+  let tombstones = 0;
+  let duplicates = 0;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const entry: unknown = JSON.parse(line);
+      if (isQueuedRetain(entry)) {
+        const key = queueKey(entry);
+        if (loaded.delete(key)) {
+          duplicates += 1;
+        }
+        loaded.set(key, { entry, line });
+        continue;
+      }
+      const dead = tombstoneKey(entry);
+      if (dead) {
+        // Drops the earlier copy the tombstone was written for.
+        loaded.delete(queueKey(dead));
+        tombstones += 1;
+        continue;
+      }
+    } catch {
+      // counted below
+    }
+    skipped += 1;
+  }
+  return { entries: [...loaded.values()], skipped, tombstones, duplicates };
+}
+
+/**
+ * Reads the queue file without writing it, for a process that does not own the queue (the CLI).
+ * A missing file is an empty queue; other read errors throw.
+ */
+export function readQueueFile(filePath: string): { entries: QueuedRetain[]; skipped: number } {
+  let text: string;
+  try {
+    text = readFileSync(filePath, "utf8");
+  } catch (error) {
+    if ((error as { code?: unknown }).code === "ENOENT") {
+      return { entries: [], skipped: 0 };
+    }
+    throw error;
+  }
+  const parsed = parseQueueText(text);
+  return { entries: parsed.entries.map((e) => e.entry), skipped: parsed.skipped };
 }
 
 /** `size` is the line's UTF-8 length plus its newline: what it takes on disk. */
@@ -277,39 +355,8 @@ export class RetainQueue {
       throw error;
     }
     this.fileBytes = Buffer.byteLength(text, "utf8");
-    // Keyed by bank and document id in file order. A later copy wins and takes the later place:
-    // a crash between replay's batched saves leaves a delivered copy before a newer append.
-    const loaded = new Map<string, Stored>();
-    let skipped = 0;
-    let tombstones = 0;
-    let duplicates = 0;
-    for (const line of text.split("\n")) {
-      if (!line.trim()) {
-        continue;
-      }
-      try {
-        const entry: unknown = JSON.parse(line);
-        if (isQueuedRetain(entry)) {
-          const key = queueKey(entry);
-          if (loaded.delete(key)) {
-            duplicates += 1;
-          }
-          loaded.set(key, stored(entry, line));
-          continue;
-        }
-        const dead = tombstoneKey(entry);
-        if (dead) {
-          // Drops the earlier copy the tombstone was written for.
-          loaded.delete(queueKey(dead));
-          tombstones += 1;
-          continue;
-        }
-      } catch {
-        // counted below
-      }
-      skipped += 1;
-    }
-    this.stored = [...loaded.values()];
+    const { entries, skipped, tombstones, duplicates } = parseQueueText(text);
+    this.stored = entries.map(({ entry, line }) => stored(entry, line));
     if (skipped > 0) {
       this.logger.warn?.(`memory-hindsight: retain queue skipped ${skipped} unreadable line(s)`);
     }
@@ -367,7 +414,13 @@ export class RetainQueue {
    * Adds or replaces (same bank and document id) and writes the file before returning. Returns
    * false, and queues nothing, when the item alone is larger than the size bound.
    */
-  enqueue(entry: Omit<QueuedRetain, "queuedAt">): boolean {
+  enqueue(
+    entry: Omit<QueuedRetain, "queuedAt">,
+    options: {
+      /** False: refuse the item (return false) rather than drop queued items for it. */
+      evict?: boolean;
+    } = {},
+  ): boolean {
     const next = stored({
       bankId: entry.bankId,
       documentId: entry.documentId,
@@ -394,6 +447,9 @@ export class RetainQueue {
         // Kept when the tombstone could not be written, so the next attempt tries again.
         this.unsaved.delete(queueKey(entry));
       }
+      return false;
+    }
+    if (options.evict === false && !this.hasRoomFor(next, index)) {
       return false;
     }
     // A failed write never leaves memory holding an item the file lacks; see the catch below.
@@ -548,6 +604,13 @@ export class RetainQueue {
     return dropped.length;
   }
 
+  /** True when `next` fits beside the queued items (replacing index, if any) without a drop. */
+  private hasRoomFor(next: Stored, index: number): boolean {
+    const others = index >= 0 ? this.stored.filter((_, i) => i !== index) : this.stored;
+    const bytes = others.reduce((sum, s) => sum + s.size, 0) + next.size;
+    return others.length + 1 <= this.limits().maxItems && bytes <= this.maxBytes();
+  }
+
   /** The bounds step of `prune()`: updates memory and warns, but neither reports nor writes. */
   private pruneStored(): Stored[] {
     const { maxItems, maxAgeMs } = this.limits();
@@ -592,7 +655,14 @@ export class RetainQueue {
   private append(line: string): void {
     // A torn last line (crash mid-append) must not swallow this item: start on a fresh line.
     const text = `${endsWithNewline(this.filePath) ? "" : "\n"}${line}\n`;
-    appendFileSync(this.filePath, text, { mode: 0o600 });
+    const fd = openSync(this.filePath, "a", 0o600);
+    try {
+      writeAll(fd, text);
+      // A queued retain must survive a power loss right after retainOrQueue said "queued".
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     this.fileBytes += Buffer.byteLength(text, "utf8");
     try {
       chmodSync(this.filePath, 0o600);
@@ -636,9 +706,7 @@ export class RetainQueue {
     const text = `${this.stored.map((s) => s.line).join("\n")}\n`;
     const fd = openSync(tmp, "w", 0o600);
     try {
-      // writeFileSync loops until every byte is out; a bare writeSync can store part of the text
-      // on a nearly full disk and report no error.
-      writeFileSync(fd, text);
+      writeAll(fd, text);
       // On disk before the rename, so a power loss cannot leave an empty or missing queue file.
       fsyncSync(fd);
     } finally {
@@ -683,11 +751,22 @@ export const RETAIN_QUEUE_RETRY_MAX_MS = 15 * 60_000;
 // Replay writes the file after this many deliveries and at the end of each pass.
 const SAVE_EVERY = 25;
 
+/** A full pass (start, timer) or one a turn started (a queued or a delivered live retain). */
+type PassKind = "full" | "turn";
+
+/**
+ * A bank that refused (auth, rate limit, bank setup): not before `until`. A turn-triggered pass
+ * skips it until then, so a wrong token or a rate limit costs no request per turn. A full pass
+ * still tries it, unless the server asked for the wait itself (`strict`, from Retry-After).
+ */
+type BankHold = { until: number; strict: boolean };
+
 /** Replays the queue in order on a backoff timer. Stops at the first transport failure. */
 export class RetainQueueRunner {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private delayMs: number;
   private running: Promise<void> | undefined;
+  private readonly holds = new Map<string, BankHold>();
   private rejectionWarned = false;
   private readonly controller = new AbortController();
 
@@ -713,12 +792,24 @@ export class RetainQueueRunner {
     return this.controller.signal.aborted;
   }
 
-  /** Runs one replay pass now (or joins the one in progress). */
+  /** Runs one full replay pass now (or joins the one in progress). */
   flush(): Promise<void> {
+    return this.startPass("full");
+  }
+
+  /**
+   * A pass a turn asked for: like `flush()`, but banks that refused recently are left for the
+   * backoff timer instead of getting one request per turn.
+   */
+  nudge(): Promise<void> {
+    return this.startPass("turn");
+  }
+
+  private startPass(kind: PassKind): Promise<void> {
     if (this.stopped()) {
       return Promise.resolve();
     }
-    this.running ??= this.replay()
+    this.running ??= this.replay(kind)
       .catch((error: unknown) => {
         this.options.logger.warn?.(
           `memory-hindsight: retain queue replay stopped (${formatErrorMessage(error)})`,
@@ -754,20 +845,56 @@ export class RetainQueueRunner {
     this.controller.abort();
   }
 
-  /** The pass that just failed waited the current delay; the next one waits twice as long. */
-  private backOff(): void {
-    this.schedule();
-    this.delayMs = Math.min(this.delayMs * 2, this.options.maxDelayMs ?? RETAIN_QUEUE_RETRY_MAX_MS);
+  private maxDelay(): number {
+    return this.options.maxDelayMs ?? RETAIN_QUEUE_RETRY_MAX_MS;
   }
 
-  private async replay(): Promise<void> {
-    let delivered = 0;
+  /**
+   * The pass that just failed waited the current delay; the next one waits twice as long. When
+   * every bank still waiting is held by a Retry-After, the timer waits for the first to end.
+   */
+  private backOff(): void {
+    this.schedule(Math.max(this.delayMs, this.strictWait()));
+    this.delayMs = Math.min(this.delayMs * 2, this.maxDelay());
+  }
+
+  /** Ms until the first held bank with items is due, if every such bank is held strictly; else 0. */
+  private strictWait(now = Date.now()): number {
+    let wait = Number.POSITIVE_INFINITY;
+    for (const [bankId, hold] of this.holds) {
+      if (!this.queue.hasBank(bankId)) {
+        continue;
+      }
+      if (!hold.strict) {
+        return 0;
+      }
+      wait = Math.min(wait, hold.until - now);
+    }
+    return Number.isFinite(wait) ? Math.max(0, wait) : 0;
+  }
+
+  private hold(bankId: string, error: unknown): void {
+    const retryAfter = (error as { retryAfterMs?: unknown } | null)?.retryAfterMs;
+    const strict = typeof retryAfter === "number" && retryAfter > 0;
+    const wait = strict ? Math.min(retryAfter, this.maxDelay()) : this.delayMs;
+    this.holds.set(bankId, { until: Date.now() + wait, strict });
+  }
+
+  private async replay(kind: PassKind): Promise<void> {
+    let result = { delivered: 0, clean: false };
     try {
-      delivered = await this.replayItems();
+      result = await this.replayItems(kind);
     } finally {
       // Removals during the pass are batched; write the final state once.
       this.queue.save();
     }
+    // Back to the base delay only once the pass and its save both succeeded, so a save that keeps
+    // failing after a pass that delivered everything still backs off.
+    if (result.clean) {
+      this.rejectionWarned = false;
+      this.delayMs = this.baseDelay();
+    }
+    const delivered = result.delivered;
     if (delivered > 0) {
       this.options.logger.info?.(
         `memory-hindsight: retain queue delivered ${delivered}, ${this.queue.size() > 0 ? `${this.queue.size()} pending` : "queue empty"}`,
@@ -775,19 +902,30 @@ export class RetainQueueRunner {
     }
   }
 
-  private async replayItems(): Promise<number> {
+  private async replayItems(kind: PassKind): Promise<{ delivered: number; clean: boolean }> {
     const { logger, send } = this.options;
     let delivered = 0;
     // Banks that refused this pass (auth, rate limit, bank setup, ambiguous 404): their items
     // wait, in order, and other banks' items still go out.
     const refused = new Set<string>();
+    // Banks this pass leaves alone because they are still held from an earlier refusal.
+    const skip = new Set<string>();
+    const now = Date.now();
+    for (const [bankId, hold] of this.holds) {
+      if (hold.until <= now) {
+        this.holds.delete(bankId);
+      } else if (kind === "turn" || hold.strict) {
+        skip.add(bankId);
+      }
+    }
+    const held = skip.size;
     this.queue.prune();
-    for (let entry = this.queue.peek(refused); entry; entry = this.queue.peek(refused)) {
+    for (let entry = this.queue.peek(skip); entry; entry = this.queue.peek(skip)) {
       try {
         await send(entry, this.controller.signal);
       } catch (error) {
         if (this.stopped()) {
-          return delivered;
+          return { delivered, clean: false };
         }
         if (!isDroppingRejection(error)) {
           this.options.onReplay?.(entry.bankId, "deferred");
@@ -797,7 +935,7 @@ export class RetainQueueRunner {
           if (isTransportFailure(error)) {
             // Hindsight is unreachable for everyone: end the pass and back off.
             this.backOff();
-            return delivered;
+            return { delivered, clean: false };
           }
           // Not an answer about this item (auth, rate limit, ambiguous 404, bank setup, refused
           // redirect, or an unexpected error): keep it, skip its bank for this pass, back off.
@@ -808,10 +946,13 @@ export class RetainQueueRunner {
             );
           }
           refused.add(entry.bankId);
+          skip.add(entry.bankId);
+          this.hold(entry.bankId, error);
           continue;
         }
         // Hindsight answered 4xx about this item: retrying cannot help, so it leaves the queue.
         this.queue.remove(entry, { persist: false });
+        this.holds.delete(entry.bankId);
         this.options.onDrop?.(entry.bankId, "rejected");
         logger.warn?.(
           `memory-hindsight: queued retain rejected and dropped: ${formatErrorMessage(error)}`,
@@ -820,9 +961,10 @@ export class RetainQueueRunner {
       }
       // A runner stopped mid-send leaves the item for the next one; a resend replaces itself.
       if (this.stopped()) {
-        return delivered;
+        return { delivered, clean: false };
       }
       this.queue.remove(entry, { persist: false });
+      this.holds.delete(entry.bankId);
       this.options.onReplay?.(entry.bankId, "delivered");
       delivered += 1;
       if (delivered % SAVE_EVERY === 0) {
@@ -831,10 +973,13 @@ export class RetainQueueRunner {
     }
     if (refused.size > 0) {
       this.backOff();
-      return delivered;
+      return { delivered, clean: false };
     }
-    this.rejectionWarned = false;
-    this.delayMs = this.baseDelay();
-    return delivered;
+    if (held > 0 && [...skip].some((bankId) => this.queue.hasBank(bankId))) {
+      // Items wait behind a hold: keep the backoff as it is and make sure the timer runs.
+      this.schedule(Math.max(this.delayMs, this.strictWait()));
+      return { delivered, clean: false };
+    }
+    return { delivered, clean: true };
   }
 }

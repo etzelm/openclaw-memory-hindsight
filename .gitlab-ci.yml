@@ -22,6 +22,7 @@ default:
 check:
   stage: check
   script:
+    - apk add --no-cache bash
     - node --version && npm --version
     - npm ci --no-audit --no-fund
     - npm run typecheck
@@ -29,7 +30,8 @@ check:
     - npm run test:coverage
     - npm run lint
     - npm run format:check
-    - node --test scripts/pack-guard.test.mjs
+    - node --test scripts/pack-guard.test.mjs scripts/api-contract.test.mjs
+    - bash scripts/host-types.sh --self-test
     # The published file list must never carry tests, helpers or local state, and must carry
     # every file a release needs.
     - npm pack --dry-run --json --ignore-scripts > pack.json
@@ -56,4 +58,13 @@ scripts:
   script:
     - apk add --no-cache bash git python3
     - chown -R node:node "$CI_PROJECT_DIR"
-    - su node -s /bin/sh -c 'bash -n scripts/*.sh && bash scripts/compat-nightly.test.sh && bash scripts/compat-matrix.sh --self-test'
+    - su node -s /bin/sh -c 'bash -n scripts/*.sh && bash scripts/compat-nightly.test.sh && bash scripts/compat-matrix.sh --self-test && bash scripts/recall-ab.test.sh'
+
+# The plugin against the latest OpenClaw release (the check job covers the floor host, the
+# devDependency). Installs openclaw@latest into a scratch dir; scripts/host-types.sh.
+host-latest:
+  stage: check
+  script:
+    - apk add --no-cache bash
+    - npm ci --no-audit --no-fund
+    - bash scripts/host-types.sh --host latest --tests

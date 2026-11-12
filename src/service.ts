@@ -120,7 +120,7 @@ export function createHindsightService(params: {
           );
         }
         if (queued) {
-          void runner.flush();
+          void runner.nudge();
           return "queued";
         }
         // Not queued (too large, already warned, or the write failed): send it live without
@@ -176,7 +176,7 @@ export function createHindsightService(params: {
       // A delivered copy replay has not saved yet must not come back over this one.
       queue?.supersede(entry);
       if (runner && queue && queue.size() > 0) {
-        void runner.flush();
+        void runner.nudge();
       }
       return "sent";
     },
@@ -245,16 +245,26 @@ export function createHindsightService(params: {
       stopped = true;
       // stop() is synchronous and the host may exit right after it: put unanswered live writes
       // in the file now. A write that still succeeds removes its copy; a replay is a replace.
+      // Without eviction: a full queue keeps its items, and the write that cannot be parked is
+      // lost only if the host really exits before it is answered.
+      let notParked = 0;
       for (const entry of inFlight) {
         try {
-          if (queue?.enqueue(entry)) {
+          if (queue?.enqueue(entry, { evict: false })) {
             parkedAtStop.add(entry);
+          } else if (queue) {
+            notParked += 1;
           }
         } catch (error) {
           params.logger.warn?.(
             `memory-hindsight: could not queue an in-flight retain at stop (${formatErrorMessage(error)})`,
           );
         }
+      }
+      if (notParked > 0) {
+        params.logger.warn?.(
+          `memory-hindsight: retain queue full at stop; ${notParked} in-flight retain(s) not queued`,
+        );
       }
       inFlight.clear();
       stopQueue();

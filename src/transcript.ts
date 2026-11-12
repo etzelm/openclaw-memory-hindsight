@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { HindsightRecallResult } from "./client.js";
 import { MEMORY_ROLES, RECALL_MAX_QUERY_CHARS } from "./config.js";
+import { type RecallQueryShaping, shapeRecallQuery } from "./query-shaping.js";
 
 /** Tag that wraps injected memories so retain never stores them again. */
 export const MEMORIES_TAG = "hindsight_memories";
@@ -173,23 +174,31 @@ export function stripRecallBoilerplate(text: string): string {
 }
 
 /** Cleaned recall text for one message, or null when too short or not user text. */
-function cleanRecallCandidate(candidate: string): string | null {
+function cleanRecallCandidate(
+  candidate: string,
+  shaping: RecallQueryShaping = "off",
+): string | null {
   let cleaned = stripRecallBoilerplate(cleanMessageText(candidate));
   cleaned = cleaned.replace(/^(?:System:.*\n)+\n?/, "");
   cleaned = cleaned.replace(/\n\[from:[^\]]*\]\s*$/, "").trim();
-  if (cleaned.length >= MIN_QUERY_CHARS && !/^\s*system:/i.test(cleaned)) {
-    return cleaned.slice(0, RECALL_MAX_QUERY_CHARS);
+  if (cleaned.length < MIN_QUERY_CHARS || /^\s*system:/i.test(cleaned)) {
+    return null;
   }
-  return null;
+  const shaped = shapeRecallQuery(cleaned, shaping, RECALL_MAX_QUERY_CHARS);
+  return shaped.length >= MIN_QUERY_CHARS ? shaped : null;
 }
 
 /** The user's current request with host envelopes removed and capped, or null when too short. */
-export function extractRecallQuery(currentUserMessage: string | undefined, prompt: string) {
+export function extractRecallQuery(
+  currentUserMessage: string | undefined,
+  prompt: string,
+  shaping: RecallQueryShaping = "off",
+) {
   for (const candidate of [currentUserMessage, prompt]) {
     if (!candidate) {
       continue;
     }
-    const cleaned = cleanRecallCandidate(candidate);
+    const cleaned = cleanRecallCandidate(candidate, shaping);
     if (cleaned) {
       return cleaned;
     }
@@ -209,7 +218,11 @@ export function isShortFollowup(query: string, maxWords: number): boolean {
  * The user message before the current one, cleaned like the query. The host may or may not list
  * the current message last, so a trailing user message equal to the query is skipped.
  */
-export function previousUserQuery(messages: unknown, query: string): string | null {
+export function previousUserQuery(
+  messages: unknown,
+  query: string,
+  shaping: RecallQueryShaping = "off",
+): string | null {
   if (!Array.isArray(messages)) {
     return null;
   }
@@ -219,7 +232,7 @@ export function previousUserQuery(messages: unknown, query: string): string | nu
     if (asMessage(message)?.role !== "user") {
       continue;
     }
-    const cleaned = cleanRecallCandidate(messageText(message));
+    const cleaned = cleanRecallCandidate(messageText(message), shaping);
     if (!cleaned) {
       continue;
     }
