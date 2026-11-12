@@ -63,7 +63,8 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
       - run: npm run build
-      - run: npm test
+      # Same as CI: the coverage floor in vitest.config.ts holds on the tagged commit too.
+      - run: npm run test:coverage
       - run: npm run lint
       - run: npm run format:check
       - run: node --test scripts/pack-guard.test.mjs

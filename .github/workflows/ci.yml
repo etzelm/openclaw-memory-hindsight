@@ -1,6 +1,6 @@
 # Public CI: the same gates as .gitlab-ci.yml (install, typecheck, build,
-# test with coverage floor, lint, format check, pack guard). Runs on pull
-# requests and on main.
+# test with coverage floor, lint, format check, pack guard, compat script
+# tests). Runs on pull requests and on main.
 
 name: CI
 
@@ -40,6 +40,14 @@ jobs:
 
       - name: Pack guard tests
         run: node --test scripts/pack-guard.test.mjs
+
+      # Shell tests for the compat nightly and matrix scripts (bash, git and python3 are on the
+      # runner image; the runner user is not root, which the unwritable WORK_ROOT case needs).
+      - name: Compat script tests
+        run: |
+          bash -n scripts/*.sh
+          bash scripts/compat-nightly.test.sh
+          bash scripts/compat-matrix.sh --self-test
 
       # The published file list must never carry tests, helpers or local state.
       - name: Pack guard

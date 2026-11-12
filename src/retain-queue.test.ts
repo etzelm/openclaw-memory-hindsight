@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HindsightClient, HindsightHttpError } from "./client.js";
 import {
+  isQueueableLiveFailure,
   isRetryableRejection,
   isTransportFailure,
   type QueuedRetain,
@@ -403,6 +404,24 @@ describe("RetainQueue", () => {
     expect(restarted.list().map((e) => e.documentId)).toEqual(["b"]);
   });
 
+  it("supersede tombstones only a delivered-but-unsaved copy, once", () => {
+    const file = retainQueuePath(stateDir);
+    const { queue } = makeQueue();
+    queue.enqueue(entry("dev", "a", "v1"));
+    queue.enqueue(entry("dev", "b"));
+    queue.remove(queue.peek()!, { persist: false });
+    // A still-queued copy and an unknown key are left alone.
+    queue.supersede({ bankId: "dev", documentId: "b" });
+    queue.supersede({ bankId: "dev", documentId: "zzz" });
+    expect(readQueueFile(file).filter((l) => "tombstone" in l)).toHaveLength(0);
+    queue.supersede({ bankId: "dev", documentId: "a" });
+    queue.supersede({ bankId: "dev", documentId: "a" });
+    expect(readQueueFile(file).filter((l) => "tombstone" in l)).toHaveLength(1);
+    expect(queue.list().map((e) => e.documentId)).toEqual(["b"]);
+    const { queue: restarted } = makeQueue();
+    expect(restarted.list().map((e) => e.documentId)).toEqual(["b"]);
+  });
+
   it("rewrites instead of appending when an append would pass the size bound", () => {
     const file = retainQueuePath(stateDir);
     const queue = new RetainQueue({
@@ -423,6 +442,51 @@ describe("RetainQueue", () => {
     queue.enqueue(entry("dev", "e", "x".repeat(200)));
     expect(statSync(file).size).toBeLessThanOrEqual(1_000);
     expect(readQueueFile(file).map((l) => l.documentId)).toEqual(["d", "e"]);
+  });
+
+  it("writes one tombstone, not one per attempt, for repeated too-large copies", () => {
+    const file = retainQueuePath(stateDir);
+    const { queue } = makeQueue(SMALL, undefined, SMALL_BOUND);
+    queue.enqueue(entry("dev", "a", "v1"));
+    queue.enqueue(entry("dev", "b"));
+    queue.remove(queue.peek()!, { persist: false });
+    for (let i = 0; i < 3; i += 1) {
+      expect(queue.enqueue(entry("dev", "a", "x".repeat(SMALL_BOUND)))).toBe(false);
+    }
+    expect(readQueueFile(file).filter((l) => "tombstone" in l)).toHaveLength(1);
+    const { queue: restarted } = makeQueue(SMALL, undefined, SMALL_BOUND);
+    expect(restarted.list().map((e) => e.documentId)).toEqual(["b"]);
+  });
+
+  it("discard removes only the copy that still holds the given item", () => {
+    const file = retainQueuePath(stateDir);
+    const { queue } = makeQueue();
+    const first = entry("dev", "a", "v1");
+    queue.enqueue(first);
+    queue.enqueue(entry("dev", "b"));
+    // A newer copy replaced it: discarding the old item leaves the newer one.
+    queue.enqueue(entry("dev", "a", "v2"));
+    queue.discard(first, first.item);
+    expect(queue.list().map((e) => e.documentId)).toEqual(["a", "b"]);
+    const current = queue.peek()!;
+    queue.discard(current, current.item);
+    expect(queue.list().map((e) => e.documentId)).toEqual(["b"]);
+    expect(readQueueFile(file).map((l) => l.documentId)).toEqual(["b"]);
+  });
+
+  it("discard keeps the copy when the rewrite fails", () => {
+    const file = retainQueuePath(stateDir);
+    const { queue } = makeQueue();
+    const a = entry("dev", "a");
+    queue.enqueue(a);
+    queue.enqueue(entry("dev", "b"));
+    mkdirSync(`${file}.tmp`);
+    try {
+      queue.discard(a, a.item);
+    } finally {
+      rmSync(`${file}.tmp`, { recursive: true, force: true });
+    }
+    expect(queue.list().map((e) => e.documentId)).toEqual(["a", "b"]);
   });
 
   it("keeps only the newest copy of a document after a crash between replay saves", () => {
@@ -605,6 +669,23 @@ function makeRunner(send: (entry: QueuedRetain) => Promise<void>) {
   return { queue, runner, logger };
 }
 
+const http = (status: number) => new HindsightHttpError(`HTTP ${status}`, status);
+
+describe("isQueueableLiveFailure", () => {
+  it("queues a live retain on outages and on 401, 403, 408 and 429, not on other 4xx or a 404", () => {
+    expect(isQueueableLiveFailure(new TypeError("fetch failed"))).toBe(true);
+    expect(isQueueableLiveFailure(http(503))).toBe(true);
+    for (const status of [401, 403, 408, 429]) {
+      expect([status, isQueueableLiveFailure(http(status))]).toEqual([status, true]);
+      expect([status, isRetryableRejection(http(status))]).toEqual([status, true]);
+    }
+    for (const status of [400, 404, 413, 422]) {
+      expect([status, isQueueableLiveFailure(http(status))]).toEqual([status, false]);
+    }
+    expect(isQueueableLiveFailure(new Error("boom"))).toBe(false);
+  });
+});
+
 describe("RetainQueueRunner", () => {
   it("replays in order and stops at the first transport failure, keeping the rest", async () => {
     const sent: string[] = [];
@@ -666,6 +747,92 @@ describe("RetainQueueRunner", () => {
     await runner.flush();
     runner.stop();
     expect(rejected()).toHaveLength(2);
+  });
+
+  it("skips a bank that refuses and still delivers other banks' items, in order", async () => {
+    const sent: string[] = [];
+    let locked = true;
+    const { queue, runner, logger } = makeRunner(async (e) => {
+      if (e.bankId === "locked" && locked) {
+        throw new HindsightHttpError("Hindsight retain failed: HTTP 401", 401);
+      }
+      sent.push(`${e.bankId}/${e.documentId}`);
+    });
+    queue.enqueue(entry("locked", "l1"));
+    queue.enqueue(entry("dev", "a"));
+    queue.enqueue(entry("locked", "l2"));
+    queue.enqueue(entry("dev", "b"));
+    const schedule = vi.spyOn(runner, "schedule");
+    await runner.flush();
+    // One try per refusing bank per pass; its items keep their order; a retry is scheduled.
+    expect(sent).toEqual(["dev/a", "dev/b"]);
+    expect(queue.list().map((e) => e.documentId)).toEqual(["l1", "l2"]);
+    expect(schedule).toHaveBeenCalled();
+    // The warning is not repeated while the bank keeps refusing, even with deliveries elsewhere.
+    queue.enqueue(entry("dev", "c"));
+    await runner.flush();
+    expect(
+      logger.warn.mock.calls.filter(([m]) => String(m).includes("queued retain not delivered")),
+    ).toHaveLength(1);
+    locked = false;
+    await runner.flush();
+    runner.stop();
+    expect(sent).toEqual(["dev/a", "dev/b", "dev/c", "locked/l1", "locked/l2"]);
+    expect(queue.size()).toBe(0);
+  });
+
+  it("still ends the pass for every bank on a transport failure", async () => {
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      if (e.bankId === "a") {
+        throw new TypeError("fetch failed");
+      }
+      sent.push(e.documentId);
+    });
+    queue.enqueue(entry("a", "1"));
+    queue.enqueue(entry("b", "2"));
+    await runner.flush();
+    runner.stop();
+    expect(sent).toEqual([]);
+    expect(queue.size()).toBe(2);
+  });
+
+  it("retries the final save of a pass that delivered every item", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const file = retainQueuePath(stateDir);
+    const { queue, runner, logger } = makeRunner(async () => {});
+    queue.enqueue(entry("dev", "a"));
+    queue.enqueue(entry("dev", "b"));
+    vi.spyOn(queue, "save").mockImplementationOnce(() => {
+      throw new Error("EACCES: permission denied, open");
+    });
+    await runner.flush();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("replay stopped (EACCES"));
+    // Memory is empty but the file still holds both delivered lines: a retry must be scheduled.
+    expect(queue.size()).toBe(0);
+    expect(existsSync(file)).toBe(true);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await runner.flush();
+    runner.stop();
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("reschedules a pass that stopped on a write error", async () => {
+    const { queue, runner, logger } = makeRunner(async () => {});
+    queue.enqueue(entry("dev", "a"));
+    queue.enqueue(entry("dev", "b"));
+    vi.spyOn(queue, "prune").mockImplementationOnce(() => {
+      throw new Error("EIO: i/o error, write");
+    });
+    const schedule = vi.spyOn(runner, "schedule");
+    await runner.flush();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("retain queue replay stopped (EIO: i/o error, write)"),
+    );
+    expect(schedule).toHaveBeenCalled();
+    runner.stop();
+    expect(queue.size()).toBe(2);
   });
 
   it("drops a queued retain on a bank-missing 404, keeps it on a route 404", async () => {

@@ -69,6 +69,42 @@ describe("hindsightConfigSchema", () => {
     ).toBeUndefined();
   });
 
+  it("rejects a token with a control, space or non-ASCII character without echoing it", () => {
+    for (const token of [
+      "SECRETPART1\nSECRETPART2",
+      "SECRETPART1\rSECRETPART2",
+      "SECRETPART1\tSECRETPART2",
+      "SECRETPART1 SECRETPART2",
+      "SECRETPART1\u0000SECRETPART2",
+      "SECRETPART1\u007fSECRETPART2",
+      "SECRETPART1\u00e9SECRETPART2",
+      "SECRETPART1\u0100SECRETPART2",
+    ]) {
+      let message = "";
+      try {
+        hindsightConfigSchema.parse({
+          hindsightApiUrl: "http://h",
+          allowInsecureHttp: true,
+          hindsightApiToken: token,
+        });
+      } catch (error) {
+        message = String((error as Error).message);
+      }
+      expect(message).toMatch(/hindsightApiToken/);
+      expect(message).not.toMatch(/SECRETPART/);
+    }
+  });
+
+  it("still accepts a printable ASCII token and trims a trailing newline", () => {
+    expect(
+      hindsightConfigSchema.parse({
+        hindsightApiUrl: "http://h",
+        allowInsecureHttp: true,
+        hindsightApiToken: "hs_A-b.c~d+e/f=g\n",
+      }).apiToken,
+    ).toBe("hs_A-b.c~d+e/f=g");
+  });
+
   it("rejects an api url with userinfo, a query string or a fragment", () => {
     expect(() =>
       hindsightConfigSchema.parse({
@@ -255,6 +291,46 @@ describe("agentBankMap", () => {
     expect(() => hindsightConfigSchema.parse({ ...base, agentBankMap: { dev: "" } })).toThrow(
       /agentBankMap/,
     );
+  });
+});
+
+describe("agentBankMap hardening", () => {
+  const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
+  it('rejects "." and ".." as a bank id', () => {
+    for (const bank of [".", "..", " .. "]) {
+      expect(() => hindsightConfigSchema.parse({ ...base, agentBankMap: { dev: bank } })).toThrow(
+        /must not be "\." or "\.\."/,
+      );
+    }
+    expect(
+      hindsightConfigSchema.parse({ ...base, agentBankMap: { dev: "..x" } }).agentBankMap,
+    ).toEqual({ dev: "..x" });
+  });
+
+  it("normalizes keys like agent ids", () => {
+    const map = hindsightConfigSchema.parse({
+      ...base,
+      agentBankMap: { "WB Dev": "wb" },
+    }).agentBankMap;
+    expect(map).toEqual({ "wb-dev": "wb" });
+    expect(() =>
+      hindsightConfigSchema.parse({ ...base, agentBankMap: { "WB Dev": "a", "wb-dev": "b" } }),
+    ).toThrow(/more than one key/);
+    expect(() => hindsightConfigSchema.parse({ ...base, agentBankMap: { "!!!": "a" } })).toThrow(
+      /not a valid agent id/,
+    );
+    expect(
+      hindsightConfigSchema.parse({ ...base, agentBankMap: { Main: "a" } }).agentBankMap,
+    ).toEqual({ main: "a" });
+  });
+
+  it("keeps prototype names as plain own keys", () => {
+    const map = hindsightConfigSchema.parse({
+      ...base,
+      agentBankMap: JSON.parse('{"__proto__":"proto-bank","constructor":"ctor-bank"}') as unknown,
+    }).agentBankMap;
+    expect(Object.keys(map).toSorted()).toEqual(["__proto__", "constructor"]);
+    expect(map.constructor).toBe("ctor-bank");
   });
 });
 

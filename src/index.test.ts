@@ -881,6 +881,25 @@ function turn(runId: string, memoryAudience: unknown = OWNER, agentId = "dev") {
   ] as const;
 }
 
+/** Starts one live retain on a fetch that never answers on its own, then stops the service. */
+async function stopDuringLiveWrite(stateDir: string) {
+  let answer: ((response: Response) => void) | undefined;
+  let fail: ((error: unknown) => void) | undefined;
+  const fetch = vi.fn<AnyFn>(
+    () =>
+      new Promise<Response>((resolve, reject) => {
+        answer = resolve;
+        fail = reject;
+      }),
+  );
+  const { service } = createTestService(fetch);
+  service.startRetainQueue(stateDir);
+  const pending = service.retainOrQueue("dev", doc("A"), AbortSignal.timeout(60_000));
+  await vi.waitFor(() => expect(answer).toBeDefined());
+  service.stop();
+  return { pending, answer: answer!, fail: fail! };
+}
+
 describe("offline retain queue", () => {
   const dirs: string[] = [];
   afterEach(async () => {
@@ -1009,7 +1028,8 @@ describe("offline retain queue", () => {
       "queued",
     );
     second.stop();
-    expect(queuedItems(stateDir).map((i) => i.documentId)).toEqual(["B", "A", "C"]);
+    // A was still in flight at the first stop, so that stop queued it ahead of B.
+    expect(queuedItems(stateDir).map((i) => i.documentId)).toEqual(["A", "B", "C"]);
   });
 
   it("replays one copy per document, as a replace of that document id, after a crash", async () => {
@@ -1037,6 +1057,57 @@ describe("offline retain queue", () => {
       ["A", "new A", "replace"],
     ]);
     expect(existsSync(queueFile(stateDir))).toBe(false);
+    service.stop();
+  });
+
+  it("never replays a delivered-but-unsaved copy over a newer one sent live", async () => {
+    const stateDir = newStateDir();
+    let releaseOther: ((response: Response) => void) | undefined;
+    let down = true;
+    const fetch = vi.fn<AnyFn>(async (url: string) => {
+      if (down) {
+        throw new TypeError("fetch failed");
+      }
+      if (url.includes("/banks/other/")) {
+        // Replay is still sending this bank's item, so its batched save has not run yet.
+        return new Promise<Response>((resolve) => {
+          releaseOther = resolve;
+        });
+      }
+      return new Response("{}", { status: 200 });
+    });
+    const { service } = createTestService(fetch);
+    service.startRetainQueue(stateDir);
+    await service.retainOrQueue(
+      "dev",
+      { content: "v1", document_id: "A" },
+      AbortSignal.timeout(60_000),
+    );
+    await service.retainOrQueue("other", doc("X"), AbortSignal.timeout(60_000));
+    await service.retainQueue()!.flush();
+    down = false;
+    // Replay delivers dev/A (not saved yet), then waits on other/X.
+    void service.retainQueue()!.flush();
+    await vi.waitFor(() => expect(releaseOther).toBeDefined());
+    // dev has nothing queued in memory now, so v2 goes out live.
+    await expect(
+      service.retainOrQueue(
+        "dev",
+        { content: "v2", document_id: "A" },
+        AbortSignal.timeout(60_000),
+      ),
+    ).resolves.toBe("sent");
+    // Crash here: a restart reads only the file and must not replay v1 over v2.
+    const { RetainQueue } = await import("./retain-queue.js");
+    const restarted = new RetainQueue({
+      filePath: queueFile(stateDir),
+      limits: () => ({ maxItems: 100, maxAgeMs: 60_000 }),
+      logger: {},
+    });
+    restarted.load();
+    expect(restarted.list()).toEqual([{ bankId: "other", documentId: "X" }]);
+    releaseOther?.(new Response("{}", { status: 200 }));
+    await service.retainQueue()!.flush();
     service.stop();
   });
 
@@ -1156,6 +1227,50 @@ describe("offline retain queue", () => {
     await agentEnd(...turn("run-1"));
     expect(existsSync(queueFile(stateDir))).toBe(true);
     service.stop();
+  });
+
+  it("queues a live retain that gets 429, 401, 403 or 408, not one that gets a route 404", async () => {
+    for (const status of [429, 401, 403, 408]) {
+      const stateDir = newStateDir();
+      const { state } = switchableHindsight();
+      state.down = false;
+      state.status = status;
+      const { api, service, agentEnd } = boot(stateDir);
+      await agentEnd(...turn(`run-${status}`));
+      expect([status, existsSync(queueFile(stateDir))]).toEqual([status, true]);
+      expect(api.logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining(`Hindsight refused the retain for now, queued (1 pending)`),
+      );
+      service.stop();
+      await forgetQueuesInMemory();
+    }
+    const stateDir = newStateDir();
+    const { state } = switchableHindsight();
+    state.down = false;
+    state.status = 404;
+    const { service, agentEnd } = boot(stateDir);
+    await agentEnd(...turn("run-404"));
+    expect(existsSync(queueFile(stateDir))).toBe(false);
+    service.stop();
+  });
+
+  it("queues a live retain still in flight at stop, so a Gateway exit keeps it", async () => {
+    const stateDir = newStateDir();
+    const { pending, fail } = await stopDuringLiveWrite(stateDir);
+    // In the file right at stop, before the write is answered.
+    expect(queuedItems(stateDir).map((i) => i.documentId)).toEqual(["A"]);
+    fail(new TypeError("fetch failed"));
+    await expect(pending).resolves.toBe("queued");
+    expect(queuedItems(stateDir).map((i) => i.documentId)).toEqual(["A"]);
+  });
+
+  it("removes the copy queued at stop when the in-flight write then succeeds", async () => {
+    const stateDir = newStateDir();
+    const { pending, answer } = await stopDuringLiveWrite(stateDir);
+    expect(queuedItems(stateDir).map((i) => i.documentId)).toEqual(["A"]);
+    answer(new Response("{}", { status: 200 }));
+    await expect(pending).resolves.toBe("sent");
+    expect(existsSync(queueFile(stateDir))).toBe(false);
   });
 
   it("keeps the old drop-and-warn behavior with retainQueueEnabled false", async () => {

@@ -93,6 +93,24 @@ describe("agentBankMap", () => {
   });
 });
 
+describe("agentBankMap own keys only", () => {
+  it("never resolves an agent id to an Object.prototype member", () => {
+    const plain = { "wb-dev": "wb" };
+    // Agent ids are lowercased first, so only all-lowercase members can collide.
+    for (const id of ["constructor", "__proto__"]) {
+      expect(ownerBankId(id, plain)).toBe(id);
+    }
+    const parsed = hindsightConfigSchema.parse({
+      hindsightApiUrl: "http://h",
+      allowInsecureHttp: true,
+      agentBankMap: { "WB Dev": "wb", constructor: "ctor-bank" },
+    }).agentBankMap;
+    expect(ownerBankId("wb-dev", parsed)).toBe("wb");
+    expect(ownerBankId("constructor", parsed)).toBe("ctor-bank");
+    expect(ownerBankId("__proto__", parsed)).toBe("__proto__");
+  });
+});
+
 describe("bank ids", () => {
   it("keeps ids made of a-z0-9_- byte-identical to the previous encoded output", () => {
     for (const id of ["main", "dev", "openclaw", "wb", "researcher", "a-b_c9"]) {

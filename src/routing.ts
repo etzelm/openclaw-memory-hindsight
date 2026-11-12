@@ -19,7 +19,8 @@ export type AgentBankMap = Readonly<Record<string, string>>;
  */
 export function ownerBankId(agentId: string, bankMap?: AgentBankMap): string {
   const normalized = normalizeAgentId(agentId);
-  return bankMap?.[normalized] ?? normalized;
+  // Own keys only: a plain-object map must not resolve `constructor` to Object's constructor.
+  return bankMap && Object.hasOwn(bankMap, normalized) ? bankMap[normalized]! : normalized;
 }
 
 /**

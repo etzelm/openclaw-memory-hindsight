@@ -5,7 +5,9 @@ import type { HindsightMetrics } from "./metrics.js";
 import {
   BankSetupError,
   isDroppingRejection,
+  isQueueableLiveFailure,
   isTransportFailure,
+  type QueuedRetain,
   type RetainQueue,
   RetainQueueRunner,
   retainQueuePath,
@@ -26,7 +28,9 @@ export type HindsightService = {
   ensureBank(bankId: string, signal?: AbortSignal): Promise<void>;
   /**
    * Writes an auto-retain. When the offline queue runs and Hindsight is unreachable (network
-   * error, timeout, 5xx), the item is queued for this bank and replayed later; a 4xx still throws.
+   * error, timeout, 5xx) or refuses for a reason that is not about the item (401, 403, 408, 429),
+   * the item is queued for this bank and replayed later; any other 4xx still throws. A write still
+   * in flight when the service stops is queued at the stop.
    */
   retainOrQueue(
     bankId: string,
@@ -62,6 +66,10 @@ export function createHindsightService(params: {
   let runner: RetainQueueRunner | undefined;
   // Kept after stop, so a live retain that fails after a stop or restart still lands in the file.
   let queue: RetainQueue | undefined;
+  // Live auto-retains not answered yet; stop() queues them so a Gateway exit cannot lose them.
+  const inFlight = new Set<Omit<QueuedRetain, "queuedAt">>();
+  // Those stop() queued; a write that then succeeds removes its own queued copy again.
+  const parkedAtStop = new WeakSet<Omit<QueuedRetain, "queuedAt">>();
   const client = new HindsightClient({
     resolveEndpoint: () => {
       const { apiUrl, apiToken } = params.config();
@@ -119,12 +127,21 @@ export function createHindsightService(params: {
         // waiting for the bank's queue, and do not try to queue it again.
         refused = true;
       }
+      if (!refused) {
+        inFlight.add(entry);
+      }
       try {
         await write(bankId, item, signal);
+        // Answered: stop() no longer needs to queue it, and a copy stop() queued is out of date.
+        inFlight.delete(entry);
+        if (parkedAtStop.has(entry)) {
+          queue?.discard(entry, entry.item);
+        }
       } catch (error) {
+        inFlight.delete(entry);
         // Read again after the await: the service may have stopped or restarted meanwhile.
         const target = queue;
-        if (!target || refused || !isTransportFailure(error)) {
+        if (!target || refused || !isQueueableLiveFailure(error)) {
           // Queue-first path: the queue refused the item and the live write failed, so it is lost.
           if (target && refused && isTransportFailure(error) && target.isTooLarge(entry)) {
             metrics?.recordDrop(bankId, "too_large");
@@ -149,11 +166,15 @@ export function createHindsightService(params: {
           throw error;
         }
         params.logger.warn?.(
-          `memory-hindsight: Hindsight unreachable, retain queued (${target.size()} pending): ${formatErrorMessage(error)}`,
+          isTransportFailure(error)
+            ? `memory-hindsight: Hindsight unreachable, retain queued (${target.size()} pending): ${formatErrorMessage(error)}`
+            : `memory-hindsight: Hindsight refused the retain for now, queued (${target.size()} pending): ${formatErrorMessage(error)}`,
         );
         runner?.schedule();
         return "queued";
       }
+      // A delivered copy replay has not saved yet must not come back over this one.
+      queue?.supersede(entry);
       if (runner && queue && queue.size() > 0) {
         void runner.flush();
       }
@@ -222,6 +243,20 @@ export function createHindsightService(params: {
     stopped: () => stopped,
     stop() {
       stopped = true;
+      // stop() is synchronous and the host may exit right after it: put unanswered live writes
+      // in the file now. A write that still succeeds removes its copy; a replay is a replace.
+      for (const entry of inFlight) {
+        try {
+          if (queue?.enqueue(entry)) {
+            parkedAtStop.add(entry);
+          }
+        } catch (error) {
+          params.logger.warn?.(
+            `memory-hindsight: could not queue an in-flight retain at stop (${formatErrorMessage(error)})`,
+          );
+        }
+      }
+      inFlight.clear();
       stopQueue();
       preparedBanks.clear();
     },

@@ -178,7 +178,11 @@ per-user LaunchAgent: launchd starts it every 60 s and a gate exits at once unle
 matches and the stamp file does not hold today's date (a LaunchAgent in a `user/<uid>`
 Background domain does not fire `StartCalendarInterval`). It is not installed by anything in this repo. The job runs whatever
 `HS_COMPAT_REF` points to with the operator's Hindsight token, Anthropic key and `claude` login,
-so pin it to a protected branch or tag that only maintainers can push. To install it for the
+so pin it to a protected branch or tag that only maintainers can push. With
+`HS_COMPAT_REF=latest-release` that means whoever can push a `vX.Y.Z` tag to `HS_COMPAT_REPO`:
+keep the tag ruleset from RELEASING.md (one-time setup, step 4) on, or point `HS_COMPAT_REPO` at
+a mirror only you can write. A tag listing that fails exits 2 with "could not list tags"; a repo
+with no release tag exits 2 with "no vX.Y.Z tag found". To install it for the
 account that owns the Hindsight token and the `claude` login:
 
 ```sh
@@ -237,12 +241,13 @@ command run first) or `GIT_SSH_COMMAND` to `EnvironmentVariables` if the repo ne
 `RESULTS_PUT` if the results go somewhere `cp -R` cannot reach. The log is
 `~/Library/Logs/hs-compat-nightly.log`.
 
-`HS_COMPAT_STATUS_FILE` (optional) names a Prometheus textfile, rewritten after every start that
-gets past the lock (a start that finds another run holding the lock leaves it alone):
+`HS_COMPAT_STATUS_FILE` (optional) names a Prometheus textfile, rewritten by every start except
+one that finds another run holding the lock (that start leaves it alone). A start that cannot
+write `WORK_ROOT` writes it with exit code 4 before it reaches the lock:
 
 | metric                                             | meaning                                                   |
 | -------------------------------------------------- | --------------------------------------------------------- |
-| `hs_compat_nightly_last_attempt_timestamp_seconds` | last start past the lock                                  |
+| `hs_compat_nightly_last_attempt_timestamp_seconds` | last start that found no other run holding the lock       |
 | `hs_compat_nightly_last_run_timestamp_seconds`     | last matrix that ran to the end (exit 0, 1 or 3)          |
 | `hs_compat_nightly_last_success_timestamp_seconds` | last matrix with every cell as expected (exit 0)          |
 | `hs_compat_nightly_last_exit_code`                 | exit code of the last start (4: `WORK_ROOT` not writable) |

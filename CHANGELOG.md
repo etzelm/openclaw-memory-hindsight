@@ -1,16 +1,81 @@
 # Changelog
 
+## 0.7.1 (2026-11-11)
+
+### Upgrade notes
+
+- No config key is added or removed.
+- Config validation is stricter. A config that loaded on 0.7.0 fails to load when:
+  `hindsightApiToken` holds a control character (usually a secret file with a second line), a
+  space or a non-ASCII character; an `agentBankMap` bank id is `.` or `..`; two `agentBankMap`
+  keys name the same agent after normalization; or a key has no usable characters. Most of these
+  were already broken: every request failed, or went to the wrong path or an arbitrary bank. A
+  token with an inner space or a Latin-1 character (U+00A0 to U+00FF) was sent as is and could
+  work on 0.7.0; it is refused now too.
+- `agentBankMap` keys are normalized like agent ids. A key such as `WB Dev` was ignored before
+  (the agent kept its own bank); it now applies to agent `wb-dev`, so that agent reads and writes
+  the mapped bank from now on.
+- A live auto-retain that gets HTTP 401, 403, 408 or 429 is now queued and replayed instead of
+  dropped. A rotated token or a rate limit no longer loses turns. Replay keeps 408 too (it
+  dropped it before).
+- Replay no longer stops for every bank at one bank that refuses (auth, rate limit, bank setup,
+  ambiguous 404): that bank is skipped for the pass and the others go out. A network error,
+  timeout or 5xx still ends the pass.
+- `hindsight_recall` output prints each memory on one line, and `hindsight_reflect` output starts
+  with an untrusted-data line. Both neutralize memory wrapper tags.
+
+### Security
+
+- A token with a line break or another control character was passed to fetch, whose error
+  quotes the header value; the plugin logged that error and returned it from `hindsight_*`
+  tools. The token is now validated when the config loads, and the error never contains it.
+
+### Fixed
+
+- Retain queue: when replay had delivered a bank's only queued copy of a document but not saved
+  yet, a newer copy went out live with no tombstone, and a crash or a failed save replayed the
+  old copy over it. A live write that succeeds now tombstones that copy.
+- Retain queue: rewrites fsync the file before the rename (and the directory after it), so a
+  power loss cannot leave an empty or missing queue file. A rewrite writes every byte before the
+  rename, so a short write on a nearly full disk cannot replace the file with a truncated copy.
+  Appends of a new item are not fsynced yet.
+- Retain queue: an auto-retain whose live write is still in flight when the plugin stops is
+  queued at the stop, so a Gateway exit does not lose it. A write that then succeeds removes it.
+- Retain queue: a replay pass that a write error ended is retried after the backoff, with the
+  wait growing while the error lasts, instead of waiting for the next retain or a restart. That
+  includes a pass that delivered every item and then could not save.
+- Retain queue: repeated too-large or unwritable retains of the same document write one
+  tombstone instead of one each. A tombstone that could not be written is tried again on the next
+  attempt.
+- `agentBankMap`: agent ids `constructor` and `__proto__` no longer resolve to `Object.prototype`
+  members (the bank id was a function or an object).
+- `hindsight_recall` has its own 10 s timeout, as documented; it waited only for the host signal.
+  Recall, reflect and memory-lookup bodies are read with a 4 MiB bound.
+- README: the source install no longer names a 0.3.0 tarball; the claude-cli text in the runtime
+  note, under the fixed values and in Limitations now agrees with `docs/compat-matrix.md`; the
+  provider-runtime limitation lists every session filter it skips; a note on the recall cache
+  and Hindsight's background processing.
+- Compatibility matrix (not in the package): B1 counts as the expected claude-cli failure only
+  when the chat.send session itself shows no audience, not another session in the same window.
+- Compatibility nightly (not in the package): a failed tag listing with `latest-release` logs
+  "could not list tags" instead of "no vX.Y.Z tag found". The docs name the tag-push trust
+  boundary of `latest-release` and say when the status file is written.
+- CI (not in the package): GitLab uses the shared pack guard and runs its tests, both CIs run the
+  compat script tests, and the release workflow enforces the coverage floor.
+
 ## 0.7.0 (2026-11-11)
 
 ### Upgrade notes
 
 - No config change is needed, and no key is added or removed.
 - A 404 whose body cannot be read (request aborted, connection lost) is now an error, not "no
-  bank yet". Auto-recall logs it at warn and injects nothing, as before. The retain queue is
-  unchanged: it drops a queued retain only on an explicit `Bank '<id>' not found` body, so such a
-  retain stayed queued before and still does.
+  bank yet". Auto-recall logs it at warn and injects nothing, as before. Replay is unchanged: it
+  drops a queued retain only on an explicit `Bank '<id>' not found` body, so such a retain stayed
+  queued before and still does. A live auto-retain whose 404 body read timed out or was aborted
+  is now queued for replay; before, it was dropped as a 404.
 - With `recallCacheTtlMs` set, a `hindsight_retain` call now drops that session's cached recall,
-  so the next turn of the session recalls fresh. Other sessions keep their cache.
+  so the next turn of the session recalls fresh. Other sessions keep their cache. The new memory
+  appears once Hindsight has processed it; a recall before that misses it and is cached as usual.
 
 ### Fixed
 
@@ -51,9 +116,10 @@
 
 - Needs an OpenClaw build with openclaw/openclaw#197274 (merged 2026-11-11) for `hindsight_*`
   tools on claude-cli sessions. That host change passes the turn's memory audience when it lists
-  claude-cli MCP tools, so the tools list through the normal audience route. On an older
-  2026.11.x host, claude-cli sessions keep auto-recall but lose the `hindsight_*` tools; stay on
-  0.5.0 there.
+  claude-cli MCP tools, so the tools list through the normal audience route. On a host without
+  it, claude-cli sessions lose the `hindsight_*` tools; stay on 0.5.0 there. (Corrected in 0.7.1:
+  only a main build from 2026-11-09 to 2026-11-11 keeps auto-recall on those sessions; released
+  builds through 2026.11.5-beta.2 give CLI turns no memory at all, see README.)
 - `listToolsWithoutAudience` is deprecated and ignored. The key still validates, so an existing
   config keeps loading; remove it. A later major release rejects it.
 

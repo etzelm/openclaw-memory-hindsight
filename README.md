@@ -28,9 +28,9 @@ contracts instead of only hooking prompts:
 It only imports `openclaw/plugin-sdk/*`. The single runtime dependency is `typebox`.
 
 > **Runtime support:** memory works on turns that run on OpenClaw's embedded agent runtime. On
-> CLI-backed runtimes such as `claude-cli`, OpenClaw (through at least 2026.11.1) does not give
-> plugin hooks a memory audience, so this plugin recalls, retains and exposes tools for none of
-> those turns. See [Limitations](#limitations).
+> CLI-backed runtimes such as `claude-cli`, released OpenClaw (through at least 2026.11.5-beta.2)
+> does not give plugin hooks a memory audience, so this plugin recalls, retains and exposes tools
+> for none of those turns. Upstream main has the host fixes. See [Limitations](#limitations).
 
 ## Install
 
@@ -59,7 +59,7 @@ tarball and install that:
 git clone https://github.com/etzelm/openclaw-memory-hindsight.git
 cd openclaw-memory-hindsight
 npm ci && npm pack
-openclaw plugins install npm-pack:./etzelm-openclaw-memory-hindsight-0.3.0.tgz --force --accept-capabilities
+openclaw plugins install npm-pack:./etzelm-openclaw-memory-hindsight-*.tgz --force --accept-capabilities
 ```
 
 `--force` confirms the "outside ClawHub review" warning for a local archive. Every install asks for
@@ -121,7 +121,7 @@ tool conflict.
 | `skipOperationalSessions`   | `true`               | Skip cron, heartbeat and subagent sessions                                                            |
 | `ignoreSessionPatterns`     | `[]`                 | Session-key globs with no recall, retain or `hindsight_*` tools (see below)                           |
 | `recallOnlySessionPatterns` | `[]`                 | Session-key globs that recall and read but never retain (see below)                                   |
-| `agentBankMap`              | `{}`                 | Agent id to bank id, so several agents share one owner bank                                           |
+| `agentBankMap`              | `{}`                 | Agent id (normalized like agent ids) to bank id (not `.` or `..`); agents can share a bank            |
 | `allowInsecureHttp`         | `false`              | Allow plain http to a non-loopback `hindsightApiUrl` (token and conversation text unencrypted)        |
 | `retainQueueEnabled`        | `true`               | Queue auto-retains that fail because Hindsight is unreachable and send them later (see below)         |
 | `retainQueueMaxItems`       | `500`                | Most queued retains kept (1 to 10000); the oldest are dropped first                                   |
@@ -143,15 +143,23 @@ Fixed values (not configurable): recall max tokens 1024, query cap 800 character
 timeout 10 s, retain and reflect timeout 30 s, memory get and knowledge-base tool timeout 10 s
 (each combined with the host's abort signal when there is one), retained roles user and
 assistant, JSON transcript format, recall injected before the user message (outside the system
-prompt, so the cached prefix stays stable). Knowledge-base tool caps: a response body over
-1 MiB fails; a page shows its first 32000 characters, then `(truncated, N more characters)`;
+prompt, so the cached prefix stays stable). A recall, reflect or memory-get response body over
+4 MiB fails. Knowledge-base tool caps: a response body over 1 MiB fails; a page shows its first 32000 characters, then `(truncated, N more characters)`;
 the tree shows 500 entries, then `(truncated, N more entries)`; search shows at most 50 hits
 with snippets cut at 500 characters and names and ids at 200.
 
-`hindsight_*` tools on claude-cli sessions need an OpenClaw build that passes the turn's memory
-audience when it lists MCP tools (openclaw/openclaw#197274). On older 2026.11.x builds those
-sessions get auto-recall but no `hindsight_*` tools. `listToolsWithoutAudience` (0.5.0) is
-deprecated and ignored since 0.6.0; remove it from your config.
+On claude-cli sessions, auto-recall and auto-retain need a host that gives CLI hooks a memory
+audience (openclaw/openclaw#194453, fixed on upstream main since 2026-11-09), and the
+`hindsight_*` tools also need one that passes that audience when it lists MCP tools
+(openclaw/openclaw#197274, merged 2026-11-11). A main build from between those dates gets
+auto-recall and auto-retain but no `hindsight_*` tools; released builds get neither (see
+[Limitations](#limitations)). `listToolsWithoutAudience` (0.5.0) is deprecated and ignored since
+0.6.0; remove it from your config.
+
+With `recallCacheTtlMs` set, a `hindsight_retain` call drops the calling session's cached
+recall, so its next turn recalls fresh. Hindsight extracts memories in the background, so that
+recall can miss a memory Hindsight has not processed yet, and its result is cached like any
+other. The new memory shows up once Hindsight has processed it and that cache entry has expired.
 
 Config changes apply without a restart: the plugin re-reads its entry from the host's current
 config snapshot (`api.runtime.config.current()`), falling back to the register-time
@@ -160,8 +168,9 @@ it on takes a gateway restart (turning it off applies at once).
 
 ### Offline retain queue
 
-When an auto-retain cannot reach Hindsight (network error, timeout or HTTP 5xx), the plugin
-writes it to `<state dir>/hindsight-native/retain-queue.jsonl` and logs one warning per failed
+When an auto-retain cannot reach Hindsight (network error, timeout or HTTP 5xx), or Hindsight
+refuses it for a reason that is not about the item (401, 403, 408 or 429: a token being rotated,
+a rate limit), the plugin writes it to `<state dir>/hindsight-native/retain-queue.jsonl` and logs one warning per failed
 retain. The state dir is the one the host passes to plugin services (`~/.openclaw` by default,
 or `OPENCLAW_STATE_DIR`). The file is mode 600 in a mode 700 directory, one JSON line per item.
 It holds the bank id, document id and the retain payload (transcript, context, tags, metadata),
@@ -178,19 +187,23 @@ session transcripts.
 - **Replay.** At service start, on a timer after a failure, and after the next successful retain.
   The first retry comes 30 s after a failed pass, and the wait doubles after each further failed
   pass (a turn for a bank with queued items also starts a pass), up to 15 min. Items go out oldest
-  first and a pass stops at the first item it cannot deliver, so each bank sees its writes in order.
+  first, so each bank sees its writes in order. A network error, timeout or 5xx ends the pass for
+  every bank; a bank that refuses (see below) is skipped for the rest of the pass while other banks'
+  items still go out.
   While a bank has queued items, a new retain for that bank queues behind them. Two retains for one
   bank that are in flight at the same moment can still land out of order if the earlier one fails
   and is queued.
-- **Not queued.** A 4xx answer (bad request, unknown bank, auth) and a refused redirect are logged
-  and dropped as before. On replay, only a Hindsight HTTP 4xx about the item drops it, with a
-  warning: any 4xx except 401, 403, 429 and an ambiguous 404 (a wrong `hindsightApiUrl` path, an
+- **Not queued.** Any other 4xx answer (bad request, unknown bank, a 404 from a wrong
+  `hindsightApiUrl` path) and a refused redirect are logged and dropped as before. On replay, only a Hindsight HTTP 4xx about the item drops it, with a
+  warning: any 4xx except 401, 403, 408, 429 and an ambiguous 404 (a wrong `hindsightApiUrl` path, an
   HTML or empty body). Hindsight creates a bank on its first retain, so its explicit `Bank '<id>'
-  not found` 404 is about the item and drops it. Everything else keeps the item, ends the pass and
-  backs off: network errors, timeouts, 5xx, 401, 403, 429, an ambiguous 404, a 4xx from bank setup
-  (applying `retainMission`), a refused redirect and any unexpected error. Kept items hold back
-  items for other banks until the next attempt; anything other than a network error, timeout or 5xx
-  logs one warning until something is delivered again.
+  not found` 404 is about the item and drops it. Everything else keeps the item and backs off:
+  network errors, timeouts, 5xx, 401, 403, 408, 429, an ambiguous 404, a 4xx from bank setup
+  (applying `retainMission`), a refused redirect and any unexpected error. Anything other than a
+  network error, timeout or 5xx logs one warning until a pass ends with no bank refusing.
+- **Shutdown.** An auto-retain whose live write is still in flight when the plugin stops is
+  written to the queue at the stop, so a Gateway exit does not lose that turn. If the write then
+  succeeds, its queued copy is removed again; a copy left behind replays as a harmless replace.
 - **Tags.** An item keeps the tags resolved when the run ended (`retainTags` plus inline
   `<retain_tags>`); a later `retainTags` change does not touch queued items.
 - **Limits.** Items beyond `retainQueueMaxItems` or a fixed 32 MiB total (UTF-8 bytes on disk,
@@ -198,8 +211,9 @@ session transcripts.
   is empty again. A single retain larger than 32 MiB is not queued: it is sent live without waiting
   for its bank's queue, and its failure is logged as before.
 - **Disk writes.** A new item is appended, on a new line even after a torn last line. Replacing,
-  pruning and replay rewrite the file (atomic rename); replay writes once per 25 delivered items and
-  at the end of each pass, and a failed write is retried by the next one. If a rewrite fails, the
+  pruning and replay rewrite the file (fsync, then atomic rename); replay writes once per 25 delivered items and
+  at the end of each pass, and a failed write is retried by the next one (a pass that a failed
+  write ended is retried after the backoff). If a rewrite fails, the
   new or newer copy is appended instead, with a tombstone for any item the limits drop; the older
   copy stays in the file until the next successful rewrite, and load keeps only the newest line per
   bank and document id. An append that would take
@@ -381,15 +395,16 @@ deprecated on npm once the fix ships, as 0.1.1 is.
 
 ## Limitations
 
-- **No memory on CLI-backed runtimes.** OpenClaw's CLI runner (for example `claude-cli`)
-  builds its plugin hook context without a memory audience (checked on 2026.11.1 and on main
-  as of 2026-11-07). On those turns auto-recall, auto-retain and the `hindsight_*` tools are
-  skipped with "this session has no memory audience". Use an embedded model route for agents
-  that need memory, or keep `@vectorize-io/hindsight-openclaw` for them until the host passes
-  the audience on CLI turns. The host bug is
-  [openclaw/openclaw#194453](https://github.com/openclaw/openclaw/issues/194453); the fix,
-  [openclaw/openclaw#194454](https://github.com/openclaw/openclaw/pull/194454), is in review and
-  not merged as of 2026-11-07.
+- **No memory on CLI-backed runtimes in released OpenClaw.** Released OpenClaw (checked through
+  2026.11.5-beta.2) builds the CLI runner's plugin hook context (for example `claude-cli`)
+  without a memory audience
+  ([openclaw/openclaw#194453](https://github.com/openclaw/openclaw/issues/194453)). On those
+  turns auto-recall, auto-retain and the `hindsight_*` tools are skipped with "this session has
+  no memory audience". Upstream main has the hook fix since 2026-11-09 and lists the tools with
+  the audience since openclaw/openclaw#197274 (2026-11-11); the first release that ships both
+  brings memory to CLI turns. Until then, use an embedded model route for agents that need
+  memory, or keep `@vectorize-io/hindsight-openclaw` for them. The expected matrix cells are in
+  [docs/compat-matrix.md](docs/compat-matrix.md).
 - **Sessions without a memory audience get no memory.** Recall, retain and the tools need a
   host-minted audience. The host mints one only for sessions whose root has a durable chat
   type: owner direct chats get the owner-private bank, groups and other senders get a
@@ -409,8 +424,9 @@ deprecated on npm once the fix ships, as 0.1.1 is.
   check there would race and drop retains. The bank still comes from the host-minted audience of
   the run that produced the messages. Recall and the tools keep their checks.
 - **`memory.search` through the provider runtime skips the plugin filters.** It is gated by the
-  caller's audience (owner-private or conversation), not by `memoryMode`, `excludeProviders` or
-  incognito session keys. Those filters apply to auto-recall, auto-retain and the tools only.
+  caller's audience (owner-private or conversation), not by `memoryMode`, `excludeProviders`,
+  `ignoreSessionPatterns`, `recallOnlySessionPatterns`, `skipOperationalSessions` or incognito
+  session keys. Those filters apply to auto-recall, auto-retain and the tools only.
 - `hindsightApiUrl` must not contain credentials, a query string or a fragment, even an empty
   one such as a trailing `?` or `#` (the parser rejects it). An unresolved SecretRef token, or a
   token sent over plain `http` to a non-loopback host, logs one warning at service start.

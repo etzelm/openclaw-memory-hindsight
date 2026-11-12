@@ -90,6 +90,8 @@ export function isExplicitPageMissingBody(text: string): boolean {
 
 /** Largest knowledge-base response body read; a bigger one fails instead of filling memory. */
 export const KB_MAX_RESPONSE_BYTES = 1024 * 1024;
+/** Largest recall, reflect or memory-lookup body read; far above what max_tokens 1024 returns. */
+export const MEMORY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 // Error bodies are only classified, never copied, so a small prefix is enough.
 const ERROR_BODY_MAX_BYTES = 64 * 1024;
 
@@ -274,7 +276,7 @@ export class HindsightClient {
     const response = await this.request<{ results?: HindsightRecallResult[] }>(
       "recall",
       this.bankUrl(bankId, "/memories/recall"),
-      { method: "POST", body, signal: options.signal },
+      { method: "POST", body, signal: options.signal, maxBodyBytes: MEMORY_MAX_RESPONSE_BYTES },
     );
     return Array.isArray(response.results) ? response.results : [];
   }
@@ -287,7 +289,12 @@ export class HindsightClient {
     const response = await this.request<{ text?: string }>(
       "reflect",
       this.bankUrl(bankId, "/reflect"),
-      { method: "POST", body: { query, budget: options.budget }, signal: options.signal },
+      {
+        method: "POST",
+        body: { query, budget: options.budget },
+        signal: options.signal,
+        maxBodyBytes: MEMORY_MAX_RESPONSE_BYTES,
+      },
     );
     return typeof response.text === "string" ? response.text : "";
   }
@@ -302,7 +309,7 @@ export class HindsightClient {
       const body = await this.request<{ id?: string; text?: unknown }>(
         "memory lookup",
         this.bankUrl(bankId, `/memories/${encodeURIComponent(memoryId)}`),
-        { method: "GET", signal },
+        { method: "GET", signal, maxBodyBytes: MEMORY_MAX_RESPONSE_BYTES },
       );
       return typeof body.text === "string" ? { id: memoryId, text: body.text } : null;
     } catch (error) {

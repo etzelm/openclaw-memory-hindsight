@@ -103,7 +103,10 @@ def classify(r, driver_exit):
     failing = sorted(i for i, c in checks.items() if c["result"] == "FAIL")
     skipped = sorted(i for i, c in checks.items() if c["result"] == "SKIP")
     cli_known = r.get("runtime") == "claude-cli" and expect_cli_fail(r.get("openclaw", {}))
-    no_audience = lambda i: i in checks and checks[i]["result"] == "FAIL" and "None/absent" in checks[i]["observed"]
+    # Only the judged session's part: B1 also lists other sessions' hooks after "; other sessions:",
+    # and a heartbeat there with no audience must not make a real B1 failure look expected.
+    own = lambda i: checks[i]["observed"].split("; other sessions:")[0]
+    no_audience = lambda i: i in checks and checks[i]["result"] == "FAIL" and "None/absent" in own(i)
     ec = r.get("exitCode")
     if driver_exit is not None and driver_exit != ec:
         return "unexpected", f"harness exited {driver_exit}, results.json says {ec}"
@@ -232,7 +235,12 @@ cases = {
     "src-claude-cli": ("claude-cli", "2026.11.2", checks(), None),
     "gmet-claude-cli": ("claude-cli", "2026.10.1", checks(AUD + ["G2"], none_audience=True, ids=IDS + ["G1", "G2"]), None),
     "gone-claude-cli": ("claude-cli", "2026.10.1", checks(AUD + ["G1"], none_audience=True, ids=IDS + ["G1", "G2"]), None),
+    "xsess-claude-cli": ("claude-cli", "2026.10.1", checks(AUD, none_audience=True), None),
 }
+# B1 fails for the chat.send session itself (it had an audience); only another session shows None/absent.
+for c in cases["xsess-claude-cli"][2]:
+    if c["id"] == "B1":
+        c["observed"] = "['agent_end=conversation/stale']; other sessions: 1 hooks ['agent_end=None/absent']"
 exits = []
 for phase, (rt, v, ch, ec) in cases.items():
     p = os.path.join(d, "cells", phase); os.makedirs(p)
@@ -265,6 +273,7 @@ want = {
     "src-claude-cli": ("unexpected", "PASS (claude-cli was expected"),
     "gmet-claude-cli": ("expected", "FAIL 13 audience checks (expected"),
     "gone-claude-cli": ("unexpected", "FAIL A1,"),
+    "xsess-claude-cli": ("unexpected", "FAIL A1,"),
 }
 bad = [(k, cells.get(k, {}).get("status"), cells.get(k, {}).get("text")) for k, (s, t) in want.items()
        if cells.get(k, {}).get("status") != s or not cells[k]["text"].startswith(t)
@@ -302,7 +311,7 @@ print("self-test missing cells:", "PASS" if ok else "FAIL " + str(m["missing"]))
 import re, sys
 top = open(sys.argv[1]).read().split("## Cells")[0].splitlines()
 rows = [l.split(" | ")[0][2:] for l in top if re.match(r"\| [a-z]+ \| ", l)]
-want = ["floor", "latest", "main", "ghost", "gmet", "gone", "lie", "oddskip", "short", "src", "trunc"]
+want = ["floor", "latest", "main", "ghost", "gmet", "gone", "lie", "oddskip", "short", "src", "trunc", "xsess"]
 print("self-test host order:", "PASS" if rows == want else "FAIL " + str(rows)); sys.exit(0 if rows == want else 1)' "$d/MATRIX.md" || st=1
   # Only partial cells left: exit 3, or 0 when the matrix itself ran with --setup-only.
   rm -rf "$d/cells" "$d/exits.tsv"; mkdir -p "$d/cells/main-embedded"

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { HindsightClient, isBankMissingBody, isBankNotFound } from "./client.js";
+import {
+  HindsightClient,
+  isBankMissingBody,
+  isBankNotFound,
+  MEMORY_MAX_RESPONSE_BYTES,
+} from "./client.js";
 import { createFakeHindsight } from "./test-helpers.js";
 
 describe("HindsightClient bank urls", () => {
@@ -132,5 +137,24 @@ describe("error bodies", () => {
     });
     await expect(client.recall("dev", "q", { budget: "low" })).rejects.toThrow(/HTTP 503/);
     expect(cancelled).toBe(true);
+  });
+});
+
+describe("memory response body bound", () => {
+  it("fails a recall, reflect or memory lookup whose body is over the bound", async () => {
+    const big = "x".repeat(MEMORY_MAX_RESPONSE_BYTES + 1);
+    const client = new HindsightClient({
+      resolveEndpoint: () => ({ apiUrl: "http://hindsight.test" }),
+      fetch: async () => new Response(big, { status: 200 }),
+    });
+    await expect(client.recall("dev", "q", { budget: "low" })).rejects.toThrow(
+      /recall failed: response larger than/,
+    );
+    await expect(client.reflect("dev", "q", { budget: "low" })).rejects.toThrow(
+      /reflect failed: response larger than/,
+    );
+    await expect(client.getMemory("dev", "m1")).rejects.toThrow(
+      /memory lookup failed: response larger than/,
+    );
   });
 });

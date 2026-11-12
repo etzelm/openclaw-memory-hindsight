@@ -4,6 +4,7 @@ import {
   closeSync,
   existsSync,
   fstatSync,
+  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -93,7 +94,7 @@ export function isDroppingRejection(error: unknown): boolean {
 
 /**
  * Rejections on replay that say nothing about the item itself: keep it and retry later. That is
- * auth (401, 403), rate limits (429) and a 404 for a route that does not exist (a wrong
+ * auth (401, 403), a request timeout (408), rate limits (429) and a 404 for a route that does not exist (a wrong
  * `hindsightApiUrl` path) or with an empty body. Hindsight creates a bank on its first retain, so
  * only an explicit `Bank '<id>' not found` 404 is an answer about this item and drops it like
  * other 4xx; an ambiguous 404 keeps it, and the age bound clears it in the end.
@@ -105,7 +106,21 @@ export function isRetryableRejection(error: unknown): boolean {
   if (error.status === 404) {
     return !error.bankMissingExplicit;
   }
-  return error.status === 401 || error.status === 403 || error.status === 429;
+  return (
+    error.status === 401 || error.status === 403 || error.status === 408 || error.status === 429
+  );
+}
+
+/**
+ * A live auto-retain failure worth queueing: Hindsight unreachable, or a rejection that says
+ * nothing about the item (auth, request timeout, rate limit). An ambiguous 404 stays out: on the
+ * live path it is almost always a wrong `hindsightApiUrl`, which queueing would only hide.
+ */
+export function isQueueableLiveFailure(error: unknown): boolean {
+  if (isTransportFailure(error)) {
+    return true;
+  }
+  return error instanceof HindsightHttpError && error.status !== 404 && isRetryableRejection(error);
 }
 
 function isQueuedRetain(value: unknown): value is QueuedRetain {
@@ -140,6 +155,21 @@ function tombstoneKey(value: unknown): { bankId: string; documentId: string } | 
 
 function tombstoneLine(key: { bankId: string; documentId: string }): string {
   return JSON.stringify({ tombstone: { bankId: key.bankId, documentId: key.documentId } });
+}
+
+/** Makes a rename durable. Best effort: some file systems refuse fsync on a directory. */
+function syncDir(dir: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(dir, "r");
+    fsyncSync(fd);
+  } catch {
+    // The rename itself succeeded; only its durability across a power loss is weaker.
+  } finally {
+    if (fd !== undefined) {
+      closeSync(fd);
+    }
+  }
 }
 
 /** True when the file is empty or its last byte is a newline. */
@@ -303,8 +333,12 @@ export class RetainQueue {
     return this.stored.some((s) => s.entry.bankId === bankId);
   }
 
-  peek(): QueuedRetain | undefined {
-    return this.stored[0]?.entry;
+  /** The oldest item, skipping banks in `skipBanks` (replay passes over a bank that refused). */
+  peek(skipBanks?: ReadonlySet<string>): QueuedRetain | undefined {
+    if (!skipBanks?.size) {
+      return this.stored[0]?.entry;
+    }
+    return this.stored.find((s) => !skipBanks.has(s.entry.bankId))?.entry;
   }
 
   /**
@@ -356,8 +390,9 @@ export class RetainQueue {
         } catch {
           this.markStale(stale!.entry);
         }
-      } else if (unsavedCopy) {
-        this.markStale(unsavedCopy);
+      } else if (unsavedCopy && this.markStale(unsavedCopy)) {
+        // Kept when the tombstone could not be written, so the next attempt tries again.
+        this.unsaved.delete(queueKey(entry));
       }
       return false;
     }
@@ -425,8 +460,8 @@ export class RetainQueue {
     this.stored = kept;
     if (index >= 0) {
       this.markStale(before[index]!.entry);
-    } else if (unsavedCopy) {
-      this.markStale(unsavedCopy);
+    } else if (unsavedCopy && this.markStale(unsavedCopy)) {
+      this.unsaved.delete(queueKey(entry));
     }
     throw rewriteError;
   }
@@ -450,10 +485,53 @@ export class RetainQueue {
     }
   }
 
+  /**
+   * Called after a newer copy of this document went out live. A copy that replay delivered but
+   * has not saved yet is still in the file, so a crash or a failed save would replay it over the
+   * newer one: tombstone it. A copy still queued in memory is left alone; it is newer than the
+   * live write or replaces itself on replay.
+   */
+  supersede(key: { bankId: string; documentId: string }): void {
+    const k = queueKey(key);
+    const copy = this.unsaved.get(k);
+    if (copy && !this.stored.some((s) => queueKey(s.entry) === k) && this.markStale(copy)) {
+      this.unsaved.delete(k);
+    }
+  }
+
+  /** True while replay's batched removals are not written yet. */
+  hasUnsaved(): boolean {
+    return this.dirty;
+  }
+
   /** Writes batched removals, if any. */
   save(): void {
     if (this.dirty) {
       this.persist();
+    }
+  }
+
+  /**
+   * Removes the queued copy of this document if it still holds exactly `item` (the service queued
+   * it at shutdown while its live write was in flight, and that write then succeeded). A newer
+   * copy is left alone. Best effort: a failed rewrite keeps the copy, which replays as a replace.
+   */
+  discard(key: { bankId: string; documentId: string }, item: HindsightRetainItem): void {
+    const index = this.stored.findIndex(
+      (s) =>
+        s.entry.bankId === key.bankId &&
+        s.entry.documentId === key.documentId &&
+        s.entry.item === item,
+    );
+    if (index < 0) {
+      return;
+    }
+    const before = [...this.stored];
+    this.stored.splice(index, 1);
+    try {
+      this.persist();
+    } catch {
+      this.stored = before;
     }
   }
 
@@ -527,13 +605,15 @@ export class RetainQueue {
    * Best effort when the rewrite failed: append a tombstone for an out-of-date copy that is still
    * in the file, so `load()` drops it after a restart instead of replaying it.
    */
-  private markStale(entry: QueuedRetain): void {
+  private markStale(entry: QueuedRetain): boolean {
     try {
       this.append(tombstoneLine(entry));
+      return true;
     } catch (error) {
       this.logger.warn?.(
         `memory-hindsight: could not mark an out-of-date queued retain (${formatErrorMessage(error)}); a restart may replay it before the newer copy is written again`,
       );
+      return false;
     }
   }
 
@@ -554,11 +634,21 @@ export class RetainQueue {
     this.ensureDir();
     const tmp = `${this.filePath}.tmp`;
     const text = `${this.stored.map((s) => s.line).join("\n")}\n`;
-    writeFileSync(tmp, text, { mode: 0o600 });
-    // writeFileSync keeps the mode of an existing file; force it.
+    const fd = openSync(tmp, "w", 0o600);
+    try {
+      // writeFileSync loops until every byte is out; a bare writeSync can store part of the text
+      // on a nearly full disk and report no error.
+      writeFileSync(fd, text);
+      // On disk before the rename, so a power loss cannot leave an empty or missing queue file.
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    // openSync keeps the mode of an existing file; force it.
     chmodSync(tmp, 0o600);
     renameSync(tmp, this.filePath);
     this.fileBytes = Buffer.byteLength(text, "utf8");
+    syncDir(dirname(this.filePath));
   }
 }
 
@@ -633,6 +723,9 @@ export class RetainQueueRunner {
         this.options.logger.warn?.(
           `memory-hindsight: retain queue replay stopped (${formatErrorMessage(error)})`,
         );
+        // A write error ended the pass; try again after the backoff instead of waiting for the
+        // next retain or a restart, and wait longer each time the disk stays unwritable.
+        this.backOff();
       })
       .finally(() => {
         this.running = undefined;
@@ -642,7 +735,8 @@ export class RetainQueueRunner {
 
   /** Schedules a pass after the current backoff unless one is already scheduled. */
   schedule(delayMs = this.delayMs): void {
-    if (this.stopped() || this.timer || this.queue.size() === 0) {
+    // An empty queue with unsaved removals still needs a pass, to write them.
+    if (this.stopped() || this.timer || (this.queue.size() === 0 && !this.queue.hasUnsaved())) {
       return;
     }
     this.timer = setTimeout(() => {
@@ -658,6 +752,12 @@ export class RetainQueueRunner {
       this.timer = undefined;
     }
     this.controller.abort();
+  }
+
+  /** The pass that just failed waited the current delay; the next one waits twice as long. */
+  private backOff(): void {
+    this.schedule();
+    this.delayMs = Math.min(this.delayMs * 2, this.options.maxDelayMs ?? RETAIN_QUEUE_RETRY_MAX_MS);
   }
 
   private async replay(): Promise<void> {
@@ -678,8 +778,11 @@ export class RetainQueueRunner {
   private async replayItems(): Promise<number> {
     const { logger, send } = this.options;
     let delivered = 0;
+    // Banks that refused this pass (auth, rate limit, bank setup, ambiguous 404): their items
+    // wait, in order, and other banks' items still go out.
+    const refused = new Set<string>();
     this.queue.prune();
-    for (let entry = this.queue.peek(); entry; entry = this.queue.peek()) {
+    for (let entry = this.queue.peek(refused); entry; entry = this.queue.peek(refused)) {
       try {
         await send(entry, this.controller.signal);
       } catch (error) {
@@ -688,24 +791,24 @@ export class RetainQueueRunner {
         }
         if (!isDroppingRejection(error)) {
           this.options.onReplay?.(entry.bankId, "deferred");
-          // Not an answer about this item (outage, auth, rate limit, ambiguous 404, refused
-          // redirect, or an unexpected error): keep it and back off.
-          if (!isTransportFailure(error) && !this.rejectionWarned) {
+          logger.debug?.(
+            `memory-hindsight: retain queue replay deferred (${this.queue.size()} pending): ${formatErrorMessage(error)}`,
+          );
+          if (isTransportFailure(error)) {
+            // Hindsight is unreachable for everyone: end the pass and back off.
+            this.backOff();
+            return delivered;
+          }
+          // Not an answer about this item (auth, rate limit, ambiguous 404, bank setup, refused
+          // redirect, or an unexpected error): keep it, skip its bank for this pass, back off.
+          if (!this.rejectionWarned) {
             this.rejectionWarned = true;
             logger.warn?.(
               `memory-hindsight: queued retain not delivered (${formatErrorMessage(error)}); ${this.queue.size()} pending, retrying with backoff; new retains for a bank with pending items queue behind it`,
             );
           }
-          logger.debug?.(
-            `memory-hindsight: retain queue replay deferred (${this.queue.size()} pending): ${formatErrorMessage(error)}`,
-          );
-          // The pass that just failed waited the current delay; the next one waits twice as long.
-          this.schedule();
-          this.delayMs = Math.min(
-            this.delayMs * 2,
-            this.options.maxDelayMs ?? RETAIN_QUEUE_RETRY_MAX_MS,
-          );
-          return delivered;
+          refused.add(entry.bankId);
+          continue;
         }
         // Hindsight answered 4xx about this item: retrying cannot help, so it leaves the queue.
         this.queue.remove(entry, { persist: false });
@@ -721,12 +824,16 @@ export class RetainQueueRunner {
       }
       this.queue.remove(entry, { persist: false });
       this.options.onReplay?.(entry.bankId, "delivered");
-      this.rejectionWarned = false;
       delivered += 1;
       if (delivered % SAVE_EVERY === 0) {
         this.queue.save();
       }
     }
+    if (refused.size > 0) {
+      this.backOff();
+      return delivered;
+    }
+    this.rejectionWarned = false;
     this.delayMs = this.baseDelay();
     return delivered;
   }

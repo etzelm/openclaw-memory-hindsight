@@ -7,12 +7,17 @@
 # Environment:
 #   HS_COMPAT_REPO     git URL or path of this package (required)
 #   HS_COMPAT_REF      ref to fetch (default develop). latest-release fetches the highest
-#                      vX.Y.Z tag in HS_COMPAT_REPO, so the run tests the latest release.
+#                      vX.Y.Z tag in HS_COMPAT_REPO, so the run tests the latest release. The
+#                      harness then runs from that tag with the run's credentials, so anyone who
+#                      can push a vX.Y.Z tag there can run code with them: keep a tag ruleset on
+#                      (RELEASING.md, one-time setup step 4) or use a mirror only you can write.
 #   HS_COMPAT_RESULTS  results destination, passed to --results-dest (required)
 #   HS_COMPAT_ARGS     extra compat-matrix.sh arguments, split on spaces (token and key files)
 #   HS_COMPAT_PRE      optional command run first, for example one that refreshes a mirror
-#   HS_COMPAT_STATUS_FILE  optional Prometheus textfile (*.prom), rewritten after every start
-#                      that gets past the lock: last attempt, last run, last success, exit code
+#   HS_COMPAT_STATUS_FILE  optional Prometheus textfile (*.prom): last attempt, last run, last
+#                      success, exit code. Rewritten by every start except one that finds another
+#                      run holding the lock (that start leaves it alone); a start that cannot
+#                      write WORK_ROOT writes it with exit code 4 before it reaches the lock.
 #   WORK_ROOT          scratch parent (default ~/work)
 #   RESULTS_PUT        copy command for the results (default cp -R)
 # One run at a time per WORK_ROOT: a second start while one runs (the agent loaded in two launchd
@@ -47,7 +52,7 @@ write_status() {
   tmp="$STATUS.tmp"
   mkdir -p "$(dirname "$STATUS")" 2>/dev/null
   if {
-    echo "# HELP hs_compat_nightly_last_attempt_timestamp_seconds Unix time compat-nightly.sh last started past its lock."
+    echo "# HELP hs_compat_nightly_last_attempt_timestamp_seconds Unix time compat-nightly.sh last started without finding another run holding its lock."
     echo "# TYPE hs_compat_nightly_last_attempt_timestamp_seconds gauge"
     echo "hs_compat_nightly_last_attempt_timestamp_seconds $now"
     echo "# HELP hs_compat_nightly_last_run_timestamp_seconds Unix time the compat matrix last ran to the end (exit 0, 1 or 3)."
@@ -111,7 +116,10 @@ if [ -n "${HS_COMPAT_PRE:-}" ]; then
   bash -c "$HS_COMPAT_PRE" || echo "warning: HS_COMPAT_PRE failed; testing the last fetched $REF"
 fi
 if [ "$REF" = latest-release ]; then
-  tag=$(git ls-remote --tags --refs "$HS_COMPAT_REPO" 'v*' 2>/dev/null | sed 's#^.*refs/tags/##' \
+  # A failed listing is not "no tags": say which one it was.
+  tags=$(git ls-remote --tags --refs "$HS_COMPAT_REPO" 'v*' 2>/dev/null) \
+    || { echo "could not list tags in $HS_COMPAT_REPO"; exit 2; }
+  tag=$(printf '%s\n' "$tags" | sed 's#^.*refs/tags/##' \
     | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1.2,1n -k2,2n -k3,3n | tail -n 1)
   [ -n "$tag" ] || { echo "no vX.Y.Z tag found in $HS_COMPAT_REPO"; exit 2; }
   echo "latest release $tag"

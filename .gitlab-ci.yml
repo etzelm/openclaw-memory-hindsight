@@ -1,5 +1,5 @@
 # Package CI: install, typecheck + build (tsc -> dist/), vitest with coverage floor, oxlint,
-# oxfmt check, pack listing.
+# oxfmt check, pack guard (same script as GitHub CI and release), and the compat script tests.
 
 stages:
   - check
@@ -29,9 +29,12 @@ check:
     - npm run test:coverage
     - npm run lint
     - npm run format:check
-    # The published file list must never carry tests, helpers or local state.
+    - node --test scripts/pack-guard.test.mjs
+    # The published file list must never carry tests, helpers or local state, and must carry
+    # every file a release needs.
     - npm pack --dry-run --json --ignore-scripts > pack.json
-    - node -e 'const f=require("./pack.json")[0].files.map(x=>x.path);console.log(f.join("\n"));const bad=f.filter(p=>/\.test\.|test-helpers|^src\/|^coverage\/|\.env|secret|token/i.test(p));if(bad.length){console.error("forbidden in pack:",bad);process.exit(1)}'
+    - node -e 'console.log(require("./pack.json")[0].files.map((x)=>x.path).join("\n"))'
+    - node scripts/pack-guard.mjs pack.json
   # MR widget percentage comes from the text-summary Lines row.
   coverage: '/Lines\s*:\s*(\d+(?:\.\d+)?)%/'
   artifacts:
@@ -43,3 +46,14 @@ check:
       coverage_report:
         coverage_format: cobertura
         path: coverage/cobertura-coverage.xml
+
+# Shell tests for the compat nightly and matrix scripts (not in the package). They need bash, git
+# and python3, and must run as a non-root user: one case checks an unwritable WORK_ROOT, which root
+# can still write.
+scripts:
+  stage: check
+  cache: []
+  script:
+    - apk add --no-cache bash git python3
+    - chown -R node:node "$CI_PROJECT_DIR"
+    - su node -s /bin/sh -c 'bash -n scripts/*.sh && bash scripts/compat-nightly.test.sh && bash scripts/compat-matrix.sh --self-test'

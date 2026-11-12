@@ -1,3 +1,8 @@
+import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
+
+/** The id normalizeAgentId falls back to for an id with no usable characters. */
+const DEFAULT_AGENT_ID = "main";
+
 export const RECALL_BUDGETS = ["low", "mid", "high"] as const;
 export const RECALL_TYPES = ["world", "experience", "observation"] as const;
 export const MEMORY_MODES = ["hybrid", "context", "tools"] as const;
@@ -183,19 +188,34 @@ function readNonNegativeInt(
 }
 
 function readBankMap(cfg: Record<string, unknown>): Record<string, string> {
+  // No prototype, so an agent id like `constructor` or `__proto__` is only ever an own key.
+  const map: Record<string, string> = Object.create(null) as Record<string, string>;
   const value = cfg.agentBankMap;
   if (value === undefined) {
-    return {};
+    return map;
   }
   if (!isRecord(value)) {
     throw new Error("agentBankMap must be an object of agent id to bank id");
   }
-  const map: Record<string, string> = {};
   for (const [agentId, bankId] of Object.entries(value)) {
     if (typeof bankId !== "string" || !bankId.trim() || !agentId.trim()) {
       throw new Error("agentBankMap entries must map an agent id to a non-empty bank id");
     }
-    map[agentId.trim().toLowerCase()] = bankId.trim();
+    const bank = bankId.trim();
+    // `.` and `..` survive percent-encoding and would turn the bank URL into another path.
+    if (bank === "." || bank === "..") {
+      throw new Error('agentBankMap bank ids must not be "." or ".."');
+    }
+    // Keys are normalized like agent ids, so `WB Dev` matches the agent `wb-dev`.
+    const key = normalizeAgentId(agentId);
+    if (key === DEFAULT_AGENT_ID && agentId.trim().toLowerCase() !== DEFAULT_AGENT_ID) {
+      // normalizeAgentId falls back to the default agent for an id with no usable characters.
+      throw new Error(`agentBankMap key ${JSON.stringify(agentId)} is not a valid agent id`);
+    }
+    if (Object.hasOwn(map, key)) {
+      throw new Error(`agentBankMap has more than one key for agent ${JSON.stringify(key)}`);
+    }
+    map[key] = bank;
   }
   return map;
 }
@@ -236,7 +256,15 @@ function readApiToken(cfg: Record<string, unknown>): string | undefined {
   if (typeof value !== "string") {
     throw new Error("hindsightApiToken must be a string or SecretRef");
   }
-  return value.trim() || undefined;
+  const token = value.trim();
+  // fetch rejects a bad header value with an error that quotes it, and that text reaches logs
+  // and tool errors. Refuse it here, and never put the value in the message.
+  if (token && !/^[\x21-\x7e]+$/.test(token)) {
+    throw new Error(
+      "hindsightApiToken must be printable ASCII without spaces or line breaks (check the secret file for a second line)",
+    );
+  }
+  return token || undefined;
 }
 
 /** True when the raw config holds a SecretRef object the host did not resolve to a string. */

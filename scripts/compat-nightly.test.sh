@@ -65,5 +65,20 @@ check "status exit code 4" "$(metric hs_compat_nightly_last_exit_code "$T/state/
 check "run time kept" "$(metric hs_compat_nightly_last_run_timestamp_seconds "$T/state/nightly.prom")" "$run1"
 check "no tmp file left" "$(ls "$T/state")" "nightly.prom"
 
+# latest-release when the tags cannot be listed (repo missing or unreachable): exit 2 and say so,
+# not "no vX.Y.Z tag found". A reachable repo with no release tag still says that.
+rm -f "$T/ran"
+HS_COMPAT_REPO=$T/no-such-repo HS_COMPAT_REF=latest-release HS_COMPAT_RESULTS=$T/results \
+  STUB_EXIT=0 STUB_OUT=$T/ran WORK_ROOT=$T/work bash "$NIGHTLY" > "$T/log" 2>&1; st=$?
+check "unlistable repo exit" "$st" 2
+check "unlistable repo message" "$(grep -c 'could not list tags' "$T/log")" 1
+check "unlistable repo is not 'no tag found'" "$(grep -c 'no vX.Y.Z tag found' "$T/log")" 0
+git init -q "$T/notags"
+HS_COMPAT_REPO=$T/notags HS_COMPAT_REF=latest-release HS_COMPAT_RESULTS=$T/results \
+  STUB_EXIT=0 STUB_OUT=$T/ran WORK_ROOT=$T/work bash "$NIGHTLY" > "$T/log" 2>&1; st=$?
+check "no-tag repo exit" "$st" 2
+check "no-tag repo message" "$(grep -c 'no vX.Y.Z tag found' "$T/log")" 1
+check "matrix not run without a tag" "$([ -e "$T/ran" ] && echo ran || echo no)" no
+
 echo "compat-nightly tests: $([ "$fails" = 0 ] && echo PASS || echo "FAIL ($fails)")"
 [ "$fails" = 0 ]
