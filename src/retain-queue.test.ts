@@ -370,6 +370,39 @@ describe("RetainQueue", () => {
     expect(readQueueFile(file).map((l) => l.documentId)).toEqual(["b"]);
   });
 
+  it("never replays a delivered copy over a newer one after a failed replay save", () => {
+    const file = retainQueuePath(stateDir);
+    const { queue } = makeQueue(SMALL, undefined, SMALL_BOUND);
+    queue.enqueue(entry("dev", "a", "v1"));
+    queue.enqueue(entry("dev", "b"));
+    // Replay delivered v1 of "a"; its batched save fails, so the file still holds v1.
+    queue.remove(queue.peek()!, { persist: false });
+    mkdirSync(`${file}.tmp`);
+    try {
+      expect(() => queue.save()).toThrow(/EISDIR/);
+      // v2 of "a" can neither be rewritten nor appended: the caller sends it live.
+      expect(() => queue.enqueue(noRoomFor("dev", "a"))).toThrow(/EISDIR/);
+    } finally {
+      rmSync(`${file}.tmp`, { recursive: true, force: true });
+    }
+    expect(queue.list().map((e) => e.documentId)).toEqual(["b"]);
+    // Crash before the next save: a restart must not replay v1 over the v2 sent live.
+    const { queue: restarted } = makeQueue(SMALL, undefined, SMALL_BOUND);
+    expect(restarted.list().map((e) => e.documentId)).toEqual(["b"]);
+  });
+
+  it("never replays a delivered copy over a newer one too large to queue", () => {
+    const { queue } = makeQueue(SMALL, undefined, SMALL_BOUND);
+    queue.enqueue(entry("dev", "a", "v1"));
+    queue.enqueue(entry("dev", "b"));
+    queue.remove(queue.peek()!, { persist: false });
+    // v2 is over the bound, so it is not queued and the caller sends it live.
+    expect(queue.enqueue(entry("dev", "a", "x".repeat(SMALL_BOUND)))).toBe(false);
+    // Crash before replay's save: the file's v1 must not come back.
+    const { queue: restarted } = makeQueue(SMALL, undefined, SMALL_BOUND);
+    expect(restarted.list().map((e) => e.documentId)).toEqual(["b"]);
+  });
+
   it("rewrites instead of appending when an append would pass the size bound", () => {
     const file = retainQueuePath(stateDir);
     const queue = new RetainQueue({

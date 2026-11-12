@@ -193,13 +193,22 @@ export class HindsightClient {
       ...(init.signal ? { signal: init.signal } : {}),
     });
     if (!response.ok) {
-      const body =
-        response.status === 404
-          ? // An oversized body is not "empty", so it never reads as a missing bank.
-            await readBoundedText(response, ERROR_BODY_MAX_BYTES).catch((error: unknown) =>
-              error instanceof BodyTooLargeError ? "<oversized>" : "",
-            )
-          : "";
+      let body = "";
+      if (response.status === 404) {
+        try {
+          body = await readBoundedText(response, ERROR_BODY_MAX_BYTES);
+        } catch (error) {
+          // An oversized body is not "empty", so it never reads as a missing bank. A read that
+          // failed (aborted, connection lost) says nothing about the bank: throw that error.
+          if (!(error instanceof BodyTooLargeError)) {
+            throw error;
+          }
+          body = "<oversized>";
+        }
+      } else {
+        // Never read, so release the connection instead of leaving the body to the GC.
+        await response.body?.cancel().catch(() => undefined);
+      }
       const bankMissing = response.status === 404 && isBankMissingBody(body);
       const bankMissingExplicit = response.status === 404 && isExplicitBankMissingBody(body);
       const pageMissing = response.status === 404 && isExplicitPageMissingBody(body);

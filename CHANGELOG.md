@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.7.0 (2026-11-11)
+
+### Upgrade notes
+
+- No config change is needed, and no key is added or removed.
+- A 404 whose body cannot be read (request aborted, connection lost) is now an error, not "no
+  bank yet". Auto-recall logs it at warn and injects nothing, as before. The retain queue is
+  unchanged: it drops a queued retain only on an explicit `Bank '<id>' not found` body, so such a
+  retain stayed queued before and still does.
+- With `recallCacheTtlMs` set, a `hindsight_retain` call now drops that session's cached recall,
+  so the next turn of the session recalls fresh. Other sessions keep their cache.
+
+### Fixed
+
+- Retain queue: a copy that replay delivered but whose batched save failed stays in the file until
+  the next save. When a newer copy of the same document then could not be queued (too large, or
+  the file could not be written) and went out live, a restart replayed the old copy over it. The
+  queue now writes a tombstone for that copy.
+- Auto-retain: the host does not await `agent_end`, so run N's handler can run after run N+1
+  started. It used and deleted run N+1's start marker, so run N retained the wrong slice and run
+  N+1 lost its start. A marker of another run is now left alone.
+- A 404 whose body read failed counted as a missing bank, so recall reported "no memories"
+  instead of an error. The read error is now thrown. Bodies of non-404 errors are cancelled
+  instead of left unread.
+- Auto-recall cache (`recallCacheTtlMs`): a `hindsight_retain` call drops the session's cached
+  recall. Auto-retain leaves the cache alone; that turn is already in the transcript.
+- Compatibility proof (not in the package): the owner fact is a boat name instead of a "launch
+  code word", which Hindsight's retain model sometimes stored without its value. B1 and B2 judge
+  the chat.send session, so a host heartbeat turn in the same window no longer fails them, and
+  B2 still fails on a code hit from any session. The probe imports the memory host SDK while it
+  registers, because upstream main now closes a plugin's invocation scope after the run.
+- Compatibility matrix (not in the package): G2 counts with the audience checks for the
+  expected `claude-cli` failure. With `CLI_AUDIENCE_FIXED_IN` set, a host built from source must
+  pass, and `CLI_AUDIENCE_FIXED_IN=main` covers a fix that is only on upstream main.
+- Compatibility nightly (not in the package): an unwritable `WORK_ROOT` exits 4 with "cannot
+  write WORK_ROOT" instead of "another nightly run took the lock". The example plist starts bash
+  through a node binary with Full Disk Access, because a LaunchAgent bootstrapped from cron after
+  a macOS reboot gets no access to an external disk.
+
+### Added
+
+- Compatibility nightly (not in the package): `HS_COMPAT_REF=latest-release` tests the highest
+  `vX.Y.Z` tag, and `HS_COMPAT_STATUS_FILE` writes a Prometheus textfile (last attempt, last run,
+  last success, exit code) for a missed-nightly alert.
+
 ## 0.6.0 (2026-11-11)
 
 ### Upgrade notes

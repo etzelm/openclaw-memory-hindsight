@@ -146,28 +146,37 @@ with `results.json`, or when a check is SKIP for any other reason.
 
 ### Expected cells
 
-OpenClaw does not give plugin hooks a memory audience on CLI-backed turns (openclaw#194453;
-fix proposed in openclaw#194454). Until a release ships the fix, every `claude-cli` cell fails
-the audience checks on every host, `main` included:
+Released OpenClaw does not give plugin hooks a memory audience on CLI-backed turns
+(openclaw#194453). Upstream `main` has the fix since 2026-11-09. Until a release ships it, every
+`claude-cli` cell on a release fails the audience checks:
 
-| OpenClaw           | embedded | claude-cli                          |
-| ------------------ | -------- | ----------------------------------- |
-| 2026.10.10 (floor) | PASS     | FAIL, expected                      |
-| latest release     | PASS     | FAIL, expected                      |
-| main               | PASS     | FAIL, expected until the fix merges |
+| OpenClaw           | embedded | claude-cli                            |
+| ------------------ | -------- | ------------------------------------- |
+| 2026.10.10 (floor) | PASS     | FAIL, expected                        |
+| latest release     | PASS     | FAIL, expected                        |
+| main               | PASS     | PASS with `CLI_AUDIENCE_FIXED_IN` set |
 
 A `claude-cli` cell counts as expected when A1 and B1 show no audience on the hooks and every
-failing check is an A, B, M or C check. Any other failure is unexpected and makes the matrix
-exit 1. When a release ships the fix, set `CLI_AUDIENCE_FIXED_IN=<version>`: from that version
-on, `claude-cli` cells must pass, and a `claude-cli` PASS before it is reported as unexpected so
-the expectation gets updated.
+failing check is an A, B, M or C check, or G2 (its recall and retain counters stay at 0 when the
+hooks get no audience). Any other failure is unexpected and makes the matrix exit 1. When a
+release ships the fix, set `CLI_AUDIENCE_FIXED_IN=<version>`: from that version on, `claude-cli`
+cells must pass, and a `claude-cli` PASS before it is reported as unexpected so the expectation
+gets updated. While it is set, a host built from source (`main`) must pass too, whatever version
+it reports: main carries the version of its last release close-out, which can be older than the
+first release with the fix. `CLI_AUDIENCE_FIXED_IN=main` is for the time between: the fix is on
+upstream main (closed 2026-11-09) but in no release yet (2026.11.3 and 2026.11.5-beta.2 still
+give CLI hooks no audience), so main must pass and every release still fails as expected.
 
 ## Nightly schedule (macOS launchd)
 
 `scripts/compat-nightly.sh` fetches the package at `HS_COMPAT_REF` from `HS_COMPAT_REPO` into a
 fresh scratch dir, runs the matrix from that checkout and copies the run dir to
-`HS_COMPAT_RESULTS`. `scripts/launchd/hs-compat-nightly.plist.example` runs it at 03:30 as a
-per-user LaunchAgent. It is not installed by anything in this repo. The job runs whatever
+`HS_COMPAT_RESULTS`. `HS_COMPAT_REF=latest-release` picks the highest `vX.Y.Z` tag in
+`HS_COMPAT_REPO`, so the run tests the latest release; a branch name tests that branch.
+`scripts/launchd/hs-compat-nightly.plist.example` runs it once a day in the 03 hour as a
+per-user LaunchAgent: launchd starts it every 60 s and a gate exits at once unless the hour
+matches and the stamp file does not hold today's date (a LaunchAgent in a `user/<uid>`
+Background domain does not fire `StartCalendarInterval`). It is not installed by anything in this repo. The job runs whatever
 `HS_COMPAT_REF` points to with the operator's Hindsight token, Anthropic key and `claude` login,
 so pin it to a protected branch or tag that only maintainers can push. To install it for the
 account that owns the Hindsight token and the `claude` login:
@@ -177,6 +186,9 @@ dest="$HOME/Library/Application Support/hs-compat"
 mkdir -p "$dest" && cp scripts/compat-nightly.sh "$dest/" && chmod 700 "$dest/compat-nightly.sh"
 sed -e "s#__HOME__#$HOME#g" \
     -e "s#__NODE_BIN__#$(dirname "$(command -v node)")#g" \
+    -e "s#__NODE__#$(realpath "$(command -v node)")#g" \
+    -e "s#__STATUS_FILE__#<dir the metrics exporter reads>/hs-compat-nightly.prom#" \
+    -e "s#__CLI_AUDIENCE_FIXED_IN__#<first release with the fix, or empty>#" \
     -e "s#__REPO_URL__#<git URL or path of this package>#" \
     -e "s#__RESULTS_DEST__#<results dir>#" \
     -e "s#__HINDSIGHT_ENV_FILE__#<dotenv with HINDSIGHT_API_TENANT_API_KEY>#" \
@@ -211,12 +223,34 @@ reboot.
 `HS_COMPAT_REF=refs/remotes/origin/develop`, and keep something fetching that clone (for
 example `HS_COMPAT_PRE`).
 
+The plist starts bash through `node` (`__NODE__`, a real path, not a symlink). On macOS a
+LaunchAgent that cron bootstraps after a reboot runs `/bin/bash` without access to an external
+volume, so with `WORK_ROOT` on an external disk every `mkdir` there fails with "Operation not
+permitted". Give that node binary Full Disk Access (System Settings > Privacy & Security > Full
+Disk Access); its children inherit it. A node upgrade changes the real path and drops the grant:
+the run then exits 4 with "cannot write WORK_ROOT", and the status file below records it. Keep
+`StandardOutPath` on the internal disk, because launchd opens it before the job starts and fails
+with EX_CONFIG (78) on a path it cannot open.
+
 `node`, `npm`, `pnpm`, `git` and `claude` must be on the plist `PATH`. Add `HS_COMPAT_PRE` (a
 command run first) or `GIT_SSH_COMMAND` to `EnvironmentVariables` if the repo needs them, and
 `RESULTS_PUT` if the results go somewhere `cp -R` cannot reach. The log is
-`~/Library/Logs/hs-compat-nightly.log`. Nothing alerts on an unexpected cell yet: read the
-latest `MATRIX.md` in the results dir, or check the exit code at the end of the log. To
-remove it:
+`~/Library/Logs/hs-compat-nightly.log`.
+
+`HS_COMPAT_STATUS_FILE` (optional) names a Prometheus textfile, rewritten after every start that
+gets past the lock (a start that finds another run holding the lock leaves it alone):
+
+| metric                                             | meaning                                                   |
+| -------------------------------------------------- | --------------------------------------------------------- |
+| `hs_compat_nightly_last_attempt_timestamp_seconds` | last start past the lock                                  |
+| `hs_compat_nightly_last_run_timestamp_seconds`     | last matrix that ran to the end (exit 0, 1 or 3)          |
+| `hs_compat_nightly_last_success_timestamp_seconds` | last matrix with every cell as expected (exit 0)          |
+| `hs_compat_nightly_last_exit_code`                 | exit code of the last start (4: `WORK_ROOT` not writable) |
+
+Alert on `time() - hs_compat_nightly_last_run_timestamp_seconds > 30 * 3600` (a missed
+nightly, including a job that never starts) and on `hs_compat_nightly_last_exit_code >= 2`
+(it could not run). An unexpected cell (exit 1) is in the latest `MATRIX.md` in the results
+dir. To remove it:
 
 ```sh
 launchctl bootout "gui/$(id -u)/com.etzelm.hs-compat-nightly"   # or user/$(id -u)

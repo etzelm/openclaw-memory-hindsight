@@ -178,6 +178,12 @@ export class RetainQueue {
   private dropWarned = false;
   /** Removals not yet written (replay batches its writes). */
   private dirty = false;
+  /**
+   * Copies removed from memory but still in the file until the next successful save, by bank and
+   * document id. A newer copy that cannot be queued gets a tombstone for it, so a restart before
+   * that save cannot replay the old copy over the newer one the caller sent live.
+   */
+  private unsaved = new Map<string, QueuedRetain>();
   /** Bytes in the file as this queue last read or wrote it; appends grow it, rewrites reset it. */
   private fileBytes = 0;
   private limits: () => RetainQueueLimits;
@@ -227,6 +233,8 @@ export class RetainQueue {
    * skipped with one warning. Any other read error throws, so the file is never overwritten.
    */
   load(): void {
+    // The file is the source of truth again; any copy it still holds is loaded below.
+    this.unsaved.clear();
     let text: string;
     try {
       text = readFileSync(this.filePath, "utf8");
@@ -335,6 +343,7 @@ export class RetainQueue {
     const index = this.stored.findIndex(
       (s) => s.entry.bankId === entry.bankId && s.entry.documentId === entry.documentId,
     );
+    const unsavedCopy = index < 0 ? this.unsaved.get(queueKey(entry)) : undefined;
     if (next.size > this.maxBytes()) {
       this.logger.warn?.(
         `memory-hindsight: retain too large to queue (${next.size} bytes, bound ${this.maxBytes()}); not queued`,
@@ -347,6 +356,8 @@ export class RetainQueue {
         } catch {
           this.markStale(stale!.entry);
         }
+      } else if (unsavedCopy) {
+        this.markStale(unsavedCopy);
       }
       return false;
     }
@@ -414,6 +425,8 @@ export class RetainQueue {
     this.stored = kept;
     if (index >= 0) {
       this.markStale(before[index]!.entry);
+    } else if (unsavedCopy) {
+      this.markStale(unsavedCopy);
     }
     throw rewriteError;
   }
@@ -431,6 +444,7 @@ export class RetainQueue {
     this.stored.splice(index, 1);
     if (options.persist === false) {
       this.dirty = true;
+      this.unsaved.set(queueKey(entry), entry);
     } else {
       this.persist();
     }
@@ -527,6 +541,7 @@ export class RetainQueue {
     this.rewrite();
     // Cleared only once written, so a failed replay save is retried by the next save().
     this.dirty = false;
+    this.unsaved.clear();
   }
 
   private rewrite(): void {

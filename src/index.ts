@@ -215,7 +215,15 @@ export default definePluginEntry({
         { name },
       );
     };
-    registerTool(RETAIN_TOOL, (ctx) => createRetainTool(service, flushDeduper, ctx));
+    // A hindsight_retain makes the session's cached recall out of date. Auto-retain does not: its
+    // turn is already in the transcript, and dropping the entry every turn would void the cache.
+    registerTool(RETAIN_TOOL, (ctx) =>
+      createRetainTool(service, flushDeduper, ctx, (key) => {
+        if (key) {
+          recallCache.delete(key);
+        }
+      }),
+    );
     registerTool(RECALL_TOOL, (ctx) => createRecallTool(service, ctx));
     registerTool(REFLECT_TOOL, (ctx) => createReflectTool(service, ctx));
     // Opt-in: registered only when knowledgeReadTools is on at startup, so the default tool set is
@@ -375,10 +383,19 @@ export default definePluginEntry({
         trigger: ctx.trigger,
         sessionKey,
       });
-      const start = sessionKey && !maintenance ? runStartBySession.get(sessionKey) : undefined;
+      const stored = sessionKey && !maintenance ? runStartBySession.get(sessionKey) : undefined;
+      // The host does not await agent_end, so run N's handler can run after run N+1's
+      // before_prompt_build replaced the marker. A marker of another run is neither used nor
+      // deleted; this run then falls back to its last user message.
+      const otherRun =
+        stored !== undefined &&
+        runId !== undefined &&
+        stored.runId !== undefined &&
+        stored.runId !== runId;
+      const start = otherRun ? undefined : stored;
       const runStart = start?.marker;
       // Taken before any skip. The marker stays while the run can still continue; without a
-      // runId it is dropped so the next run marks its own start.
+      // runId on either side it is dropped so the next run marks its own start.
       if (sessionKey && start && (runId === undefined || start.runId !== runId)) {
         runStartBySession.delete(sessionKey);
       }

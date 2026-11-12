@@ -104,6 +104,8 @@ export function createRetainTool(
   service: HindsightService,
   deduper: FlushDeduper,
   ctx: OpenClawPluginToolContext,
+  /** Called after a retain Hindsight accepted, so the session's cached recall is dropped. */
+  onRetained?: (sessionKey: string | undefined) => void,
 ): ToolBody | null {
   const bank = resolveToolBank(service, ctx, "retain");
   if (!bank) {
@@ -172,6 +174,7 @@ export function createRetainTool(
           },
           { async: true, signal: bounded },
         );
+        onRetained?.(ctx.sessionKey);
       } catch (error) {
         if (flushId) {
           deduper.release(flushId, bank.bankId, content);

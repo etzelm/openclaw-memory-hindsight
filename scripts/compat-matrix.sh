@@ -18,7 +18,9 @@
 # to CLI turn hooks (openclaw#194453). Such a cell counts as expected when A1 and B1 show no
 # audience on the hooks and every failing check is an audience check (A*, B*, M*, C*). Set
 # CLI_AUDIENCE_FIXED_IN=<version> once a release ships the fix: from that version on, claude-cli
-# cells must pass. Every other FAIL is unexpected.
+# cells must pass. CLI_AUDIENCE_FIXED_IN=main while the fix is only on upstream main: main (any
+# host built from source) must pass, every release still fails as expected. Every other FAIL is
+# unexpected.
 #
 # Options:
 #   --hosts "LIST"            hosts to test, separated by spaces or commas
@@ -73,15 +75,22 @@ import glob, json, os, re, sys
 run = sys.argv[1]
 fixed_in = os.environ.get("CLI_AUDIENCE_FIXED_IN", "")
 AUDIENCE = ("A", "B", "M", "C")
+# G2 (metrics change after turns) counts recalls and retains, so it fails whenever the hooks get
+# no audience; G1 (the metrics route) does not depend on the audience.
+AUDIENCE_IDS = ("G2",)
 
 def vkey(v):
     m = re.search(r"(\d+)\.(\d+)\.(\d+)", v or "")
     return tuple(int(x) for x in m.groups()) if m else None
 
-def expect_cli_fail(host_version):
+def expect_cli_fail(openclaw):
     if not fixed_in:
         return True
-    hv, fv = vkey(host_version), vkey(fixed_in)
+    # A host built from source (main) reports the version of its last release branch point, which
+    # can be older than the first release with the fix; it is current upstream, so it has the fix.
+    if openclaw.get("kind") in ("git", "checkout"):
+        return False
+    hv, fv = vkey(openclaw.get("version", "")), vkey(fixed_in)
     return hv is None or fv is None or hv < fv
 
 ALL_IDS = ["H1", "H2", "H3", "S1", "S2", "R1", "A1", "A2", "A3", "A4", "B1", "B2", "B3", "B4",
@@ -93,7 +102,7 @@ def classify(r, driver_exit):
     checks = {c["id"]: c for c in r.get("checks", [])}
     failing = sorted(i for i, c in checks.items() if c["result"] == "FAIL")
     skipped = sorted(i for i, c in checks.items() if c["result"] == "SKIP")
-    cli_known = r.get("runtime") == "claude-cli" and expect_cli_fail(r.get("openclaw", {}).get("version", ""))
+    cli_known = r.get("runtime") == "claude-cli" and expect_cli_fail(r.get("openclaw", {}))
     no_audience = lambda i: i in checks and checks[i]["result"] == "FAIL" and "None/absent" in checks[i]["observed"]
     ec = r.get("exitCode")
     if driver_exit is not None and driver_exit != ec:
@@ -106,7 +115,7 @@ def classify(r, driver_exit):
     if (r.get("verdict") == "FAIL") != bool(failing) or (ec == 1) != bool(failing):
         return "unexpected", f"verdict {r.get('verdict')} and exit {ec} disagree with {len(failing)} failing checks"
     if failing:
-        if cli_known and no_audience("A1") and no_audience("B1") and all(i[0] in AUDIENCE for i in failing):
+        if cli_known and no_audience("A1") and no_audience("B1") and all(i[0] in AUDIENCE or i in AUDIENCE_IDS for i in failing):
             return "expected", f"FAIL {len(failing)} audience checks (expected, openclaw#194453)"
         return "unexpected", "FAIL " + ",".join(failing)
     if skipped:
@@ -167,7 +176,9 @@ for h in hosts:
     lines.append(f"| {h} | " + " | ".join(cs) + " |")
 lines.append("")
 lines.append("Expected: claude-cli cells FAIL on the audience checks until the host gives CLI turn")
-lines.append("hooks a memory audience (openclaw#194453)" + (f"; fixed from {fixed_in} on." if fixed_in else "; no release has the fix yet."))
+lines.append("hooks a memory audience (openclaw#194453)" + (
+    "; fixed on upstream main, in no release yet." if fixed_in == "main"
+    else f"; fixed from {fixed_in} on, and on main." if fixed_in else "; no release has the fix yet."))
 partial = [c for c in cells if c["status"] == "partial"]
 lines.append(f"Unexpected cells: {len(unexpected)}. Partial cells (turn checks SKIP): {len(partial)}.")
 lines.append("")
@@ -218,13 +229,17 @@ cases = {
     "short-embedded": ("embedded", "2026.11.1", checks(ids=IDS[:5] + IDS[-2:]), 0),
     "oddskip-embedded": ("embedded", "2026.11.1", checks(skip="model offline"), None),
     "lie-embedded": ("embedded", "2026.11.1", checks(), None),
+    "src-claude-cli": ("claude-cli", "2026.11.2", checks(), None),
+    "gmet-claude-cli": ("claude-cli", "2026.10.1", checks(AUD + ["G2"], none_audience=True, ids=IDS + ["G1", "G2"]), None),
+    "gone-claude-cli": ("claude-cli", "2026.10.1", checks(AUD + ["G1"], none_audience=True, ids=IDS + ["G1", "G2"]), None),
 }
 exits = []
 for phase, (rt, v, ch, ec) in cases.items():
     p = os.path.join(d, "cells", phase); os.makedirs(p)
     fail = sum(c["result"] == "FAIL" for c in ch)
     code = ec if ec is not None else (1 if fail else 0)
-    json.dump({"phase": phase, "runtime": rt, "model": "m", "openclaw": {"kind": "npm", "version": f"OpenClaw {v} (abc)", "commit": ""},
+    kind = "git" if phase.startswith("src-") else "npm"
+    json.dump({"phase": phase, "runtime": rt, "model": "m", "openclaw": {"kind": kind, "version": f"OpenClaw {v} (abc)", "commit": ""},
                "plugin": {"description": "test"}, "abort": None, "exitCode": code,
                "verdict": "FAIL" if fail or code else "PASS", "checks": ch},
               open(os.path.join(p, "results.json"), "w"))
@@ -247,6 +262,9 @@ want = {
     "short-embedded": ("unexpected", "incomplete, missing R1,A1"),
     "oddskip-embedded": ("unexpected", "SKIP for an unknown reason"),
     "lie-embedded": ("unexpected", "harness exited 1, results.json says 0"),
+    "src-claude-cli": ("unexpected", "PASS (claude-cli was expected"),
+    "gmet-claude-cli": ("expected", "FAIL 13 audience checks (expected"),
+    "gone-claude-cli": ("unexpected", "FAIL A1,"),
 }
 bad = [(k, cells.get(k, {}).get("status"), cells.get(k, {}).get("text")) for k, (s, t) in want.items()
        if cells.get(k, {}).get("status") != s or not cells[k]["text"].startswith(t)
@@ -259,8 +277,19 @@ PY
   python3 -c '
 import json, sys
 c = {x["dir"].split("/")[-1]: x for x in json.load(open(sys.argv[1]))["cells"]}
-ok = c["main-claude-cli"]["status"] == "expected" and c["floor-claude-cli"]["status"] == "expected"
+ok = (c["main-claude-cli"]["status"] == "expected" and c["floor-claude-cli"]["status"] == "expected"
+      and c["src-claude-cli"]["status"] == "expected" and c["latest-claude-cli"]["status"] == "unexpected")
 print("self-test CLI_AUDIENCE_FIXED_IN:", "PASS" if ok else "FAIL"); sys.exit(0 if ok else 1)' "$d/matrix.json" || st=1
+  CLI_AUDIENCE_FIXED_IN=main render "$d"
+  python3 -c '
+import json, sys
+c = {x["dir"].split("/")[-1]: x for x in json.load(open(sys.argv[1]))["cells"]}
+# main: the source-built cell passes as expected; the npm cells keep their expected failure, and
+# an npm claude-cli PASS (main-claude-cli is an npm fixture) is still unexpected.
+ok = (c["src-claude-cli"]["status"] == "expected" and c["floor-claude-cli"]["status"] == "expected"
+      and c["main-claude-cli"]["status"] == "unexpected")
+print("self-test CLI_AUDIENCE_FIXED_IN=main:", "PASS" if ok else "FAIL"); sys.exit(0 if ok else 1)' "$d/matrix.json" || st=1
+  grep -q "fixed on upstream main, in no release yet" "$d/MATRIX.md" || { echo "self-test FIXED_IN=main text: FAIL"; st=1; }
   python3 -c 'import json,sys; json.dump({"runtimes": ["embedded", "claude-cli"], "hostLabels": {k: k for k in ("floor", "latest", "main", "ghost")}}, open(sys.argv[1], "w"))' "$d/run.json"
   render "$d"; [ $? = 1 ] || st=1
   python3 -c '
@@ -273,7 +302,7 @@ print("self-test missing cells:", "PASS" if ok else "FAIL " + str(m["missing"]))
 import re, sys
 top = open(sys.argv[1]).read().split("## Cells")[0].splitlines()
 rows = [l.split(" | ")[0][2:] for l in top if re.match(r"\| [a-z]+ \| ", l)]
-want = ["floor", "latest", "main", "ghost", "lie", "oddskip", "short", "trunc"]
+want = ["floor", "latest", "main", "ghost", "gmet", "gone", "lie", "oddskip", "short", "src", "trunc"]
 print("self-test host order:", "PASS" if rows == want else "FAIL " + str(rows)); sys.exit(0 if rows == want else 1)' "$d/MATRIX.md" || st=1
   # Only partial cells left: exit 3, or 0 when the matrix itself ran with --setup-only.
   rm -rf "$d/cells" "$d/exits.tsv"; mkdir -p "$d/cells/main-embedded"

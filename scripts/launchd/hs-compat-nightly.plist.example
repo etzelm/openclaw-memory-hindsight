@@ -4,6 +4,14 @@
   Nightly compatibility matrix for @etzelm/openclaw-memory-hindsight (see docs/compat-matrix.md).
   A per-user LaunchAgent: install it for the account that owns the Hindsight token and the
   claude CLI login. Replace every __PLACEHOLDER__ before loading.
+
+  The job starts through node (__NODE__, the real path of a node binary with Full Disk Access),
+  which runs bash with the script and forwards SIGTERM. A LaunchAgent that runs /bin/bash itself
+  gets no access to an external volume (WORK_ROOT on an external SSD) once it is bootstrapped
+  from cron after a reboot. Without that need, /bin/bash can be the first argument instead.
+
+  StartInterval 60 with a gate on the hour and a stamp file, not StartCalendarInterval: a
+  LaunchAgent in a user/<uid> Background domain does not fire calendar schedules.
 -->
 <plist version="1.0">
 <dict>
@@ -11,7 +19,12 @@
   <string>com.etzelm.hs-compat-nightly</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
+    <string>__NODE__</string>
+    <string>-e</string>
+    <string>const c=require("child_process").spawn("/bin/bash",process.argv.slice(1),{stdio:"inherit"});for(const s of ["SIGTERM","SIGINT","SIGHUP"])process.on(s,()=>c.kill(s));c.on("exit",(code,sig)=>process.exit(code??(sig?1:0)))</string>
+    <string>--</string>
+    <string>-c</string>
+    <string>s="$GATE_STAMP"; d=$(date +%F); [ "$(date +%H)" = "$GATE_HOUR" ] &amp;&amp; [ "$(cat "$s" 2&gt;/dev/null)" != "$d" ] || exit 0; echo "$d" &gt; "$s"; exec /bin/bash "$0"</string>
     <string>__HOME__/Library/Application Support/hs-compat/compat-nightly.sh</string>
   </array>
   <key>EnvironmentVariables</key>
@@ -20,22 +33,25 @@
     <string>__NODE_BIN__:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
     <string>__HOME__</string>
+    <key>GATE_HOUR</key>
+    <string>03</string>
+    <key>GATE_STAMP</key>
+    <string>__HOME__/Library/Application Support/hs-compat/last-run</string>
     <key>HS_COMPAT_REPO</key>
     <string>__REPO_URL__</string>
     <key>HS_COMPAT_REF</key>
-    <string>develop</string>
+    <string>latest-release</string>
     <key>HS_COMPAT_RESULTS</key>
     <string>__RESULTS_DEST__</string>
+    <key>HS_COMPAT_STATUS_FILE</key>
+    <string>__STATUS_FILE__</string>
+    <key>CLI_AUDIENCE_FIXED_IN</key>
+    <string>__CLI_AUDIENCE_FIXED_IN__</string>
     <key>HS_COMPAT_ARGS</key>
     <string>--token-env-file __HINDSIGHT_ENV_FILE__ --anthropic-env-file __ANTHROPIC_ENV_FILE__</string>
   </dict>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>3</integer>
-    <key>Minute</key>
-    <integer>30</integer>
-  </dict>
+  <key>StartInterval</key>
+  <integer>60</integer>
   <!-- Aqua: gui/<uid> domain (logged-in account). Background: user/<uid> domain (no GUI session). -->
   <key>LimitLoadToSessionType</key>
   <array>

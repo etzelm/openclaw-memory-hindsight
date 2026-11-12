@@ -85,3 +85,52 @@ describe("missing bank vs other 404s", () => {
     await expect(clientAnswering(404, body).getMemory("dev", "m9")).resolves.toBeNull();
   });
 });
+
+/** A response whose body stream fails mid-read (the request was aborted, or the socket died). */
+function failingBodyResponse(status: number, failure: unknown) {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"detail":'));
+    },
+    pull(controller) {
+      controller.error(failure);
+    },
+  });
+  return new Response(body, { status });
+}
+
+describe("error bodies", () => {
+  it("does not read a 404 whose body read failed as a missing bank", async () => {
+    const aborted = new DOMException("This operation was aborted", "AbortError");
+    const client = new HindsightClient({
+      resolveEndpoint: () => ({ apiUrl: "http://hindsight.test" }),
+      fetch: async () => failingBodyResponse(404, aborted),
+    });
+    const error = await client.recall("fresh", "q", { budget: "low" }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(error).toBeDefined();
+    expect(isBankNotFound(error)).toBe(false);
+    // The abort stays visible as an abort.
+    expect((error as { name?: unknown }).name).toBe("AbortError");
+  });
+
+  it("cancels the body of a non-404 error so the connection is released", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new TextEncoder().encode("x".repeat(1024)));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const client = new HindsightClient({
+      resolveEndpoint: () => ({ apiUrl: "http://hindsight.test" }),
+      fetch: async () => new Response(body, { status: 503 }),
+    });
+    await expect(client.recall("dev", "q", { budget: "low" })).rejects.toThrow(/HTTP 503/);
+    expect(cancelled).toBe(true);
+  });
+});

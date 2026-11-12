@@ -500,7 +500,7 @@ GW_TOKEN=$(openssl rand -hex 24)
 ( umask 077; printf '%s' "$GW_TOKEN" > "$L/gw-token"; printf 'Authorization: Bearer %s\n' "$GW_TOKEN" > "$L/gw-auth.hdr" )
 export OPENCLAW_GATEWAY_TOKEN="$GW_TOKEN"
 export AUDIENCE_PROBE_LOG="$L/probe/probe.jsonl" AUDIENCE_PROBE_HS="$HS" AUDIENCE_PROBE_CODE="$CODE"
-export AUDIENCE_PROBE_QUERY="launch code word" AUDIENCE_PROBE_DELAY_MS="$DELAY_MS"
+export AUDIENCE_PROBE_QUERY="boat name" AUDIENCE_PROBE_DELAY_MS="$DELAY_MS"
 CONF=$OPENCLAW_CONFIG_PATH
 
 L="$L" PORT="$PORT" TOKEN="$GW_TOKEN" MODEL="$MODEL" TOKF="$TOKF" python3 - <<'PY'
@@ -626,7 +626,7 @@ import { appendFileSync } from "node:fs";
 const LOG = process.env.AUDIENCE_PROBE_LOG;
 const HS = new URL(process.env.AUDIENCE_PROBE_HS || "http://localhost:8888");
 const CODE = process.env.AUDIENCE_PROBE_CODE || "";
-const QUERY = process.env.AUDIENCE_PROBE_QUERY || "launch code word";
+const QUERY = process.env.AUDIENCE_PROBE_QUERY || "boat name";
 const DELAY = Number(process.env.AUDIENCE_PROBE_DELAY_MS || 15000);
 const als = new AsyncLocalStorage();
 const msg = (e) => (e instanceof Error ? e.message : String(e));
@@ -669,6 +669,11 @@ function guardState(fn) {
   }
 }
 
+// Imported once, during register: a host that closes the plugin's invocation scope after a run
+// refuses a later import() with "Plugin invocation scope is closed" before the provider is reached.
+let sdkModule;
+const loadSdk = () => (sdkModule ??= import("openclaw/plugin-sdk/memory-host-search"));
+
 async function providerOp(api, op, p) {
   await als.run({ op }, async () => {
     const rec = {
@@ -685,7 +690,7 @@ async function providerOp(api, op, p) {
     };
     let sdk;
     try {
-      sdk = await import("openclaw/plugin-sdk/memory-host-search");
+      sdk = await loadSdk();
     } catch (error) {
       log({ ...rec, outcome: "sdk-import-failed", error: msg(error) });
       return;
@@ -736,6 +741,7 @@ export default {
     jsonSchema: { type: "object", additionalProperties: false, properties: {} },
   },
   register(api) {
+    loadSdk().catch(() => {});
     traceHindsightIo();
     api.registerService({
       id: "audience-probe",
@@ -966,7 +972,9 @@ sys.exit(0 if j.get("total_documents", 0) >= 1 and j.get("pending_operations", 1
   done
   echo "bank_not_ready=$1"; return 1
 }
-QUESTION="What is my launch code word? Answer with just the code word, or say you do not know."
+# The fact must not read as a secret: Hindsight's retain LLM may store "the user has a launch
+# code word" without its value, and then no search can return the code.
+QUESTION="What is my boat's name? Answer with just the name, or say you do not know."
 
 if [ "$TURNS" = 1 ]; then
   KEY_A=$(call sessions.create '{"agentId":"main"}' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("key",""))' 2>/dev/null)
@@ -976,7 +984,7 @@ if [ "$TURNS" = 1 ]; then
   s0=$(skipped)
   mark turn1_start
   with_timeout 600 "${OC[@]}" agent --session-key "$KEY_A" --json \
-    --message "Please remember this for later: my launch city is Lisbon and my launch code word is $CODE. Reply with one short sentence." \
+    --message "Please remember this for later: my home city is Lisbon and my boat is named $CODE. Reply with one short sentence." \
     > "$L/turn1.out" 2>&1
   e1=$?; echo "agent_exit=$e1"
   mark turn1_end
@@ -1090,7 +1098,7 @@ redact < "$OUT/documents.json" > "$OUT/documents.json.tmp" && mv "$OUT/documents
 cat "$OUT/documents.md"
 
 # ---- checks ---------------------------------------------------------------------------------
-OWNER_KEY="$(printf '%s' "${KEY_A:-}" | redact)" OUT="$OUT" BANK="$BANK" CODE="$CODE" TURNS="$TURNS" SKIP_REASON="$SKIP_REASON" MODEL="$MODEL" \
+OWNER_KEY="$(printf '%s' "${KEY_A:-}" | redact)" CONV_KEY="$(printf '%s' "${KEY_B:-}" | redact)" OUT="$OUT" BANK="$BANK" CODE="$CODE" TURNS="$TURNS" SKIP_REASON="$SKIP_REASON" MODEL="$MODEL" \
 RUNTIME="$RUNTIME" python3 - <<'PY' >> "$CHECKS"
 import json, os, re
 e = os.environ
@@ -1193,11 +1201,21 @@ else:
         bool(s2) and all(o["outcome"] == "searched" and o.get("hitsContainCode") for o in s2)
         and bool(s2io) and all(x["bank"] == BANK for x in s2io))
 
-    ch = [h for h in hooks if win("conv_start", None)(h)]
-    row(*T["B1"][:3], sorted({f"{h['hook']}={h['audienceKind']}/{h['guard'].split(':')[0]}" for h in ch}),
+    # Only the chat.send session: host heartbeat or main-session turns can run in the same window
+    # with a conversation audience of their own and are not this turn.
+    lab = lambda h: f"{h['hook']}={h['audienceKind']}/{h['guard'].split(':')[0]}"
+    cw = [h for h in hooks if win("conv_start", None)(h)]
+    ch = [h for h in cw if h.get("session") == e["CONV_KEY"]]
+    other = [h for h in cw if h.get("session") != e["CONV_KEY"]]
+    # Keep the literal None/absent text first: compat-matrix.sh matches it in this column.
+    row(*T["B1"][:3], f"{sorted({lab(h) for h in ch})}; other sessions: {len(other)} hooks {sorted({lab(h) for h in other})}",
         bool(ch) and all(h["audienceKind"] == "conversation" and h["guard"] == "current" for h in ch))
     hist = read("conv.history")
-    cs = [o for o in ops if o["op"] == "self-search:conversation"]
+    # The chat.send session must search successfully. A code hit from any session's conversation
+    # audience is still a leak, so the leak test is not scoped.
+    cs_all = [o for o in ops if o["op"] == "self-search:conversation"]
+    cs = [o for o in cs_all if o.get("presentedSession") == e["CONV_KEY"]]
+    leak = [o for o in cs_all if o.get("hitsContainCode")]
     wsc = [l for l in read("workspace-code.txt").splitlines() if l.strip()]
     # Paths around Hindsight that tools.deny removes. If a host renames a tool group they come
     # back, and B2 must say so instead of reading like a plugin leak.
@@ -1232,8 +1250,9 @@ else:
     used = sorted(set(re.findall(r'"type":\s*"toolCall"[^{}]*?"name":\s*"([^"]+)"', hist)) & BYPASS)
     row(*T["B2"][:3],
         f"history_has_code={CODE in hist}; self-search={[(o['outcome'], o.get('hits'), o.get('hitsContainCode')) for o in cs]}; "
+        f"other sessions={[(o.get('presentedSession'), o['outcome'], o.get('hitsContainCode')) for o in cs_all if o not in cs]}; "
         f"workspace files with code={wsc}; bypass tools offered={off}, used in conversation={used}",
-        bool(hist) and CODE not in hist and bool(cs) and all(o["outcome"] == "searched" and not o.get("hitsContainCode") for o in cs)
+        bool(hist) and CODE not in hist and bool(cs) and all(o["outcome"] == "searched" for o in cs) and not leak
         and not wsc and on is not None and not off and not used)
     cio = [x for x in io if win("conv_start", None)(x) and x["bank"]
            and x["op"] != "released-check" and not str(x["op"]).startswith("released:")]

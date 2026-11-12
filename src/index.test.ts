@@ -546,6 +546,44 @@ describe("auto-retain across one run's agent_end calls", () => {
     expect(posts[1]!.texts.slice(0, 2)).toEqual([ask.content, reply.content]);
   });
 
+  it("keeps the next run's start when the previous run's agent_end arrives late", async () => {
+    // The host does not await agent_end, so run-1's handler can run after run-2 started.
+    const { fake, hook } = setup();
+    const next = { role: "user", content: "what was the code word?" };
+    const answer = { role: "assistant", content: "heron" };
+    await hook("before_prompt_build")(
+      { prompt: ask.content, currentUserMessage: ask.content, messages: [...prior, ask] },
+      ctxFor("run-1"),
+    );
+    await hook("before_prompt_build")(
+      {
+        prompt: next.content,
+        currentUserMessage: next.content,
+        messages: [...prior, ask, reply, next],
+      },
+      ctxFor("run-2"),
+    );
+    await hook("agent_end")(
+      { success: true, runId: "run-1", messages: [...prior, ask, reply] },
+      ctxFor("run-1"),
+    );
+    // run-2 continues in-run (two user messages), so a lost start shows in its document.
+    await hook("agent_end")(
+      {
+        success: true,
+        runId: "run-2",
+        messages: [...prior, ask, reply, next, answer, { role: "user", content: resume }, resumed],
+      },
+      ctxFor("run-2"),
+    );
+    const posts = retained(fake.requests);
+    const byRun = new Map(posts.map((p) => [p.documentId.split(":run:")[1], p.texts]));
+    // run-1 never reads run-2's start (that would leave it nothing to retain).
+    expect(byRun.get("run-1")).toEqual([ask.content, reply.content]);
+    // run-2 still has its own start.
+    expect(byRun.get("run-2")).toEqual([next.content, answer.content, resume, resumed.content]);
+  });
+
   it("drops the run start when the session ends", async () => {
     const { fake, hook } = setup();
     await firstAttempt(hook);
@@ -1389,5 +1427,40 @@ describe("auto-recall cache and follow-ups", () => {
       "[Inter-session message] sourceSession=agent:dev:subagent:1 isUser=false\nThis content was routed by OpenClaw from another session.";
     await expect(run(recallEv(banner), recallCtx())).resolves.toBeUndefined();
     expect(recalls()).toHaveLength(0);
+  });
+});
+
+const cacheRecalls = (fake: ReturnType<typeof createFakeHindsight>) =>
+  fake.requests.filter((r) => r.url.endsWith("/memories/recall"));
+const retainToolFrom = (registerTool: ReturnType<typeof vi.fn<AnyFn>>, ctx: unknown) => {
+  const factory = registerTool.mock.calls.find(([, opts]) => opts.name === "hindsight_retain")?.[0];
+  return factory!(ctx)!;
+};
+const toolCtx = (sessionKey: string) => ({
+  agentId: "dev",
+  sessionKey,
+  memoryAudience: OWNER,
+  assertMemoryAudienceCurrent: () => undefined,
+});
+
+describe("recall cache and same-session retains", () => {
+  const ask = recallEv("where does hindsight run?");
+
+  it("recalls fresh after hindsight_retain in the same session, still cached for another", async () => {
+    const { fake, hook, registerTool } = setup({ recallCacheTtlMs: 60_000 });
+    const run = hook("before_prompt_build")!;
+    await run(ask, recallCtx());
+    await run(ask, recallCtx("agent:dev:other"));
+    await run(ask, recallCtx());
+    expect(cacheRecalls(fake)).toHaveLength(2);
+    await retainToolFrom(registerTool, toolCtx("agent:dev:main")).execute("c1", {
+      content: "Hindsight moved to the NAS",
+    });
+    // The same session's next turn does not reuse results from before its own retain.
+    await run(ask, recallCtx());
+    expect(cacheRecalls(fake)).toHaveLength(3);
+    // Another session's entry is untouched.
+    await run(ask, recallCtx("agent:dev:other"));
+    expect(cacheRecalls(fake)).toHaveLength(3);
   });
 });
