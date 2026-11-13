@@ -1,30 +1,52 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import { defaultRuntime } from "openclaw/plugin-sdk/runtime";
 import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { HindsightClient, HindsightHttpError, isBankNotFound } from "./client.js";
+import { type CommandLike, registerAdminCommands } from "./cli-admin.js";
+import { registerSidecarCommands } from "./cli-sidecar.js";
 import {
+  HindsightClient,
+  HindsightHttpError,
+  type HindsightRecallResult,
+  isBankNotFound,
+} from "./client.js";
+import {
+  autoRecallRequest,
+  configForAgent,
   type HindsightConfig,
   hindsightConfigSchema,
   PLUGIN_ID,
+  RECALL_TYPES,
+  type RecallType,
   readPluginConfigEntry,
 } from "./config.js";
 import { sessionDocumentPrefix } from "./document-ids.js";
-import { type QueuedRetain, readQueueFile, retainQueuePath } from "./retain-queue.js";
+import {
+  appendQueueTombstone,
+  type QueuedRetain,
+  readQueueFile,
+  retainQueuePath,
+} from "./retain-queue.js";
 import { conversationBankId, ownerBankId } from "./routing.js";
+import { memorySlotIsSet, resolveSlotRole, slotDoctorLine } from "./slot-mode.js";
+import { extractRecallQuery } from "./transcript.js";
 
 /**
- * `openclaw hindsight status | doctor | forget`. Runs in the CLI process, not the Gateway: it reads
+ * `openclaw hindsight status | doctor | recall | queue | forget | directives | memory | consolidate`. Runs in the CLI process, not the Gateway: it reads
  * the plugin's config from the host's config snapshot, talks to Hindsight directly, and only reads
- * the Gateway's retain queue file (the Gateway owns it). Output never carries the token.
+ * the Gateway's retain queue file (the Gateway owns it; `queue --drop` only appends a tombstone
+ * line, which the Gateway's queue honors). Output never carries the token.
  */
 
 export const CLI_COMMAND = "hindsight";
 export const CLI_DESCRIPTOR = {
   name: CLI_COMMAND,
-  description: "Inspect and maintain Hindsight memory (status, doctor, forget)",
+  description:
+    "Inspect and maintain Hindsight memory (status, doctor, recall, queue, forget, directives, memory, consolidate, export, sync-memory-files)",
   hasSubcommands: true,
 } as const;
 /** Hindsight version this release was tested against. */
@@ -57,6 +79,19 @@ function defaultCliRuntime(): CliRuntime {
   };
 }
 
+/** True when this build's manifest declares kind memory (the kind-less test build does not). */
+export function manifestHasMemoryKind(): boolean {
+  try {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ) as { kind?: unknown };
+    const kind = manifest.kind;
+    return kind === "memory" || (Array.isArray(kind) && kind.includes("memory"));
+  } catch {
+    return true;
+  }
+}
+
 function packageInfo(): { name: string; version: string } {
   try {
     const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -70,6 +105,11 @@ function packageInfo(): { name: string; version: string } {
   } catch {
     return { name: "@etzelm/openclaw-memory-hindsight", version: "unknown" };
   }
+}
+
+/** Short stable id of a queued item (bank and document id), for `queue --drop`. */
+export function queueItemId(bankId: string, documentId: string): string {
+  return createHash("sha256").update(`${bankId}\n${documentId}`).digest("hex").slice(0, 12);
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
@@ -106,7 +146,7 @@ const byBank = (entries: QueuedRetain[]) => {
 
 export function registerHindsightCli(
   api: OpenClawPluginApi,
-  deps: { runtime?: CliRuntime } = {},
+  deps: { runtime?: CliRuntime; hasMemoryKind?: () => boolean } = {},
 ): void {
   const runtime = (): CliRuntime => deps.runtime ?? defaultCliRuntime();
   const hostConfig = (): unknown => {
@@ -133,6 +173,10 @@ export function registerHindsightCli(
       } catch (error) {
         const code = (error as { code?: unknown }).code;
         return { error: `cannot read --token-file (${typeof code === "string" ? code : "error"})` };
+      }
+      if (!token) {
+        // An empty token means "no token": the requests would go out unauthenticated.
+        return { error: "--token-file is empty" };
       }
       raw = { ...asOptionalRecord(raw), hindsightApiToken: token };
     }
@@ -175,6 +219,11 @@ export function registerHindsightCli(
     const queue = queueEntries();
     const pkg = packageInfo();
     const counts = byBank(queue.entries);
+    const role = resolveSlotRole({
+      mode: config.slotMode,
+      hostConfig: hostConfig(),
+      pluginId: PLUGIN_ID,
+    }).role;
     if (opts.json) {
       io.log(
         JSON.stringify(
@@ -185,6 +234,7 @@ export function registerHindsightCli(
             reachable,
             serverVersion: serverVersion ?? null,
             memorySlot: memorySlot() ?? null,
+            slotRole: role,
             memoryMode: config.memoryMode,
             autoRecall: config.autoRecall,
             autoRetain: config.autoRetain,
@@ -202,7 +252,7 @@ export function registerHindsightCli(
       io.log(
         `Hindsight: ${config.apiUrl} (${reachable ? `reachable, API ${serverVersion ?? "version unknown"}` : "unreachable"})`,
       );
-      io.log(`Memory slot: ${memorySlot() ?? "(not set)"}`);
+      io.log(`Memory slot: ${memorySlot() ?? "(not set)"} (this plugin: ${role})`);
       io.log(
         `Mode: ${config.memoryMode} (auto-recall ${config.autoRecall ? "on" : "off"}, auto-retain ${config.autoRetain ? "on" : "off"})`,
       );
@@ -240,17 +290,36 @@ export function registerHindsightCli(
     }
     const { config } = parsed;
     report("PASS", "config", `valid (${config.apiUrl}, mode ${config.memoryMode})`);
-    const slot = memorySlot();
-    if (slot === PLUGIN_ID) {
-      report("PASS", "memory slot", `${PLUGIN_ID} owns plugins.slots.memory`);
+    // Replace or sidecar (slot-mode.ts): a sidecar beside memory-core is a supported setup.
+    const slotRole = resolveSlotRole({
+      mode: config.slotMode,
+      hostConfig: hostConfig(),
+      pluginId: PLUGIN_ID,
+    });
+    const slotLine = slotDoctorLine(slotRole, PLUGIN_ID);
+    if (
+      slotRole.role === "owner" &&
+      memorySlotIsSet(hostConfig()) &&
+      !(deps.hasMemoryKind ?? manifestHasMemoryKind)()
+    ) {
+      report(
+        "FAIL",
+        "memory slot",
+        "this build has no manifest kind memory, so the host refuses its memory runtime while plugins.slots.memory names it",
+        "install the regular package, or: openclaw config set plugins.slots.memory memory-core",
+      );
     } else {
       report(
-        "WARN",
+        slotLine.status,
         "memory slot",
-        slot
-          ? `${slot} owns plugins.slots.memory, so this plugin's provider runtime is not used`
-          : "plugins.slots.memory is not set",
-        `openclaw config set plugins.slots.memory ${PLUGIN_ID}`,
+        slotLine.text.replace(/^memory slot: /, ""),
+        ...(slotLine.status === "FAIL"
+          ? [
+              config.slotMode === "replace"
+                ? `openclaw config set plugins.slots.memory ${PLUGIN_ID}`
+                : "openclaw config set plugins.slots.memory memory-core",
+            ]
+          : []),
       );
     }
     const raw = asOptionalRecord(rawPluginConfig());
@@ -352,16 +421,23 @@ export function registerHindsightCli(
       return;
     }
     const { config } = parsed;
+    const bankOpt = opts.bank === undefined ? undefined : opts.bank.trim();
+    if (bankOpt !== undefined && (!bankOpt || bankOpt === "." || bankOpt === "..")) {
+      // As in agentBankMap: "." and ".." would collapse the request path.
+      io.error('forget: --bank must be a bank id (not empty, "." or "..")');
+      io.exit(1);
+      return;
+    }
     const agent = opts.agent?.trim() || /^agent:([^:]+):/.exec(session)?.[1];
-    if (!opts.bank && !agent) {
+    if (!bankOpt && !agent) {
       io.error(
         "forget: cannot tell the agent from this session key; pass --agent <id> or --bank <id>",
       );
       io.exit(1);
       return;
     }
-    const banks = opts.bank
-      ? [opts.bank]
+    const banks = bankOpt
+      ? [bankOpt]
       : [
           ...new Set([
             ownerBankId(agent!, config.agentBankMap),
@@ -370,7 +446,15 @@ export function registerHindsightCli(
         ];
     const prefix = sessionDocumentPrefix(session);
     // A queued copy would be sent again after the delete and bring the text back.
-    const queued = queueEntries().entries.filter(
+    const queue = queueEntries();
+    if (queue.error) {
+      io.error(
+        `forget: cannot read the retain queue (${queue.error}); a queued copy could bring the text back after the delete, so nothing was deleted; check with openclaw hindsight doctor`,
+      );
+      io.exit(1);
+      return;
+    }
+    const queued = queue.entries.filter(
       (e) => banks.includes(e.bankId) && e.documentId.startsWith(prefix),
     );
     if (queued.length > 0) {
@@ -405,6 +489,11 @@ export function registerHindsightCli(
           }
           if (items.length < LIST_PAGE) {
             break;
+          }
+          if (page === MAX_LIST_PAGES - 1) {
+            io.error(
+              `forget: stopped listing ${bank} after ${MAX_LIST_PAGES * LIST_PAGE} documents; run forget again after this one to find the rest`,
+            );
           }
         }
       }
@@ -459,6 +548,174 @@ export function registerHindsightCli(
     }
   }
 
+  /** `recall <query>`: the request auto-recall would send for an agent, and what it would inject. */
+  async function recall(
+    queryArg: unknown,
+    opts: { agent?: string; bank?: string; types?: string; json?: boolean; tokenFile?: string },
+  ) {
+    const io = runtime();
+    const fail = (message: string) => {
+      io.error(`recall: ${message}`);
+      io.exit(1);
+    };
+    const query = typeof queryArg === "string" ? queryArg.trim() : "";
+    if (!query) {
+      fail("a query is required");
+      return;
+    }
+    let types: RecallType[] | undefined;
+    if (opts.types !== undefined) {
+      const names = opts.types
+        .split(",")
+        .map((name) => name.trim())
+        .filter(Boolean);
+      const parsedTypes = names.map((name) => RECALL_TYPES.find((type) => type === name));
+      if (names.length === 0 || parsedTypes.some((type) => type === undefined)) {
+        fail(`--types must be a comma list of ${RECALL_TYPES.join(", ")}`);
+        return;
+      }
+      types = [...new Set(parsedTypes as RecallType[])];
+    }
+    const bankOpt = opts.bank === undefined ? undefined : opts.bank.trim();
+    if (bankOpt !== undefined && (!bankOpt || bankOpt === "." || bankOpt === "..")) {
+      fail('--bank must be a bank id (not empty, "." or "..")');
+      return;
+    }
+    const parsed = parseConfig(opts.tokenFile);
+    if ("error" in parsed) {
+      fail(`config invalid (${parsed.error}); run openclaw hindsight doctor`);
+      return;
+    }
+    const agent = normalizeAgentId(opts.agent?.trim() || "main");
+    const agentConfig = configForAgent(parsed.config, agent);
+    const config = types ? { ...agentConfig, recallTypes: types } : agentConfig;
+    const bank = bankOpt ?? ownerBankId(agent, config.agentBankMap);
+    const sent = extractRecallQuery(query, query, config.recallQueryShaping) || query;
+    const request = autoRecallRequest(config, sent);
+    let results: HindsightRecallResult[];
+    try {
+      results = await clientFor(config).recall(bank, sent, {
+        ...request.options,
+        signal: AbortSignal.timeout(config.recallTimeoutMs),
+      });
+    } catch (error) {
+      if (!isBankNotFound(error)) {
+        fail(`Hindsight request failed: ${formatErrorMessage(error)}`);
+        return;
+      }
+      results = [];
+    }
+    const injected = config.recallTopK
+      ? Math.min(config.recallTopK, results.length)
+      : results.length;
+    if (opts.json) {
+      io.log(
+        JSON.stringify(
+          {
+            bank,
+            agent,
+            injected,
+            results: results.map((r) => ({
+              id: r.id,
+              type: r.type ?? null,
+              score: r.scores?.final ?? null,
+              text: r.text,
+            })),
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+    const off = config.autoRecall ? "" : " (auto-recall is off for this agent)";
+    if (results.length === 0) {
+      io.log(`Bank: ${bank} (agent ${agent}); no memories${off}`);
+      return;
+    }
+    const cap = config.recallTopK ? ` (recallTopK ${config.recallTopK})` : "";
+    io.log(
+      `Bank: ${bank} (agent ${agent}); ${plural(results.length, "result")}, auto-recall would inject ${injected}${cap}${off}`,
+    );
+    results.forEach((r, i) => {
+      const score = typeof r.scores?.final === "number" ? r.scores.final.toFixed(3) : "-";
+      const line = `${i + 1}. [${r.type ?? "?"}] score ${score}  ${r.text.replace(/\s+/g, " ").trim()}`;
+      io.log(i < injected ? line : `   (not injected) ${line}`);
+    });
+  }
+
+  /** `queue --list | --drop <id>`: the Gateway's retain queue, never with memory text. */
+  async function queueCommand(opts: { list?: boolean; drop?: string; yes?: boolean }) {
+    const io = runtime();
+    const fail = (message: string) => {
+      io.error(`queue: ${message}`);
+      io.exit(1);
+    };
+    const drop = opts.drop?.trim();
+    if (Boolean(opts.list) === Boolean(drop)) {
+      fail("pass --list, or --drop <id>");
+      return;
+    }
+    const stateDir = api.runtime?.state?.resolveStateDir?.();
+    const read = queueEntries();
+    if (!stateDir || read.error) {
+      fail(`cannot read the retain queue (${read.error ?? "the host gave no state dir"})`);
+      return;
+    }
+    if (opts.list) {
+      if (read.entries.length === 0) {
+        io.log("Retain queue: empty");
+        return;
+      }
+      io.log(`Retain queue: ${plural(read.entries.length, "item")}`);
+      for (const e of read.entries) {
+        io.log(
+          `${queueItemId(e.bankId, e.documentId)}  ${e.bankId}  ${e.documentId}  queued ${new Date(e.queuedAt).toISOString()}  ${Buffer.byteLength(JSON.stringify(e), "utf8")} bytes`,
+        );
+      }
+      return;
+    }
+    const entry = read.entries.find((e) => queueItemId(e.bankId, e.documentId) === drop);
+    if (!entry) {
+      fail(`no queued item with id ${drop} (see openclaw hindsight queue --list)`);
+      return;
+    }
+    const what = `${drop} (${entry.bankId}, ${entry.documentId})`;
+    if (!opts.yes) {
+      if (!io.isTTY) {
+        fail("not a terminal: pass --yes to drop");
+        return;
+      }
+      if (!(await io.confirm(`Drop queued retain ${what}? It will not be sent. [y/N] `))) {
+        io.log("Nothing dropped.");
+        io.exit(1);
+        return;
+      }
+    }
+    const filePath = retainQueuePath(stateDir);
+    const still = () =>
+      readQueueFile(filePath).entries.some(
+        (e) => e.bankId === entry.bankId && e.documentId === entry.documentId,
+      );
+    try {
+      // A Gateway rewrite (atomic rename) at the same moment can lose the append; check, retry once.
+      for (let attempt = 0; attempt < 2 && still(); attempt++) {
+        appendQueueTombstone(filePath, entry);
+      }
+      if (still()) {
+        fail("the queue file changed during the drop; run the command again");
+        return;
+      }
+    } catch (error) {
+      fail(`could not write the retain queue (${formatErrorMessage(error)})`);
+      return;
+    }
+    io.log(`Dropped ${what}.`);
+    io.log(
+      "A running Gateway forgets it before its next replay step; a replay already sending it is not stopped.",
+    );
+  }
+
   if (typeof api.registerCli !== "function") {
     return;
   }
@@ -485,6 +742,32 @@ export function registerHindsightCli(
         )
         .action(async (opts: { tokenFile?: string }) => doctor(opts));
       root
+        .command("recall <query>")
+        .description(
+          "Run the recall auto-recall would send for an agent (read-only) and show what it would inject, with scores",
+        )
+        .option("--agent <id>", "Agent whose config and bank to use (default main)")
+        .option("--bank <id>", "Recall from this bank instead of the agent's owner bank")
+        .option(
+          "--types <list>",
+          "Comma list of world, experience, observation; replaces recallTypes",
+        )
+        .option("--json", "Print JSON")
+        .option(
+          "--token-file <path>",
+          "Read the Hindsight token from this file (for a SecretRef the CLI does not resolve)",
+        )
+        .action(async (query: unknown, opts: Parameters<typeof recall>[1]) => recall(query, opts));
+      root
+        .command("queue")
+        .description(
+          "List the Gateway's retain queue (no memory text), or drop one queued item so it is never sent",
+        )
+        .option("--list", "List queued items: id, bank, document id, time, size")
+        .option("--drop <id>", "Drop the item with this id (from --list)")
+        .option("--yes", "Drop without asking (needed outside a terminal)")
+        .action(async (opts: Parameters<typeof queueCommand>[0]) => queueCommand(opts));
+      root
         .command("forget")
         .description(
           "Delete a session's auto-retained documents (and their memory units) from Hindsight. Memories saved with hindsight_retain or the pre-compaction flush are not tied to a session and stay",
@@ -502,6 +785,19 @@ export function registerHindsightCli(
           "Read the Hindsight token from this file (for a SecretRef the CLI does not resolve)",
         )
         .action(async (opts: Parameters<typeof forget>[0]) => forget(opts));
+      // SAFETY: CommandLike names only Commander methods the host's program has.
+      registerAdminCommands(root as unknown as CommandLike, {
+        io: runtime,
+        parseConfig,
+        clientFor,
+      });
+      registerSidecarCommands(root as unknown as CommandLike, {
+        io: runtime,
+        parseConfig,
+        clientFor,
+        hostConfig,
+        stateDir: () => api.runtime?.state?.resolveStateDir?.(),
+      });
     },
     { descriptors: [CLI_DESCRIPTOR] },
   );

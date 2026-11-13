@@ -1112,3 +1112,175 @@ describe("RetainQueueRunner backoff after a failed final save (D1)", () => {
     expect(queue.hasUnsaved()).toBe(false);
   });
 });
+
+const unavailable = (retryAfterMs?: number) => {
+  const error = new HindsightHttpError("HTTP 503", 503);
+  if (retryAfterMs !== undefined) {
+    Object.assign(error, { retryAfterMs });
+  }
+  return error;
+};
+
+describe("RetainQueueRunner Retry-After on a 5xx (G1)", () => {
+  it("holds the bank for a 503's Retry-After, in turn and full passes, and retries when it ends", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    let down = true;
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      sent.push(e.documentId);
+      if (down) {
+        throw unavailable(3_000);
+      }
+    });
+    queue.enqueue(entry("dev", "a"));
+    await runner.flush();
+    expect(sent).toEqual(["a"]);
+    await runner.nudge();
+    await runner.nudge();
+    expect(sent).toEqual(["a"]);
+    down = false;
+    // Past the 1 s backoff, inside the 3 s Retry-After: no pass sends.
+    await vi.advanceTimersByTimeAsync(1_500);
+    await runner.flush();
+    expect(sent).toEqual(["a"]);
+    await vi.advanceTimersByTimeAsync(1_600);
+    expect(sent).toEqual(["a", "a"]);
+    expect(queue.size()).toBe(0);
+    runner.stop();
+  });
+
+  it("caps a 5xx Retry-After hold at the longest backoff", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    let down = true;
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      sent.push(e.documentId);
+      if (down) {
+        throw unavailable(3_600_000);
+      }
+    });
+    queue.enqueue(entry("dev", "a"));
+    await runner.flush();
+    down = false;
+    // maxDelayMs is 4 s in makeRunner.
+    await vi.advanceTimersByTimeAsync(4_100);
+    expect(sent).toEqual(["a", "a"]);
+    runner.stop();
+  });
+
+  it("a 5xx without Retry-After keeps the 0.8.0 behavior: no hold, a turn pass retries", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      sent.push(e.documentId);
+      throw unavailable();
+    });
+    queue.enqueue(entry("dev", "a"));
+    await runner.flush();
+    await runner.nudge();
+    expect(sent).toEqual(["a", "a"]);
+    runner.stop();
+  });
+});
+
+describe("RetainQueueRunner holds are per bank (G2)", () => {
+  it("a Retry-After hold on one bank does not delay another bank's backoff retry", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    let offline = true;
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      sent.push(`${e.bankId}/${e.documentId}`);
+      if (e.bankId === "a") {
+        throw rateLimited(3_600_000);
+      }
+      if (offline) {
+        throw new TypeError("fetch failed");
+      }
+    });
+    queue.enqueue(entry("a", "x"));
+    queue.enqueue(entry("b", "y"));
+    await runner.flush();
+    expect(sent).toEqual(["a/x", "b/y"]);
+    offline = false;
+    // Bank b has no hold: the timer retries it after the 1 s backoff, not after a's 4 s hold.
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(sent).toEqual(["a/x", "b/y", "b/y"]);
+    expect(queue.hasBank("b")).toBe(false);
+    expect(queue.hasBank("a")).toBe(true);
+    runner.stop();
+  });
+
+  it("a 503 Retry-After on one bank holds only that bank; the next pass delivers the others", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    let down = true;
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      sent.push(`${e.bankId}/${e.documentId}`);
+      if (e.bankId === "a" && down) {
+        throw unavailable(3_000);
+      }
+    });
+    queue.enqueue(entry("a", "x"));
+    queue.enqueue(entry("b", "y"));
+    await runner.flush();
+    // A 5xx still ends the pass (Hindsight may be down for everyone).
+    expect(sent).toEqual(["a/x"]);
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(sent).toEqual(["a/x", "b/y"]);
+    down = false;
+    await vi.advanceTimersByTimeAsync(2_100);
+    expect(sent).toEqual(["a/x", "b/y", "a/x"]);
+    expect(queue.size()).toBe(0);
+    runner.stop();
+  });
+});
+
+describe("RetainQueueRunner: a bank queued after a strict hold armed the timer (F2)", () => {
+  for (const [label, refusal] of [
+    ["a 429", () => rateLimited(3_600_000)],
+    ["a 503", () => unavailable(3_600_000)],
+  ] as const) {
+    it(`${label} Retry-After on bank a does not time the retry of bank b queued later`, async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      const sent: string[] = [];
+      const { queue, runner } = makeRunner(async (e) => {
+        sent.push(`${e.bankId}/${e.documentId}`);
+        if (e.bankId === "a") {
+          throw refusal();
+        }
+      });
+      queue.enqueue(entry("a", "x"));
+      await runner.flush();
+      expect(sent).toEqual(["a/x"]);
+      // The timer now waits for a's hold (4 s, the cap in makeRunner).
+      await vi.advanceTimersByTimeAsync(500);
+      // A live retain to b fails and is queued; the service asks for a pass after the backoff.
+      queue.enqueue(entry("b", "y"));
+      runner.schedule();
+      // The backoff is 2 s after one failed pass: b goes out then, a is still held.
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(sent).toEqual(["a/x", "b/y"]);
+      expect(queue.hasBank("b")).toBe(false);
+      // a is not retried before its hold ends (4 s), and is retried after it.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sent).toEqual(["a/x", "b/y"]);
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(sent).toEqual(["a/x", "b/y", "a/x"]);
+      runner.stop();
+    });
+  }
+
+  it("a later schedule() never moves an earlier timer back", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const sent: string[] = [];
+    const { queue, runner } = makeRunner(async (e) => {
+      sent.push(e.documentId);
+    });
+    queue.enqueue(entry("dev", "a"));
+    runner.schedule(1_000);
+    runner.schedule(3_000);
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(sent).toEqual(["a"]);
+    runner.stop();
+  });
+});

@@ -1,6 +1,7 @@
 import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { RECALL_QUERY_SHAPING_MODES, type RecallQueryShaping } from "./query-shaping.js";
+import { SLOT_MODES, type SlotMode } from "./slot-mode.js";
 
 /** The id normalizeAgentId falls back to for an id with no usable characters. */
 const DEFAULT_AGENT_ID = "main";
@@ -67,6 +68,26 @@ export type HindsightConfig = {
   retainQueueMaxAgeMs: number;
   /** Offer the read-only knowledge-base tools (tree, search, page). Off by default. */
   knowledgeReadTools: boolean;
+  /** Offer Active Memory protected private transcript recall (conversation-recall.ts). Off by default. */
+  privateTranscriptRecall: boolean;
+  /** Add the short static memory prompt section (promptBuilder). Off by default. */
+  memoryPromptSection: boolean;
+  /** List the owner bank's active global directives in the prompt section. Off by default. */
+  promptDirectives: boolean;
+  /** Replace memory-core (own plugins.slots.memory) or run beside it; auto follows the slot. */
+  slotMode: SlotMode;
+  /** Sidecar: skip auto-recall on turns Active Memory visibly recalls from Hindsight. Off by default. */
+  activeMemoryYield: boolean;
+  /** Sidecar: serve owner-bank hits to memory_search corpus=wiki|all. Off by default. */
+  corpusSupplement: boolean;
+  /** Session-key globs whose memory_search may read the owner bank through the supplement. */
+  corpusSupplementSessionPatterns: string[];
+  /** Retain MEMORY.md, USER.md and the memory/ notes into the owner bank on change. Off by default. */
+  memoryFileSync: boolean;
+  /** Agents whose workspace memory files are synced; empty = the default agent. */
+  memoryFileSyncAgents: string[];
+  /** How often the memory file sync scans for changes, in ms. */
+  memoryFileSyncIntervalMs: number;
   /** Per-session auto-recall cache lifetime in ms; 0 turns the cache and the follow-up rules off. */
   recallCacheTtlMs: number;
   /** A query of at most this many words (no URL or path) is a short follow-up; 0 = off. */
@@ -83,7 +104,30 @@ export type HindsightConfig = {
   recallHistoryPattern?: RegExp;
   /** Auto-recall request timeout in ms; a slow Hindsight then costs a turn at most this long. */
   recallTimeoutMs: number;
+  /** Start auto-recall at message_received and await it in before_prompt_build. Off by default. */
+  recallEarlyStart: boolean;
+  /** On an auto-recall timeout, inject the session's last block if younger than this (ms); 0 = off. */
+  recallStaleOnTimeout: number;
+  /** Send `include: {entities: null}` (default): no entity observations, which the plugin never reads. */
+  recallSkipEntities: boolean;
+  /** Normalized agent id -> auto-recall keys that replace the global ones on that agent's turns. */
+  agents: Readonly<Record<string, AgentOverrides>>;
 };
+
+/**
+ * The keys an `agents` entry may set. Bank selection is not among them: the bank stays with the
+ * memory audience. Each is read by the same function at the top level and per agent.
+ */
+export const AGENT_OVERRIDE_KEYS = [
+  "autoRecall",
+  "recallTimeoutMs",
+  "recallTopK",
+  "recallMinScore",
+  "recallQueryShaping",
+  "recallTypes",
+] as const;
+export type AgentOverrideKey = (typeof AGENT_OVERRIDE_KEYS)[number];
+export type AgentOverrides = Partial<Pick<HindsightConfig, AgentOverrideKey>>;
 
 export const MAX_RECALL_CACHE_TTL_MS = 3_600_000;
 export const MAX_RECALL_FOLLOWUP_WORDS = 100;
@@ -92,9 +136,15 @@ export const MAX_TAG_GROUPS = 32;
 export const MAX_TAG_GROUP_DEPTH = 8;
 export const MAX_RECALL_HISTORY_PATTERN_CHARS = 500;
 export const MIN_RECALL_TIMEOUT_MS = 250;
+export const MAX_RECALL_STALE_MS = 3_600_000;
 export const MAX_RECALL_TIMEOUT_MS = 30_000;
 
 export const DEFAULT_RETAIN_QUEUE_MAX_ITEMS = 500;
+export const DEFAULT_MEMORY_FILE_SYNC_INTERVAL_MS = 600_000;
+export const MIN_MEMORY_FILE_SYNC_INTERVAL_MS = 60_000;
+export const MAX_MEMORY_FILE_SYNC_INTERVAL_MS = 86_400_000;
+/** Default session-key globs for the corpus supplement: the agent's main session only. */
+export const DEFAULT_SUPPLEMENT_SESSION_PATTERNS: readonly string[] = ["agent:*:main"];
 export const MAX_RETAIN_QUEUE_MAX_ITEMS = 10_000;
 export const DEFAULT_RETAIN_QUEUE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -115,7 +165,7 @@ export const GET_TIMEOUT_MS = 10_000;
 export const RETAIN_SOURCE = "openclaw";
 export const MEMORY_ROLES = ["user", "assistant"] as const;
 
-const CONFIG_KEYS = [
+export const CONFIG_KEYS = [
   "hindsightApiUrl",
   "hindsightApiToken",
   "memoryMode",
@@ -138,6 +188,16 @@ const CONFIG_KEYS = [
   "retainQueueMaxItems",
   "retainQueueMaxAgeMs",
   "knowledgeReadTools",
+  "privateTranscriptRecall",
+  "memoryPromptSection",
+  "promptDirectives",
+  "slotMode",
+  "activeMemoryYield",
+  "corpusSupplement",
+  "corpusSupplementSessionPatterns",
+  "memoryFileSync",
+  "memoryFileSyncAgents",
+  "memoryFileSyncIntervalMs",
   // Deprecated in 0.6.0 and ignored: accepted so a config that still sets it keeps validating.
   "listToolsWithoutAudience",
   "recallCacheTtlMs",
@@ -148,6 +208,10 @@ const CONFIG_KEYS = [
   "recallTopK",
   "recallMinScore",
   "recallQueryShaping",
+  "agents",
+  "recallEarlyStart",
+  "recallStaleOnTimeout",
+  "recallSkipEntities",
 ] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -289,17 +353,113 @@ function readBankMap(cfg: Record<string, unknown>): Record<string, string> {
       throw new Error('agentBankMap bank ids must not be "." or ".."');
     }
     // Keys are normalized like agent ids, so `WB Dev` matches the agent `wb-dev`.
-    const key = normalizeAgentId(agentId);
-    if (key === DEFAULT_AGENT_ID && agentId.trim().toLowerCase() !== DEFAULT_AGENT_ID) {
-      // normalizeAgentId falls back to the default agent for an id with no usable characters.
-      throw new Error(`agentBankMap key ${JSON.stringify(agentId)} is not a valid agent id`);
-    }
+    const key = agentMapKey("agentBankMap", agentId);
     if (Object.hasOwn(map, key)) {
       throw new Error(`agentBankMap has more than one key for agent ${JSON.stringify(key)}`);
     }
     map[key] = bank;
   }
   return map;
+}
+
+/**
+ * One reader per override key, used for the top-level key and for each `agents` entry, so both
+ * accept the same values. Returns undefined for an optional key that is unset.
+ */
+const AGENT_KEY_READERS: {
+  [K in AgentOverrideKey]: (cfg: Record<string, unknown>) => HindsightConfig[K];
+} = {
+  autoRecall: (cfg) => readBool(cfg, "autoRecall", true),
+  recallTimeoutMs: (cfg) =>
+    readIntInRange(
+      cfg,
+      "recallTimeoutMs",
+      RECALL_TIMEOUT_MS,
+      MIN_RECALL_TIMEOUT_MS,
+      MAX_RECALL_TIMEOUT_MS,
+    ),
+  recallTopK: (cfg) =>
+    cfg.recallTopK === undefined
+      ? undefined
+      : readPositiveInt(cfg, "recallTopK", 1, MAX_RECALL_TOP_K),
+  recallMinScore: (cfg) => readOptionalUnitNumber(cfg, "recallMinScore"),
+  recallQueryShaping: (cfg) =>
+    readEnum(cfg, "recallQueryShaping", RECALL_QUERY_SHAPING_MODES, "off"),
+  recallTypes: (cfg) =>
+    readStringList(cfg, "recallTypes")?.map((entry): RecallType => {
+      const type = RECALL_TYPES.find((candidate) => candidate === entry);
+      if (!type) {
+        throw new Error(`recallTypes entries must be: ${RECALL_TYPES.join(", ")}`);
+      }
+      return type;
+    }),
+};
+
+/** Normalizes an agent id map key; refuses one that normalizeAgentId maps to the default agent. */
+function agentMapKey(mapName: string, agentId: string): string {
+  const key = normalizeAgentId(agentId);
+  if (key === DEFAULT_AGENT_ID && agentId.trim().toLowerCase() !== DEFAULT_AGENT_ID) {
+    // normalizeAgentId falls back to the default agent for an id with no usable characters.
+    throw new Error(`${mapName} key ${JSON.stringify(agentId)} is not a valid agent id`);
+  }
+  return key;
+}
+
+function readAgents(cfg: Record<string, unknown>): Record<string, AgentOverrides> {
+  // No prototype, so an agent id like `constructor` or `__proto__` is only ever an own key.
+  const map: Record<string, AgentOverrides> = Object.create(null) as Record<string, AgentOverrides>;
+  const value = cfg.agents;
+  if (value === undefined) {
+    return map;
+  }
+  if (!isRecord(value)) {
+    throw new Error("agents must be an object of agent id to auto-recall keys");
+  }
+  const allowed = new Set<string>(AGENT_OVERRIDE_KEYS);
+  for (const [agentId, entry] of Object.entries(value)) {
+    const path = `agents[${JSON.stringify(agentId)}]`;
+    if (!isRecord(entry)) {
+      throw new Error(`${path} must be an object`);
+    }
+    const key = agentMapKey("agents", agentId);
+    if (Object.hasOwn(map, key)) {
+      throw new Error(`agents has more than one key for agent ${JSON.stringify(key)}`);
+    }
+    const unknown = Object.keys(entry).filter((k) => !allowed.has(k));
+    if (unknown.length > 0) {
+      throw new Error(`${path} has unknown keys: ${unknown.join(", ")}`);
+    }
+    const overrides: Record<string, unknown> = {};
+    for (const name of AGENT_OVERRIDE_KEYS) {
+      if (entry[name] === undefined) {
+        continue;
+      }
+      try {
+        overrides[name] = AGENT_KEY_READERS[name](entry);
+      } catch (error) {
+        throw new Error(`${path}.${error instanceof Error ? error.message : String(error)}`, {
+          cause: error,
+        });
+      }
+    }
+    map[key] = overrides as AgentOverrides;
+  }
+  return map;
+}
+
+/**
+ * The config one agent's auto-recall runs with: the global config with that agent's `agents`
+ * entry laid over it. An agent without an entry (or no agent id) gets the config object itself.
+ */
+export function configForAgent(
+  config: HindsightConfig,
+  agentId: string | undefined,
+): HindsightConfig {
+  if (!agentId) {
+    return config;
+  }
+  const overrides = config.agents[normalizeAgentId(agentId)];
+  return overrides ? { ...config, ...overrides } : config;
 }
 
 function readGroupList(value: unknown, path: string, depth: number): RecallTagGroup[] {
@@ -390,6 +550,11 @@ function readHistoryPattern(
   if (typeof value !== "string") {
     throw new Error("recallHistoryPattern must be a string");
   }
+  if (!value.trim()) {
+    throw new Error(
+      "recallHistoryPattern must not be empty (it would match every query and turn recallTagGroups off)",
+    );
+  }
   if (value.length > MAX_RECALL_HISTORY_PATTERN_CHARS) {
     throw new Error(
       `recallHistoryPattern must be at most ${MAX_RECALL_HISTORY_PATTERN_CHARS} characters`,
@@ -401,21 +566,160 @@ function readHistoryPattern(
   } catch {
     throw new Error("recallHistoryPattern is not a valid regular expression");
   }
+  const refusal = historyPatternRefusal(value);
+  if (refusal) {
+    throw new Error(
+      `recallHistoryPattern: "${refusal.token}" at character ${refusal.at} is ${refusal.what}; ${HISTORY_PATTERN_GRAMMAR}`,
+    );
+  }
+  if (pattern.test("")) {
+    throw new Error(
+      "recallHistoryPattern matches the empty string, so it would match every query and turn recallTagGroups off (check for an empty | alternative)",
+    );
+  }
   if (!tagGroups) {
     throw new Error("recallHistoryPattern needs recallTagGroups (it only lifts that filter)");
   }
   return pattern;
 }
 
-/** The tag filter for one recall query: recallTagGroups, unless the query asks for history. */
+/** Where a recallHistoryPattern leaves the 0.9.0 grammar: the token, its 1-based position, why. */
+export interface HistoryPatternRefusal {
+  token: string;
+  at: number;
+  what: string;
+}
+
+/** What one `|` alternative may hold besides atoms: one non-capturing group. */
+const HISTORY_PATTERN_GRAMMAR =
+  "0.9.0 accepts only literal text, escaped punctuation (like \\. or \\|), \\b \\s \\d \\w, ^, $, | and one unquantified (?:a|b) group per | alternative, case-insensitive";
+
+/**
+ * The first token of `source` outside the recallHistoryPattern grammar, or undefined. The grammar:
+ * literal characters, an escaped ASCII punctuation character, `\b` `\s` `\d` `\w`, `^`, `$`, `|`,
+ * and per top-level `|` alternative at most one `(?:...)` group that holds the same atoms and `|`
+ * but no group. Nothing is quantified, so a match at one start position tries each group
+ * alternative once with the rest of its | alternative: per start position at most (group
+ * alternatives) x (atoms after the group) steps, a fixed ceiling (measured in docs/configuration.md).
+ * `source` must already compile with `new RegExp(source, "i")`.
+ */
+export function historyPatternRefusal(source: string): HistoryPatternRefusal | undefined {
+  let inGroup = false;
+  let groupInAlternative = false;
+  let i = 0;
+  const refuse = (token: string, what: string) => ({ token, at: i + 1, what });
+  while (i < source.length) {
+    const c = source[i]!;
+    const rest = source.slice(i);
+    if (c === "\\") {
+      const next = source[i + 1] ?? "";
+      if (/^[bsdw!-/:-@[-`{-~]$/.test(next)) {
+        i += 2;
+        continue;
+      }
+      return refuse(
+        `\\${next}`,
+        /^[1-9k]$/.test(next) ? "a backreference" : "an escape outside the allowlist",
+      );
+    }
+    if (c === "*" || c === "+" || c === "?") {
+      return refuse(c, "a quantifier");
+    }
+    if (c === "{") {
+      const q = /^\{\d+(,\d*)?\}/.exec(rest);
+      return q ? refuse(q[0], "a quantifier") : refuse(c, "a literal brace (write \\{)");
+    }
+    if (c === "}") {
+      return refuse(c, "a literal brace (write \\})");
+    }
+    if (c === "[") {
+      // JavaScript reads [] and [^] as complete classes; an escape never closes one.
+      let end = i + (source[i + 1] === "^" ? 2 : 1);
+      while (end < source.length && source[end] !== "]") {
+        end += source[end] === "\\" ? 2 : 1;
+      }
+      return refuse(source.slice(i, end + 1), "a character class");
+    }
+    if (c === "]") {
+      return refuse(c, "a literal bracket (write \\])");
+    }
+    if (c === ".") {
+      return refuse(c, "the any-character dot (write \\. for a period)");
+    }
+    if (c === "(") {
+      if (rest.startsWith("(?:")) {
+        if (inGroup) {
+          return refuse("(?:", "a nested group");
+        }
+        if (groupInAlternative) {
+          return refuse("(?:", "a second group in one | alternative");
+        }
+        inGroup = true;
+        groupInAlternative = true;
+        i += 3;
+        continue;
+      }
+      const look = /^\(\?<?[=!]/.exec(rest);
+      if (look) {
+        return refuse(look[0], look[0].includes("<") ? "a lookbehind" : "a lookahead");
+      }
+      const named = /^\(\?<[^>]*>/.exec(rest);
+      if (named) {
+        return refuse(named[0], "a named capture group");
+      }
+      const modifier = /^\(\?[a-z-]*:/.exec(rest);
+      if (modifier) {
+        return refuse(modifier[0], "a modifier group");
+      }
+      // Any other "(?" form does not compile, so it never gets here.
+      return refuse(c, "a capture group");
+    }
+    if (c === ")") {
+      inGroup = false;
+    } else if (c === "|" && !inGroup) {
+      groupInAlternative = false;
+    }
+    i += 1;
+  }
+  return undefined;
+}
+
+/**
+ * The tag filter for one recall query: recallTagGroups, unless the query asks for history. The
+ * pattern sees the first RECALL_MAX_QUERY_CHARS characters, the length its worst case was timed on.
+ */
 export function recallFilterFor(
   config: Pick<HindsightConfig, "recallTagGroups" | "recallHistoryPattern">,
   query: string,
 ): { tagGroups?: RecallTagGroup[] } {
-  if (!config.recallTagGroups || config.recallHistoryPattern?.test(query)) {
+  if (
+    !config.recallTagGroups ||
+    config.recallHistoryPattern?.test(query.slice(0, RECALL_MAX_QUERY_CHARS))
+  ) {
     return {};
   }
   return { tagGroups: config.recallTagGroups };
+}
+
+/**
+ * The request auto-recall sends for one query under one agent's config (also `openclaw hindsight
+ * recall`). Everything that changes what Hindsight returns is in the key, so an early recall is
+ * reused only for the request the turn would send itself.
+ */
+export function autoRecallRequest(config: HindsightConfig, query: string) {
+  const filter = recallFilterFor(config, query);
+  const options = {
+    budget: config.recallBudget,
+    maxTokens: RECALL_MAX_TOKENS,
+    ...(config.recallTypes ? { types: config.recallTypes } : {}),
+    ...(config.preferObservations === undefined
+      ? {}
+      : { preferObservations: config.preferObservations }),
+    ...filter,
+    ...(config.recallMinScore === undefined ? {} : { minScores: { final: config.recallMinScore } }),
+    ...(config.recallSkipEntities ? { skipEntities: true } : {}),
+  };
+  return { filter, options, key: JSON.stringify([config.apiUrl, query, options]) };
 }
 
 function normalizeApiUrl(raw: string | undefined): string {
@@ -490,13 +794,7 @@ export const hindsightConfigSchema = {
     if (unknown.length > 0) {
       throw new Error(`memory-hindsight config has unknown keys: ${unknown.join(", ")}`);
     }
-    const recallTypes = readStringList(value, "recallTypes")?.map((entry): RecallType => {
-      const type = RECALL_TYPES.find((candidate) => candidate === entry);
-      if (!type) {
-        throw new Error(`recallTypes entries must be: ${RECALL_TYPES.join(", ")}`);
-      }
-      return type;
-    });
+    const recallTypes = AGENT_KEY_READERS.recallTypes(value);
     const preferObservations =
       value.preferObservations === undefined
         ? undefined
@@ -507,16 +805,9 @@ export const hindsightConfigSchema = {
     const allowInsecureHttp = readBool(value, "allowInsecureHttp", false);
     const recallTagGroups = readTagGroups(value);
     const recallHistoryPattern = readHistoryPattern(value, recallTagGroups);
-    const recallTopK =
-      value.recallTopK === undefined
-        ? undefined
-        : readPositiveInt(value, "recallTopK", 1, MAX_RECALL_TOP_K);
-    const recallMinScore = readOptionalUnitNumber(value, "recallMinScore");
-    if (isPlainHttpRemote(apiUrl) && !allowInsecureHttp) {
-      throw new Error(
-        "hindsightApiUrl is plain http to a non-loopback host, so the bearer token and conversation text would travel unencrypted; use https or a loopback tunnel, or set allowInsecureHttp: true to accept the risk",
-      );
-    }
+    const recallTopK = AGENT_KEY_READERS.recallTopK(value);
+    const recallMinScore = AGENT_KEY_READERS.recallMinScore(value);
+    const agents = readAgents(value);
     if (isPlainHttpRemote(apiUrl) && !allowInsecureHttp) {
       throw new Error(
         "hindsightApiUrl is plain http to a non-loopback host, so the bearer token and conversation text would travel unencrypted; use https or a loopback tunnel, or set allowInsecureHttp: true to accept the risk",
@@ -526,7 +817,7 @@ export const hindsightConfigSchema = {
       apiUrl,
       ...(apiToken ? { apiToken } : {}),
       memoryMode: readEnum(value, "memoryMode", MEMORY_MODES, "hybrid"),
-      autoRecall: readBool(value, "autoRecall", true),
+      autoRecall: AGENT_KEY_READERS.autoRecall(value),
       autoRetain: readBool(value, "autoRetain", true),
       recallBudget: readEnum(value, "recallBudget", RECALL_BUDGETS, "mid"),
       ...(recallTypes ? { recallTypes } : {}),
@@ -555,6 +846,24 @@ export const hindsightConfigSchema = {
         DEFAULT_RETAIN_QUEUE_MAX_AGE_MS,
       ),
       knowledgeReadTools: readBool(value, "knowledgeReadTools", false),
+      privateTranscriptRecall: readBool(value, "privateTranscriptRecall", false),
+      memoryPromptSection: readBool(value, "memoryPromptSection", false),
+      promptDirectives: readBool(value, "promptDirectives", false),
+      slotMode: readEnum(value, "slotMode", SLOT_MODES, "auto"),
+      activeMemoryYield: readBool(value, "activeMemoryYield", false),
+      corpusSupplement: readBool(value, "corpusSupplement", false),
+      corpusSupplementSessionPatterns: readStringList(value, "corpusSupplementSessionPatterns") ?? [
+        ...DEFAULT_SUPPLEMENT_SESSION_PATTERNS,
+      ],
+      memoryFileSync: readBool(value, "memoryFileSync", false),
+      memoryFileSyncAgents: readStringList(value, "memoryFileSyncAgents") ?? [],
+      memoryFileSyncIntervalMs: readIntInRange(
+        value,
+        "memoryFileSyncIntervalMs",
+        DEFAULT_MEMORY_FILE_SYNC_INTERVAL_MS,
+        MIN_MEMORY_FILE_SYNC_INTERVAL_MS,
+        MAX_MEMORY_FILE_SYNC_INTERVAL_MS,
+      ),
       recallCacheTtlMs: readNonNegativeInt(value, "recallCacheTtlMs", 0, MAX_RECALL_CACHE_TTL_MS),
       recallFollowupMaxWords: readNonNegativeInt(
         value,
@@ -562,14 +871,17 @@ export const hindsightConfigSchema = {
         0,
         MAX_RECALL_FOLLOWUP_WORDS,
       ),
-      recallQueryShaping: readEnum(value, "recallQueryShaping", RECALL_QUERY_SHAPING_MODES, "off"),
-      recallTimeoutMs: readIntInRange(
+      recallQueryShaping: AGENT_KEY_READERS.recallQueryShaping(value),
+      recallTimeoutMs: AGENT_KEY_READERS.recallTimeoutMs(value),
+      agents,
+      recallEarlyStart: readBool(value, "recallEarlyStart", false),
+      recallStaleOnTimeout: readNonNegativeInt(
         value,
-        "recallTimeoutMs",
-        RECALL_TIMEOUT_MS,
-        MIN_RECALL_TIMEOUT_MS,
-        MAX_RECALL_TIMEOUT_MS,
+        "recallStaleOnTimeout",
+        0,
+        MAX_RECALL_STALE_MS,
       ),
+      recallSkipEntities: readBool(value, "recallSkipEntities", true),
       ...(recallTagGroups ? { recallTagGroups } : {}),
       ...(recallHistoryPattern ? { recallHistoryPattern } : {}),
       ...(recallTopK === undefined ? {} : { recallTopK }),

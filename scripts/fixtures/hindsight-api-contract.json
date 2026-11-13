@@ -145,6 +145,22 @@
             "type": "string",
             "enum": ["high", "low", "mid"]
           },
+          "include": {
+            "type": "object",
+            "required": [],
+            "properties": {
+              "entities": {
+                "type": "object",
+                "properties": {
+                  "max_tokens": {
+                    "type": "integer"
+                  }
+                },
+                "required": [],
+                "nullable": true
+              }
+            }
+          },
           "max_tokens": {
             "type": "integer"
           },
@@ -443,6 +459,19 @@
             },
             "nullable": true
           },
+          "temporal_window": {
+            "type": "object",
+            "required": ["end", "start"],
+            "nullable": true,
+            "properties": {
+              "end": {
+                "type": "string"
+              },
+              "start": {
+                "type": "string"
+              }
+            }
+          },
           "types": {
             "type": "array",
             "items": {
@@ -524,6 +553,14 @@
             "type": "string",
             "enum": ["high", "low", "mid"]
           },
+          "fact_types": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["experience", "observation", "world"]
+            },
+            "nullable": true
+          },
           "query": {
             "type": "string"
           }
@@ -581,6 +618,167 @@
         }
       },
       "response": null
+    },
+    "GET /v1/default/banks/{bank_id}/pages/tree": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "query:tags": {
+          "required": false,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "nullable": true
+        },
+        "query:tags_match": {
+          "required": false,
+          "type": "string",
+          "enum": ["all", "all_strict", "any", "any_strict", "exact"]
+        },
+        "query:tag_groups": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["roots"],
+        "properties": {
+          "roots": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "kind", "name"],
+              "properties": {
+                "children": {
+                  "type": "array",
+                  "items": {
+                    "ref": "PageNode"
+                  }
+                },
+                "id": {
+                  "type": "string"
+                },
+                "is_stale": {
+                  "type": "boolean",
+                  "nullable": true
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": ["folder", "page"]
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/default/banks/{bank_id}/pages/search": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "query:q": {
+          "required": true,
+          "type": "string"
+        },
+        "query:limit": {
+          "required": false,
+          "type": "integer"
+        },
+        "query:tags": {
+          "required": false,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "nullable": true
+        },
+        "query:tags_match": {
+          "required": false,
+          "type": "string",
+          "enum": ["all", "all_strict", "any", "any_strict", "exact"]
+        },
+        "query:tag_groups": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["results", "total"],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "name", "score", "snippet"],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "snippet": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/default/banks/{bank_id}/pages/{page_id}": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "path:page_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["id", "markdown", "name", "type"],
+        "properties": {
+          "markdown": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      }
     },
     "GET /v1/default/banks/{bank_id}/knowledge-base/tree": {
       "params": {
@@ -739,6 +937,365 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      }
+    },
+    "GET /v1/default/banks/{bank_id}/directives": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "query:tags": {
+          "required": false,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "nullable": true
+        },
+        "query:tags_match": {
+          "required": false,
+          "type": "string",
+          "enum": ["all", "any", "exact"]
+        },
+        "query:active_only": {
+          "required": false,
+          "type": "boolean"
+        },
+        "query:limit": {
+          "required": false,
+          "type": "integer"
+        },
+        "query:offset": {
+          "required": false,
+          "type": "integer"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["items", "limit", "offset", "total"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["bank_id", "content", "id", "name"],
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "is_active": {
+                  "type": "boolean"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "priority": {
+                  "type": "integer"
+                },
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "POST /v1/default/banks/{bank_id}/directives": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": {
+        "type": "object",
+        "required": ["content", "name"],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "required": ["bank_id", "content", "id", "name"],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/default/banks/{bank_id}/directives/{directive_id}": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "path:directive_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["bank_id", "content", "id", "name"],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "DELETE /v1/default/banks/{bank_id}/directives/{directive_id}": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "path:directive_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": null
+    },
+    "PATCH /v1/default/banks/{bank_id}/memories/{memory_id}": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "path:memory_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": {
+        "type": "object",
+        "required": [],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "state": {
+            "type": "string",
+            "nullable": true
+          },
+          "text": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "response": null
+    },
+    "DELETE /v1/default/banks/{bank_id}/memories/{memory_id}/observations": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "path:memory_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["deleted_count"],
+        "properties": {
+          "deleted_count": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "POST /v1/default/banks/{bank_id}/consolidate": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": {
+        "type": "object",
+        "required": [],
+        "nullable": true,
+        "properties": {}
+      },
+      "response": {
+        "type": "object",
+        "required": ["operation_id"],
+        "properties": {
+          "deduplicated": {
+            "type": "boolean"
+          },
+          "operation_id": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "GET /v1/default/banks/{bank_id}/operations/{operation_id}": {
+      "params": {
+        "path:bank_id": {
+          "required": true,
+          "type": "string"
+        },
+        "path:operation_id": {
+          "required": true,
+          "type": "string"
+        },
+        "query:include_payload": {
+          "required": false,
+          "type": "boolean"
+        },
+        "header:authorization": {
+          "required": false,
+          "type": "string",
+          "nullable": true
+        }
+      },
+      "request": null,
+      "response": {
+        "type": "object",
+        "required": ["operation_id", "status"],
+        "properties": {
+          "error_message": {
+            "type": "string",
+            "nullable": true
+          },
+          "operation_type": {
+            "type": "string",
+            "nullable": true
+          },
+          "progress": {
+            "type": "object",
+            "required": ["at", "stage"],
+            "nullable": true,
+            "properties": {
+              "detail": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "nullable": true
+              },
+              "processed": {
+                "type": "integer",
+                "nullable": true
+              },
+              "stage": {
+                "type": "string"
+              },
+              "total": {
+                "type": "integer",
+                "nullable": true
+              }
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": ["cancelled", "completed", "failed", "not_found", "pending", "processing"]
           }
         }
       }

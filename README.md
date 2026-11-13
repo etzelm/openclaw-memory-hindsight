@@ -3,27 +3,19 @@
 A native [Hindsight](https://github.com/vectorize-io/hindsight) memory engine for
 [OpenClaw](https://docs.openclaw.ai), packaged as a third-party plugin (plugin id
 `hindsight-native`). It owns the memory slot and plugs Hindsight into the host's memory
-contracts instead of only hooking prompts:
+contracts (replace mode), or runs beside memory-core without touching `memory_search` (sidecar):
 
-- **Provider runtime**: `memory.status`, `memory.search` (v2) and `memory.get` in the Gateway,
-  CLI and Control UI read Hindsight through the host's audience-checked provider API.
-- **Auto-recall** before each prompt and **auto-retain** of each finished run (one document per
-  run, replaced on re-delivery). Host maintenance turns (the pre-compaction flush and Active
-  Memory's recall child) get neither; they use the tools. A bank nothing was retained to yet
-  reads as "no memories", without a warning.
-- **Agent tools** `hindsight_retain`, `hindsight_recall`, `hindsight_reflect`, plus opt-in
-  read-only knowledge-base tools (see [Knowledge-base read tools](#knowledge-base-read-tools)).
-- **Recall tool declaration** (`recallToolNames`): Active Memory uses `hindsight_recall` and
-  `hindsight_reflect` without a `toolsAllow` list.
-- **Pre-compaction flush, tools arm**: before compaction the host runs a silent turn that saves
-  durable context through `hindsight_retain` (deduplicated per flush id, stable document ids).
-- **/learn**: lessons persist through `hindsight_retain` on hosts that have the learn seam
-  (see [Compatibility](#compatibility)).
-- **Audience-based banks**: the host-minted memory audience picks the bank. Owner-private
-  sessions use the agent's bank (same id as the vendor plugin's per-agent bank, so existing
-  memory carries over); group chats and other senders get a separate
-  `<bank>::conv::<hash>` bank per conversation, so their memories never surface in the owner's
-  private recall.
+- **Auto-recall** before each prompt and **auto-retain** of each finished run. The host's memory
+  audience picks the bank: owner-private sessions use the agent's bank, every other conversation
+  gets its own, so group chats never surface in the owner's private recall.
+- **Agent tools** `hindsight_retain`, `hindsight_recall`, `hindsight_reflect` (plus opt-in
+  knowledge-base read tools), a **provider runtime** for `memory.status`, `memory.search` and
+  `memory.get`, the pre-compaction flush and `/learn`.
+- **Operations**: an offline retain queue, a recall circuit breaker, Gateway metrics and an
+  `openclaw hindsight` CLI (status, doctor, recall, queue, forget).
+
+How each part works: [docs/design.md](docs/design.md). Every key in detail:
+[docs/configuration.md](docs/configuration.md).
 
 It only imports `openclaw/plugin-sdk/*`. The single runtime dependency is `typebox`.
 
@@ -31,6 +23,32 @@ It only imports `openclaw/plugin-sdk/*`. The single runtime dependency is `typeb
 > CLI-backed runtimes such as `claude-cli`, released OpenClaw (through at least 2026.11.5-beta.2)
 > does not give plugin hooks a memory audience, so this plugin recalls, retains and exposes tools
 > for none of those turns. Upstream main has the host fixes. See [Limitations](#limitations).
+
+## Quick start
+
+1. Install: `openclaw plugins install npm:@etzelm/openclaw-memory-hindsight`
+2. Point it at Hindsight and give it the memory slot (full example under [Install](#install)):
+
+   ```sh
+   openclaw config set plugins.entries.hindsight-native.config.hindsightApiUrl http://localhost:8888
+   openclaw config set plugins.slots.memory hindsight-native
+   openclaw config set plugins.entries.hindsight-native.hooks.allowConversationAccess true
+   ```
+
+3. Set `hindsightApiToken` if your Hindsight needs one (a SecretRef; see [Install](#install)).
+4. Restart the Gateway, then run `openclaw hindsight doctor` and fix any `FAIL` line it prints.
+
+## Troubleshooting
+
+| You see (Gateway log or behavior)                                                                      | Cause                                                                                                  | Fix                                                                                                 |
+| ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `memory-hindsight: disabled until configured (<reason>)`                                               | The config does not parse; the reason names the key                                                    | Fix that key; `openclaw hindsight doctor` prints the same reason                                    |
+| `memory-hindsight: auto-recall skipped: this session has no memory audience` (debug)                   | The host gave the turn no memory audience: a CLI-backed runtime such as `claude-cli`, or an older host | Run the agent on the embedded runtime, or use a host with the fix (see [Limitations](#limitations)) |
+| `memory-hindsight: auto-recall found no bank yet` (debug)                                              | Nothing was retained to this agent's bank yet                                                          | None; the first finished run creates it                                                             |
+| `memory-hindsight: auto-recall paused for 60 s after 3 failed recalls (Hindsight slow or unreachable)` | Hindsight timed out or failed three times in a row; the breaker skips recall                           | Check Hindsight (`openclaw hindsight status`); recall resumes by itself                             |
+| `memory-hindsight: hindsightApiToken not resolved; requests go unauthenticated`                        | The token SecretRef did not resolve                                                                    | Check the secrets provider path; the CLI takes `--token-file`                                       |
+| `memory-hindsight: ignoring invalid live config (<reason>)`                                            | A live config change does not parse; the plugin keeps the config it started with                       | Fix the key the reason names                                                                        |
+| No memories injected, no log line                                                                      | `autoRecall` off (globally or in `agents`), `memoryMode: tools`, or a session filter                   | `openclaw hindsight recall "<query>" --agent <id>` shows what auto-recall would inject              |
 
 ## Install
 
@@ -104,207 +122,138 @@ tool conflict.
 
 ## Configuration
 
-| Key                         | Default              | Meaning                                                                                               |
-| --------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------- |
-| `hindsightApiUrl`           | required             | Base URL of the Hindsight API                                                                         |
-| `hindsightApiToken`         | none                 | Bearer token; use a SecretRef                                                                         |
-| `memoryMode`                | `hybrid`             | `hybrid`: auto-recall and tools; `context`: auto-recall only, no tools, no flush; `tools`: tools only |
-| `autoRecall` / `autoRetain` | `true`               | Turn the hooks on or off                                                                              |
-| `recallBudget`              | `mid`                | Hindsight recall budget: `low`, `mid`, `high`                                                         |
-| `recallTypes`               | all                  | Subset of `world`, `experience`, `observation`                                                        |
-| `preferObservations`        | Hindsight default    | Prefer consolidated observations in recall                                                            |
-| `recallPromptPreamble`      | built in             | Text above the injected `<hindsight_memories>` block                                                  |
-| `retainMission`             | none                 | Applied to each bank once before its first write                                                      |
-| `retainContext`             | built in             | Context string sent with each retain                                                                  |
-| `retainTags`                | `[]`                 | Tags added to every retained memory (auto-retain, `hindsight_retain`, pre-compaction flush)           |
-| `excludeProviders`          | `[]`                 | Message providers that never recall or retain (for example `heartbeat`)                               |
-| `skipOperationalSessions`   | `true`               | Skip cron, heartbeat and subagent sessions                                                            |
-| `ignoreSessionPatterns`     | `[]`                 | Session-key globs with no recall, retain or `hindsight_*` tools (see below)                           |
-| `recallOnlySessionPatterns` | `[]`                 | Session-key globs that recall and read but never retain (see below)                                   |
-| `agentBankMap`              | `{}`                 | Agent id (normalized like agent ids) to bank id (not `.` or `..`); agents can share a bank            |
-| `allowInsecureHttp`         | `false`              | Allow plain http to a non-loopback `hindsightApiUrl` (token and conversation text unencrypted)        |
-| `retainQueueEnabled`        | `true`               | Queue auto-retains that fail because Hindsight is unreachable and send them later (see below)         |
-| `retainQueueMaxItems`       | `500`                | Most queued retains kept (1 to 10000); the oldest are dropped first                                   |
-| `retainQueueMaxAgeMs`       | `604800000` (7 days) | Queued retains older than this are dropped                                                            |
-| `recallCacheTtlMs`          | `0` (off)            | Auto-recall cache per session and bank, 0 to 3600000 ms; a repeated query skips the API call          |
-| `recallFollowupMaxWords`    | `0` (off)            | At most N words, no URL or path: skip after a recent recall with hits, else add the prior user turn   |
-| `recallQueryShaping`        | `off`                | `strip` removes the subagent envelope from the query; see `docs/recall-query-shaping.md`              |
-| `recallTopK`                | none (all)           | Most memories auto-recall injects, 1 to 50, best first                                                |
-| `recallMinScore`            | none                 | Final-score floor for auto-recall, 0 to 1 (Hindsight `min_scores.final`)                              |
-| `recallTagGroups`           | none                 | Hindsight `tag_groups` for auto-recall and `hindsight_recall` (see below)                             |
-| `recallHistoryPattern`      | none                 | Regex; a matching query recalls without `recallTagGroups`                                             |
-| `recallTimeoutMs`           | `10000`              | Auto-recall timeout, 250 to 30000 ms; see the recall circuit breaker below                            |
-| `knowledgeReadTools`        | `false`              | Offer the read-only knowledge-base tools (see below); turning it on needs a gateway restart           |
+### Choose a mode: replace or sidecar
 
-Session patterns: `*` matches any run of characters except `:`, `**` matches anything including
-`:`, everything else is literal. Patterns match the trimmed session key. `ignoreSessionPatterns`
-sessions get no auto-recall, no auto-retain and no `hindsight_*` tools. `recallOnlySessionPatterns`
-sessions (for example `agent:dev:subagent:**`) get auto-recall, `hindsight_recall`,
-`hindsight_reflect` and, with `knowledgeReadTools`, the knowledge-base read tools, even when
-`skipOperationalSessions` would skip them, but never auto-retain and no `hindsight_retain`.
-`excludeProviders`, `temp:` and incognito sessions win over both lists, and ignore wins over
-recall-only. A pattern never selects a bank; the bank still comes from the memory audience.
+**Replace** (slot `hindsight-native`): Hindsight serves `memory_search`, Active Memory, the flush
+and `/learn`; memory-core's file index is gone. **Sidecar** (slot `memory-core`): memory-core keeps
+those and the plugin adds recall, retain and `hindsight_*` tools (+1265 cached prompt tokens per
+turn, plus indexing); it needs a host with [openclaw#198445](https://github.com/openclaw/openclaw/issues/198445). [docs/sidecar-mode.md](docs/sidecar-mode.md)
 
-Fixed values (not configurable): recall max tokens 1024, query cap 800 characters,
-`hindsight_recall` timeout 10 s, retain and reflect timeout 30 s, memory get and knowledge-base tool timeout 10 s
-(each combined with the host's abort signal when there is one), retained roles user and
-assistant, JSON transcript format, recall injected before the user message (outside the system
-prompt, so the cached prefix stays stable). A recall, reflect or memory-get response body over
-4 MiB fails. Knowledge-base tool caps: a response body over 1 MiB fails; a page shows its first 32000 characters, then `(truncated, N more characters)`;
-the tree shows 500 entries, then `(truncated, N more entries)`; search shows at most 50 hits
-with snippets cut at 500 characters and names and ids at 200.
-
-On claude-cli sessions, auto-recall and auto-retain need a host that gives CLI hooks a memory
-audience (openclaw/openclaw#194453, fixed on upstream main since 2026-11-09), and the
-`hindsight_*` tools also need one that passes that audience when it lists MCP tools
-(openclaw/openclaw#197274, merged 2026-11-11). A main build from between those dates gets
-auto-recall and auto-retain but no `hindsight_*` tools; released builds get neither (see
-[Limitations](#limitations)). `listToolsWithoutAudience` (0.5.0) is deprecated and ignored since
-0.6.0; remove it from your config.
-
-With `recallCacheTtlMs` set, a `hindsight_retain` call drops the calling session's cached
-recall, so its next turn recalls fresh. Hindsight extracts memories in the background, so that
-recall can miss a memory Hindsight has not processed yet, and its result is cached like any
-other. The new memory shows up once Hindsight has processed it and that cache entry has expired.
-
-Recall cap and floor: both are off by default, so every result Hindsight returns is injected.
-`recallTopK` keeps the first N results (Hindsight ranks best first) and is applied at injection,
-so a cached recall follows a live change. `recallMinScore` is sent as Hindsight's
-`min_scores.final`; Hindsight documents its reranker scores as not calibrated across queries, so
-prefer the cap. Neither applies to `hindsight_recall`. Pick values with an eval run; see
-[docs/recall-ab.md](docs/recall-ab.md).
-
-Recall tag filter: `recallTagGroups` is passed through as Hindsight's recall `tag_groups` (groups
-are AND-ed; each is a leaf `{tags, match, resolve}` or `{and: [...]}`, `{or: [...]}`,
-`{not: ...}`, the Hindsight 1.2.1 shape, at most 32 groups per list and 8 levels deep). It applies
-to auto-recall and `hindsight_recall`, not to the provider runtime's search. When the recall query
-matches `recallHistoryPattern` (case-insensitive), that recall runs without the filter. Example
-that keeps status units ("waiting on CI") out of recall unless the question asks about history:
-
-```json
-"recallTagGroups": [{ "not": { "tags": ["kind:status"], "match": "any_strict" } }],
-"recallHistoryPattern": "\\b(history|timeline|status|progress|what happened|when did|so far|previous|earlier|changed|still)\\b"
-```
-
-`any_strict` inside `not` keeps untagged memories, which matters because Hindsight observations
-carry no tags. A filter only helps if the tags exist at retain time; check the bank before turning
-it on, and measure it with an eval run, since a filter can hide the answer.
-
-Recall circuit breaker: auto-recall waits on the reply path, so a slow or unreachable Hindsight
-would cost every turn up to `recallTimeoutMs`. After 3 auto-recalls in a row end in a timeout, a
-network error or an HTTP 5xx, auto-recall skips for 60 s without sending a request (one warning in
-the log), then lets one probe through while other turns keep skipping. Any answer to the probe
-closes the breaker (`auto-recall resumed` in the log); another failure pauses it for 60 s more. A
-4xx, a missing bank or an empty result never counts, and a live cached recall is still served
-while the breaker is open. The breaker is global (one server), resets when `hindsightApiUrl`
-changes or the service restarts, and does not apply to the `hindsight_*` tools.
+| Key                               | Default              | Meaning                                                                                                |
+| --------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------ |
+| `hindsightApiUrl`                 | required             | Base URL of the Hindsight API                                                                          |
+| `hindsightApiToken`               | none                 | Bearer token; use a SecretRef                                                                          |
+| `memoryMode`                      | `hybrid`             | `hybrid`: auto-recall and tools; `context`: auto-recall only, no tools, no flush; `tools`: tools only  |
+| `autoRecall` / `autoRetain`       | `true`               | Turn the hooks on or off                                                                               |
+| `recallBudget`                    | `mid`                | Hindsight recall budget: `low`, `mid`, `high`                                                          |
+| `recallTypes`                     | all                  | Subset of `world`, `experience`, `observation`                                                         |
+| `preferObservations`              | Hindsight default    | Prefer consolidated observations in recall                                                             |
+| `recallPromptPreamble`            | built in             | Text above the injected `<hindsight_memories>` block                                                   |
+| `retainMission`                   | none                 | Applied to each bank once before its first write                                                       |
+| `retainContext`                   | built in             | Context string sent with each retain                                                                   |
+| `retainTags`                      | `[]`                 | Tags added to every retained memory (auto-retain, `hindsight_retain`, pre-compaction flush)            |
+| `excludeProviders`                | `[]`                 | Message providers that never recall or retain (for example `heartbeat`)                                |
+| `skipOperationalSessions`         | `true`               | Skip cron, heartbeat and subagent sessions                                                             |
+| `ignoreSessionPatterns`           | `[]`                 | Session-key globs with no recall, retain or `hindsight_*` tools (see below)                            |
+| `recallOnlySessionPatterns`       | `[]`                 | Session-key globs that recall and read but never retain (see below)                                    |
+| `agentBankMap`                    | `{}`                 | Agent id (normalized like agent ids) to bank id (not `.` or `..`); agents can share a bank             |
+| `allowInsecureHttp`               | `false`              | Allow plain http to a non-loopback `hindsightApiUrl` (token and conversation text unencrypted)         |
+| `retainQueueEnabled`              | `true`               | Queue auto-retains that fail because Hindsight is unreachable and send them later (see below)          |
+| `retainQueueMaxItems`             | `500`                | Most queued retains kept (1 to 10000); the oldest are dropped first                                    |
+| `retainQueueMaxAgeMs`             | `604800000` (7 days) | Queued retains older than this are dropped                                                             |
+| `recallCacheTtlMs`                | `0` (off)            | Auto-recall cache per session and bank, 0 to 3600000 ms; a repeated query skips the API call           |
+| `recallFollowupMaxWords`          | `0` (off)            | At most N words, no URL or path: skip after a recent recall with hits, else add the prior user turn    |
+| `recallQueryShaping`              | `off`                | `strip` removes the subagent envelope from the query; see `docs/recall-query-shaping.md`               |
+| `recallTopK`                      | none (all)           | Most memories auto-recall injects, 1 to 50, best first                                                 |
+| `recallMinScore`                  | none                 | Final-score floor for auto-recall, 0 to 1 (Hindsight `min_scores.final`)                               |
+| `recallTagGroups`                 | none                 | Hindsight `tag_groups` for auto-recall and `hindsight_recall` (see below)                              |
+| `recallHistoryPattern`            | none                 | Restricted pattern (see below); a matching query recalls without `recallTagGroups`                     |
+| `recallTimeoutMs`                 | `10000`              | Auto-recall timeout, 250 to 30000 ms; see the recall circuit breaker below                             |
+| `agents`                          | `{}`                 | Per-agent auto-recall keys (see "Per-agent overrides" below); other agents use the global keys         |
+| `recallEarlyStart`                | `false`              | Experimental: start recall at message arrival, await it at prompt build (see below); needs a restart   |
+| `recallStaleOnTimeout`            | `0` (off)            | On a recall timeout, inject the session's last block from the same bank if younger (ms)                |
+| `recallSkipEntities`              | `true`               | Send `include.entities: null`: no entity observations, which the plugin never reads                    |
+| `knowledgeReadTools`              | `false`              | Offer the read-only knowledge-base tools (see below); turning it on needs a gateway restart            |
+| `memoryPromptSection`             | `false`              | Add a static memory section (under 80 words) to the system prompt; needs a gateway restart             |
+| `promptDirectives`                | `false`              | List the owner bank's active global directives in the system prompt (see below); needs a restart       |
+| `privateTranscriptRecall`         | `false`              | Remember across conversations ([limits](docs/private-transcript-recall.md)); needs a restart           |
+| `slotMode`                        | `auto`               | `replace`, `sidecar`, or `auto` (replace when the slot names this plugin); read at startup             |
+| `corpusSupplement`                | `false`              | Sidecar: Hindsight hits in `memory_search` `corpus=wiki`/`all` for matching sessions; needs a restart  |
+| `activeMemoryYield`               | `false`              | Sidecar: skip auto-recall on turns Active Memory visibly recalls from Hindsight (docs/sidecar-mode.md) |
+| `corpusSupplementSessionPatterns` | `["agent:*:main"]`   | Session-key globs whose `memory_search` may read the owner bank through the supplement                 |
+| `memoryFileSync`                  | `false`              | Retain MEMORY.md, USER.md and `memory/*.md` into the owner bank on change (see docs/sidecar-mode.md)   |
+| `memoryFileSyncAgents`            | `[]` (default agent) | Agents whose workspace memory files are synced                                                         |
+| `memoryFileSyncIntervalMs`        | `600000`             | Scan interval for `memoryFileSync`, 60000 to 86400000 ms                                               |
 
 Config changes apply without a restart: the plugin re-reads its entry from the host's current
 config snapshot (`api.runtime.config.current()`), falling back to the register-time
 `api.pluginConfig`. One exception: `knowledgeReadTools` registers its tools at startup, so turning
 it on takes a gateway restart (turning it off applies at once).
 
-### Offline retain queue
+Per-agent overrides, latency levers, session patterns, the tag filter and history pattern, the
+cache, cap and floor, the breaker, KB tools and directives: [docs/configuration.md](docs/configuration.md).
 
-When an auto-retain cannot reach Hindsight (network error, timeout or HTTP 5xx), or Hindsight
-refuses it for a reason that is not about the item (401, 403, 408 or 429: a token being rotated,
-a rate limit), the plugin writes it to `<state dir>/hindsight-native/retain-queue.jsonl` and logs one warning per failed
-retain. The state dir is the one the host passes to plugin services (`~/.openclaw` by default,
-or `OPENCLAW_STATE_DIR`). The file is mode 600 in a mode 700 directory, one JSON line per item.
-It holds the bank id, document id and the retain payload (transcript, context, tags, metadata),
-and never the API URL or token. The transcript is conversation text, so treat the file like
-session transcripts.
+## Operate
 
-- **Same bank, always.** Each item keeps the bank chosen from the run's memory audience when the
-  run ended. Replay writes to that bank only, even if `agentBankMap` changed in between. Items do
-  not record the server: if `hindsightApiUrl` points at another Hindsight by then, they go there
-  under the same bank id.
-- **No duplicates.** Each item keeps its document id and is sent with `update_mode: replace`. A
-  second retain of the same document replaces the queued copy, and a replay that the server had
-  already received overwrites instead of adding a document.
-- **Replay.** At service start, on a timer after a failure, and after the next successful retain.
-  The first retry comes 30 s after a failed pass, and the wait doubles after each further failed
-  pass (a turn for a bank with queued items also starts a pass), up to 15 min. Items go out oldest
-  first, so each bank sees its writes in order. A network error, timeout or 5xx ends the pass for
-  every bank; a bank that refuses (see below) is skipped for the rest of the pass while other banks'
-  items still go out.
-  While a bank has queued items, a new retain for that bank queues behind them. Two retains for one
-  bank that are in flight at the same moment can still land out of order if the earlier one fails
-  and is queued.
-- **Not queued.** Any other 4xx answer (bad request, unknown bank, a 404 from a wrong
-  `hindsightApiUrl` path) and a refused redirect are logged and dropped as before. On replay, only a Hindsight HTTP 4xx about the item drops it, with a
-  warning: any 4xx except 401, 403, 408, 429 and an ambiguous 404 (a wrong `hindsightApiUrl` path, an
-  HTML or empty body). Hindsight creates a bank on its first retain, so its explicit `Bank '<id>'
-  not found` 404 is about the item and drops it. Everything else keeps the item and backs off:
-  network errors, timeouts, 5xx, 401, 403, 408, 429, an ambiguous 404, a 4xx from bank setup
-  (applying `retainMission`), a refused redirect and any unexpected error. Anything other than a
-  network error, timeout or 5xx logs one warning until a pass ends with no bank refusing.
-- **Shutdown.** An auto-retain whose live write is still in flight when the plugin stops is
-  written to the queue at the stop, so a Gateway exit does not lose that turn. If the write then
-  succeeds, its queued copy is removed again; a copy left behind replays as a harmless replace.
-- **Tags.** An item keeps the tags resolved when the run ended (`retainTags` plus inline
-  `<retain_tags>`); a later `retainTags` change does not touch queued items.
-- **Limits.** Items beyond `retainQueueMaxItems` or a fixed 32 MiB total (UTF-8 bytes on disk,
-  oldest first), or older than `retainQueueMaxAgeMs`, are dropped with one warning until the queue
-  is empty again. A single retain larger than 32 MiB is not queued: it is sent live without waiting
-  for its bank's queue, and its failure is logged as before.
-- **Disk writes.** A new item is appended, on a new line even after a torn last line. Replacing,
-  pruning and replay rewrite the file (fsync, then atomic rename); replay writes once per 25 delivered items and
-  at the end of each pass, and a failed write is retried by the next one (a pass that a failed
-  write ended is retried after the backoff). If a rewrite fails, the
-  new or newer copy is appended instead, with a tombstone for any item the limits drop; the older
-  copy stays in the file until the next successful rewrite, and load keeps only the newest line per
-  bank and document id. An append that would take
-  the file past 32 MiB rewrites it instead. Only when that rewrite fails too is the item not queued:
-  an out-of-date copy it replaced gets a tombstone line so a restart does not replay it, and the
-  retain is sent live, or, when its live write already failed, logged and not kept. Until the next
-  successful rewrite, the file stays within 32 MiB plus at most one short tombstone line per item
-  removed from the queue meanwhile. A crash between replay's writes can also leave an already delivered copy before
-  a newer one; load keeps the newer one, and replay always sends `update_mode: replace` with the
-  item's document id, so a repeat is harmless. One queue per file per process, shared across
-  service restarts.
-- **Downgrade.** The file format is unchanged. 0.2.0 reads tombstones but keeps every copy of a
-  document (left by a crash during replay or by a replace that could not rewrite the file) and
-  sends them oldest first, same document id with replace, so the newest text wins unless the same
-  document is retained again before that replay finishes. 0.1.x has no queue and ignores the file.
-  A build that ignores tombstone lines (only unreleased queue builds before 0.2.0) can replay an
-  out-of-date copy a tombstone hid; if the newer copy was then sent live and never queued, the stale
-  text overwrites it on the server. Let the queue drain (the file is deleted when it is empty), or
-  delete the file, before downgrading.
-- Only auto-retain is queued. `hindsight_retain` and the pre-compaction flush return the error to
-  the agent, as before. With `retainQueueEnabled: false` the plugin neither reads nor writes the
-  file; delete it, or turn the queue back on to drain it. `retainQueueEnabled` is read at service
-  start (restart the gateway after changing it); the two limits apply live. One gateway process per
-  state dir: the file is not locked.
+### `openclaw hindsight` CLI
 
-### Knowledge-base read tools
+Operator commands that run in the CLI process, not the Gateway. They read this plugin's config from
+the host config, talk to Hindsight directly and never print the token.
 
-With `knowledgeReadTools: true` the agent also gets three read-only tools over Hindsight's
-knowledge pages (documents Hindsight writes and refreshes from memories), under the same names as
-the vendor plugin:
+- `openclaw hindsight status [--json]`: plugin version, Hindsight URL with reachability and API
+  version, the memory slot owner, mode, and the retain queue depth per bank. Exit 1 when Hindsight
+  is unreachable.
+- `openclaw hindsight doctor`: checks the config, the memory slot, the token, reachability, the
+  server version (warns below 1.2.1), auth (one bank-list request) and the retain queue, and prints
+  a fix under each failure. Exit 1 when a check fails. It also runs while the plugin is disabled by
+  a bad config, to say why.
+- `openclaw hindsight recall <query> [--agent <id>] [--bank <id>] [--types <list>] [--json]`:
+  read-only. Sends the request auto-recall would send for the agent (default `main`, with its
+  `agents` entry), to its owner bank or `--bank`; `--types` (comma list) replaces `recallTypes`.
+  Prints each result with its type and final score, and marks the ones past `recallTopK` as not
+  injected. Exit 1 when Hindsight does not answer.
+- `openclaw hindsight queue --list | --drop <id> [--yes]`: `--list` prints the Gateway's retain
+  queue as id, bank, document id, queue time and size, never the memory text. `--drop` removes one
+  item so it is never sent: it asks first (outside a terminal it needs `--yes`) and appends a
+  tombstone line to the queue file; a running Gateway forgets the item before its next replay step
+  or queue write. A replay already sending that item is not stopped.
+- `openclaw hindsight forget --session <key> [--agent <id>] [--bank <id>] [--dry-run] [--yes]`:
+  deletes the session's auto-retained run documents, and the memory units Hindsight extracted from
+  them, from the agent's owner bank and the session's conversation bank (or only `--bank`). It
+  lists them first, and `--dry-run` stops there. Otherwise it asks for confirmation; outside a
+  terminal it needs `--yes`. It refuses while the Gateway's retain queue still holds a copy of the
+  session, or when it cannot read the queue, because replay would bring the text back. Retain
+  picks the conversation bank from the session key of the host's memory audience, which can be
+  the root session when the run belongs to a child session. If forget finds nothing for a child
+  session, run it with the root session key or pass `--bank`.
+  Memories saved with `hindsight_retain` or by
+  the pre-compaction flush carry no session id and are not removed. Observations Hindsight already
+  consolidated from those memories may outlive them until it consolidates again.
+- `openclaw hindsight directives list [--all] [--json]`, `directives add --name <n> --content <text>
+  [--priority <n>] [--tags <list>]` and `directives rm <id>`: the bank's directives, hard rules
+  Hindsight applies to every reflect. All take `--agent <id>` (owner bank of that agent, default
+  `main`) or `--bank <id>`. `list` shows active ones (`--all`: inactive too) and marks those
+  `promptDirectives` lists. `add` and `rm` show the directive first, then ask; `--dry-run` stops
+  after the preview, and outside a terminal they need `--yes`.
+- `openclaw hindsight memory show <id> [--json]`, `memory curate <id> --text <text> | --restore |
+  --clear-observations` and `memory invalidate <id> [--reason <text>]`: one memory unit by id
+  (`hindsight_recall` and `recall --json` print ids), with `--agent`/`--bank` as above. `show`
+  prints its type, curation state, dates, document, tags and entities. `curate --text` replaces a
+  world or experience memory's text (Hindsight re-embeds it and rebuilds its observations),
+  `--restore` makes an invalidated memory valid again, and `--clear-observations` deletes the
+  observations derived from it so Hindsight consolidates it again. `invalidate` retires a wrong
+  memory: out of recall and consolidation but kept for audit, and reversible. Observations are
+  derived and cannot be curated. Each write shows the memory first and asks, like `directives`.
+- `openclaw hindsight consolidate [--wait] [--timeout <s>]`: asks Hindsight to consolidate the
+  bank's new memories into observations now instead of on its own schedule (`--agent`/`--bank` as
+  above). It prints the operation id and returns; with `--wait` it polls every 2 s and prints
+  each new status and progress, exits 0 when the operation completed and 1 when it failed, was
+  cancelled or is still running after `--timeout` (default 600 s, at most 3600). A timeout does
+  not cancel the job on the server.
+- `openclaw hindsight export --out <dir>` and `openclaw hindsight sync-memory-files [--dry-run]`:
+  bank memories to markdown, and one memory file sync pass; see [docs/sidecar-mode.md](docs/sidecar-mode.md).
 
-- `hindsight_get_knowledge_base_tree`: folders and pages with page ids and a stale mark
-  (`GET .../knowledge-base/tree`).
-- `hindsight_search_knowledge_base`: pages matching a query, with a snippet (`query`, optional
-  `limit` clamped to 1-50; `GET .../knowledge-base/search`).
-- `hindsight_get_knowledge_page`: one page as markdown by `page_id`
-  (`GET .../knowledge-base/pages/<id>`).
+The CLI does not resolve SecretRefs the way the Gateway does (checked on 2026.10.10), so with a
+SecretRef token pass `--token-file <path>` to any of the three commands; the file holds the token
+alone, is read for that run only and is never printed. Without it `doctor` warns and requests from
+the CLI go unauthenticated.
 
-They follow the recall tools' rules: same bank from the host-minted memory audience (an
-owner-private session reads the owner bank, a conversation reads only its own
-`<bank>::conv::<hash>` bank), same session filters, none in `context` mode or without an
-audience. Hindsight scopes page ids to the bank in the URL, so a page id from the owner bank is
-"not found" through a conversation bank. A bank nothing was written to reads as "no knowledge
-pages yet"; as with recall, a 404 with an empty body counts as a missing bank too. A route 404
-(`{"detail":"Not Found"}`: wrong URL or a Hindsight version without these endpoints) stays an
-error. `page_id` must look like a Hindsight id (letters, digits, `_ . : -`, starting with a
-letter or digit, at most 200 characters) and is refused otherwise, before any request. Output
-is marked as untrusted data, like recall, and capped (see Fixed values). The manifest's
-`contracts.tools` always lists the three names (it is static), so they appear in plugin status
-and doctor tool-owner output even with the key off; they are registered only when it is on.
-Host tool listings can therefore show them while the key is off: the manifest's `configSignals`
-only test that a key is present, not that it is `true`, so they cannot express this key. The
-write tools (create folder, create page, update, delete) are not ported.
+### Retain queue
+
+Auto-retains that fail because Hindsight is unreachable wait in a file-backed queue in the
+Gateway's state dir and replay when it answers (`retainQueueEnabled`, on by default).
+`openclaw hindsight queue --list` shows it; edge cases (bounds, restarts, rejections, tombstones)
+are in [docs/offline-retain-queue.md](docs/offline-retain-queue.md).
 
 ### Gateway metrics
 
@@ -351,64 +300,18 @@ config key; counters live in memory and reset when the Gateway restarts.
   Past 200 label sets per metric family, new `agent` and `bank` values fold into `other`;
   `outcome` and `reason` keep their value. No session ids, document ids or text.
 
-### `openclaw hindsight` CLI
+### Rollback
 
-Operator commands that run in the CLI process, not the Gateway. They read this plugin's config from
-the host config, talk to Hindsight directly and never print the token.
+Both plugins are `kind: memory`; only the slot owner runs. To go back to the vendor plugin:
 
-- `openclaw hindsight status [--json]`: plugin version, Hindsight URL with reachability and API
-  version, the memory slot owner, mode, and the retain queue depth per bank. Exit 1 when Hindsight
-  is unreachable.
-- `openclaw hindsight doctor`: checks the config, the memory slot, the token, reachability, the
-  server version (warns below 1.2.1), auth (one bank-list request) and the retain queue, and prints
-  a fix under each failure. Exit 1 when a check fails. It also runs while the plugin is disabled by
-  a bad config, to say why.
-- `openclaw hindsight forget --session <key> [--agent <id>] [--bank <id>] [--dry-run] [--yes]`:
-  deletes the session's auto-retained run documents, and the memory units Hindsight extracted from
-  them, from the agent's owner bank and the session's conversation bank (or only `--bank`). It
-  lists them first, and `--dry-run` stops there. Otherwise it asks for confirmation; outside a
-  terminal it needs `--yes`. It refuses while the Gateway's retain queue still holds a copy of the
-  session, because replay would bring the text back. Memories saved with `hindsight_retain` or by
-  the pre-compaction flush carry no session id and are not removed. Observations Hindsight already
-  consolidated from those memories may outlive them until it consolidates again.
+```sh
+openclaw config set plugins.slots.memory hindsight-openclaw
+# restore plugins.entries.active-memory.config.toolsAllow if you removed it
+openclaw gateway restart
+```
 
-The CLI does not resolve SecretRefs the way the Gateway does (checked on 2026.10.10), so with a
-SecretRef token pass `--token-file <path>` to any of the three commands; the file holds the token
-alone, is read for that run only and is never printed. Without it `doctor` warns and requests from
-the CLI go unauthenticated.
-
-### Mapping from `@vectorize-io/hindsight-openclaw`
-
-| Vendor key                                                                                                                                                                                                                                                                                                        | Here                                                                                                      |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `hindsightApiUrl`, `hindsightApiToken`, `memoryMode`, `autoRecall`, `autoRetain`, `recallBudget`, `recallTypes`, `preferObservations`, `recallPromptPreamble`, `retainMission`, `retainContext`, `retainTags`, `excludeProviders`, `skipOperationalSessions`, `agentBankMap`, `recallTimeoutMs`                   | Same key, same meaning                                                                                    |
-| `dynamicBankId`, `dynamicBankGranularity`, `bankIdPrefix`                                                                                                                                                                                                                                                         | Replaced by audience routing: owner bank = agent id (or `agentBankMap`), conversations get their own bank |
-| `retainRoles`, `recallRoles`, `retainFormat`, `recallMaxTokens`, `recallMaxQueryChars`, `recallInjectionPosition`, `retainSource`                                                                                                                                                                                 | Fixed values (see above)                                                                                  |
-| `retainQueueMaxAgeMs`                                                                                                                                                                                                                                                                                             | Same key; must be a positive number of ms (the vendor's `-1` for no limit is rejected)                    |
-| `retainToolCalls`, `retainEveryNTurns`, `retainOverlapTurns`, `recallContextTurns`, `retainQueuePath`, `retainQueueFlushIntervalMs`, `enableKnowledgeTools`, `allowKnowledgeDelete`, daemon keys (`apiPort`, `embedPort`, `embedVersion`, `daemonIdleTimeout`), `llm*`, `debug*`, `log*`, `skipStatelessSessions` | Not supported; remove them (unknown keys are rejected)                                                    |
-
-## Compared with `@vectorize-io/hindsight-openclaw`
-
-Both plugins talk to the same Hindsight API and use the same per-agent owner bank ids. Differences
-as of the vendor plugin 1.2.0:
-
-- **`recallToolNames`**: this plugin declares `hindsight_recall` and `hindsight_reflect`, so
-  Active Memory's deep recall uses them without a `toolsAllow` list. The vendor plugin declares
-  none, and once Memory Core stops registering its tools for a slot it does not own
-  (openclaw#191028) deep recall has no tools unless `toolsAllow` is set
-  ([vectorize-io/hindsight#6303](https://github.com/vectorize-io/hindsight/issues/6303)).
-- **Provider runtime**: both register one. Here `memory.search` (v2) and `memory.get` resolve the
-  bank from the caller's memory audience. The vendor runtime refuses search unless the bank
-  depends on the agent alone, which excludes its default user and channel banking.
-- **Banks**: the vendor plugin derives banks from config (`dynamicBankId`,
-  `dynamicBankGranularity`, `bankIdPrefix`). Here the host-minted audience picks the bank:
-  owner-private sessions use the agent bank, every other conversation gets its own
-  `<bank>::conv::<hash>` bank.
-- **Pre-compaction flush**: the vendor plugin has none and relies on per-turn retain. Here the
-  tools-arm flush saves in-turn context through `hindsight_retain` before compaction, deduplicated
-  per flush id with stable document ids.
-
-The vendor plugin has features this one does not port; see [Limitations](#limitations).
+Owner-private memory is in the same banks either way, so nothing is lost. Conversation banks
+(`<bank>::conv::<hash>`) are only read by this plugin.
 
 ## Security
 
@@ -417,47 +320,20 @@ plugin refuses a plain `http://` `hindsightApiUrl` to any host other than `local
 or `::1`, and config resolution fails with an error that names `allowInsecureHttp`. Prefer `https://`
 or a loopback tunnel. To accept the risk on a trusted network, set `allowInsecureHttp: true`; the
 plugin then warns at service start that the token and conversation text travel unencrypted.
-Redirects are refused, so an https endpoint cannot forward a request body to plain http.
-
-Report vulnerabilities privately; see [SECURITY.md](SECURITY.md) for how and for supported
-versions.
+Redirects are refused, so an https endpoint cannot forward a request body to plain http. Report
+vulnerabilities privately: [SECURITY.md](SECURITY.md).
 
 ## Compatibility
 
 ### Supported OpenClaw versions
 
 OpenClaw `>=2026.10.10` is supported. Older hosts lack APIs or session behavior the plugin needs
-(see [Host API evidence](#host-api-evidence)). Memory needs the embedded agent runtime; CLI
+(see [Host API evidence](docs/host-api-evidence.md)). Memory needs the embedded agent runtime; CLI
 runtimes such as `claude-cli` get none yet (see [Limitations](#limitations)).
 
 `scripts/compat-matrix.sh` runs the live proof on the floor host (2026.10.10), the latest
 OpenClaw release and OpenClaw `main`, on the embedded and `claude-cli` runtimes. See
 [docs/compat-matrix.md](docs/compat-matrix.md) for how to run it and the expected cells.
-
-### Host API evidence
-
-`openclaw.install.minHostVersion` is `>=2026.10.10`; `openclaw.compat.pluginApi` is
-`>=2026.10.1`. Evidence (published `openclaw` npm tarballs and release tags, checked 2026-11-03
-and 2026-11-07):
-
-- 2026.10.10 is the first release that records a dashboard session created by
-  `sessions.create` as a direct chat (openclaw#181359). On 2026.10.1 through 2026.10.9 the host
-  gives turns in such a session no memory audience ("root session ... has no durable chat
-  type"), so the plugin neither recalls nor retains there: no memory is read or written in those
-  sessions, including `openclaw agent --session-key` runs in them.
-- 2026.9.36 has no tools-arm flush plan (`persistenceToolNames`) and no
-  `assertMemoryAudienceCurrent`. 2026.10.1 is the first release with `recallToolNames`, the
-  tools-arm `providerFlushPlanResolver` result and `memoryAudience` /
-  `assertMemoryAudienceCurrent` on hook and tool contexts; every release through 2026.10.10
-  keeps them. The package typechecks against the `openclaw@2026.10.10` types.
-- `/learn`: no tagged release through 2026.10.10 has a memory learn hook. `main` had
-  `learnToolNames` / `learnGuidanceBuilder` on the memory capability from openclaw#181879, and
-  openclaw#191665 (2026-11-03) replaced them with `api.registerLearnContribution`. The plugin
-  calls `registerLearnContribution` when the host has it, sets the two capability fields
-  otherwise, and on tagged releases `/learn` simply does not route lessons here.
-- openclaw#191028 (Memory Core registers `memory_search`/`memory_get` only when it owns the slot)
-  is on `main` after 2026.10.10. On older hosts Memory Core's tools can appear next to ours when
-  dreaming keeps it loaded.
 
 ## Releases and versioning
 
@@ -489,15 +365,13 @@ deprecated on npm once the fix ships, as 0.1.1 is.
   session authority without an audience has no private or conversation grant"). Run
   `openclaw doctor --fix` to stamp older dashboard roots.
 - **Workspace memory files are outside the bank split.** The audience split covers Hindsight
-  banks only. An agent with file or shell tools can still write a fact to its workspace (for
-  example the daily note `memory/YYYY-MM-DD.md` that the default `AGENTS.md` suggests for
-  "remember this"), and any later session of that agent with the same tools can read it,
-  group chats included. To keep owner facts out of group sessions, sandbox non-main sessions
-  or deny `group:fs` and `group:runtime` for them in OpenClaw's tool policy.
-- **Auto-retain does not re-check audience currency.** The host starts `agent_end` handlers
-  without awaiting them and releases the run's audience when the attempt ends, so a currency
-  check there would race and drop retains. The bank still comes from the host-minted audience of
-  the run that produced the messages. Recall and the tools keep their checks.
+  banks only. An agent with file or shell tools can write a fact to its workspace (for example
+  the daily note `memory/YYYY-MM-DD.md`), and any later session of that agent with the same tools
+  can read it, group chats included. To keep owner facts out of group sessions, sandbox non-main
+  sessions or deny `group:fs` and `group:runtime` for them in OpenClaw's tool policy.
+- **Auto-retain does not re-check audience currency.** The host runs `agent_end` unawaited and
+  releases the audience when the attempt ends, so a check there would race and drop retains. The
+  bank still comes from the run's host-minted audience; recall and the tools keep their checks.
 - **`memory.search` through the provider runtime skips the plugin filters.** It is gated by the
   caller's audience (owner-private or conversation), not by `memoryMode`, `excludeProviders`,
   `ignoreSessionPatterns`, `recallOnlySessionPatterns`, `skipOperationalSessions` or incognito
@@ -507,27 +381,11 @@ deprecated on npm once the fix ships, as 0.1.1 is.
   token sent over plain `http` to a non-loopback host, logs one warning at service start.
 - Flush dedupe is per process; a restart mid-cycle can repeat a flush write, which the stable
   document id plus `update_mode: replace` turns into an overwrite.
-- Conversation banks are never pruned by the plugin, and `openclaw memory forget` does not reach
-  slot owners (no host seam yet); `openclaw hindsight forget` removes one session's auto-retained
-  documents (see the CLI section).
+- Conversation banks are never pruned by the plugin, and `openclaw memory forget` reaches neither
+  mode (no host seam yet); `openclaw hindsight forget` removes one session's auto-retained documents.
 
-Not ported from the vendor plugin: knowledge-base write tools (create, update, delete; the
-read tools are opt-in, see above), tool-call retention
-(`retainToolCalls`), `retainEveryNTurns` windows, the local Hindsight daemon, and
-per-user/per-channel bank granularity (replaced by audience routing).
-
-## Rollback
-
-Both plugins are `kind: memory`; only the slot owner runs. To go back to the vendor plugin:
-
-```sh
-openclaw config set plugins.slots.memory hindsight-openclaw
-# restore plugins.entries.active-memory.config.toolsAllow if you removed it
-openclaw gateway restart
-```
-
-Owner-private memory is in the same banks either way, so nothing is lost. Conversation banks
-(`<bank>::conv::<hash>`) are only read by this plugin.
+Not ported from the vendor plugin: knowledge-base write tools, `retainToolCalls`, `retainEveryNTurns`,
+the local Hindsight daemon, and per-user/per-channel banks (replaced by audience routing).
 
 ## Development
 
@@ -537,8 +395,5 @@ npm run typecheck && npm run build && npm test && npm run lint && npm run format
 npm pack --dry-run   # dist/*.js, openclaw.plugin.json, README, CHANGELOG, LICENSE only
 ```
 
-`scripts/live-proof.sh` runs one OpenClaw host (npm version, git ref or path) on the embedded
-or `claude-cli` runtime through a throwaway Gateway and real turns, and prints a PASS/FAIL
-table. `scripts/compat-matrix.sh` runs it for the floor host, the latest release and `main`.
-See [docs/compat-matrix.md](docs/compat-matrix.md), including the expected `claude-cli` cells
-and an optional nightly launchd schedule.
+`scripts/live-proof.sh` (one host, one runtime, real turns, `--slot sidecar` for the sidecar
+build) and `scripts/compat-matrix.sh` (floor, latest, main): [docs/compat-matrix.md](docs/compat-matrix.md).

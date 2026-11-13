@@ -209,4 +209,9 @@ describe("Retry-After on a refused request", () => {
     expect((await refuse(429, new Date(0).toUTCString()))?.retryAfterMs).toBeUndefined();
     expect((await refuse(401, "30"))?.retryAfterMs).toBeUndefined();
   });
+  it("reads it on every 5xx, not only 503 (G1)", async () => {
+    for (const status of [500, 502, 504]) {
+      expect([status, (await refuse(status, "4"))?.retryAfterMs]).toEqual([status, 4_000]);
+    }
+  });
 });

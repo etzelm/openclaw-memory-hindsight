@@ -30,7 +30,7 @@ check:
     - npm run test:coverage
     - npm run lint
     - npm run format:check
-    - node --test scripts/pack-guard.test.mjs scripts/api-contract.test.mjs
+    - node --test scripts/pack-guard.test.mjs scripts/api-contract.test.mjs scripts/sidecar-variant.test.mjs
     - bash scripts/host-types.sh --self-test
     # The published file list must never carry tests, helpers or local state, and must carry
     # every file a release needs.

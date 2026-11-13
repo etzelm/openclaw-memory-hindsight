@@ -10,7 +10,7 @@
   "cliCommands": [
     {
       "name": "hindsight",
-      "description": "Inspect and maintain Hindsight memory (status, doctor, forget)",
+      "description": "Inspect and maintain Hindsight memory (status, doctor, recall, queue, forget, directives, memory, consolidate, export, sync-memory-files)",
       "hasSubcommands": true
     }
   ],
@@ -54,14 +54,72 @@
       "label": "Memory Mode",
       "help": "hybrid: auto-recall plus tools; context: auto-recall only; tools: tools only"
     },
-    "agentBankMap": {
-      "label": "Agent Bank Map",
-      "help": "Agent id to owner bank id, so several agents share one private bank (for example wb-dev and wb-dev2 to wb)",
-      "advanced": true
-    },
     "allowInsecureHttp": {
       "label": "Allow Insecure HTTP",
       "help": "Permit plain http to a non-loopback host. Token and conversation text are sent unencrypted; prefer https or a loopback tunnel",
+      "advanced": true
+    },
+    "autoRecall": {
+      "label": "Auto-Recall",
+      "help": "Recall memories before each prompt and inject them above the user message; per agent through agents"
+    },
+    "autoRetain": {
+      "label": "Auto-Retain",
+      "help": "Retain each finished run as one Hindsight document"
+    },
+    "recallBudget": {
+      "label": "Recall Budget",
+      "help": "Hindsight recall budget (low, mid, high) for auto-recall and the recall tools",
+      "advanced": true
+    },
+    "recallTypes": {
+      "label": "Recall Types",
+      "help": "Memory types auto-recall asks for (world, experience, observation); unset = all",
+      "advanced": true
+    },
+    "preferObservations": {
+      "label": "Prefer Observations",
+      "help": "Let an observation replace the raw facts it was built from; unset = the server's setting",
+      "advanced": true
+    },
+    "recallPromptPreamble": {
+      "label": "Recall Preamble",
+      "help": "Text above the injected memories block",
+      "advanced": true
+    },
+    "retainMission": {
+      "label": "Retain Mission",
+      "help": "Applied to each bank before its first write: what Hindsight should extract",
+      "advanced": true
+    },
+    "retainContext": {
+      "label": "Retain Context",
+      "help": "Context Hindsight gets with every retained transcript",
+      "advanced": true
+    },
+    "retainTags": {
+      "label": "Retain Tags",
+      "help": "Tags added to every retained memory (for example source:openclaw)",
+      "advanced": true
+    },
+    "excludeProviders": {
+      "label": "Excluded Providers",
+      "help": "Message providers that never recall or retain (for example heartbeat)",
+      "advanced": true
+    },
+    "skipOperationalSessions": {
+      "label": "Skip Operational Sessions",
+      "help": "No memory for cron, heartbeat and subagent sessions",
+      "advanced": true
+    },
+    "ignoreSessionPatterns": {
+      "label": "Ignored Sessions",
+      "help": "Session-key globs with no recall, no retain and no hindsight tools",
+      "advanced": true
+    },
+    "recallOnlySessionPatterns": {
+      "label": "Recall-Only Sessions",
+      "help": "Session-key globs that recall and read but never retain",
       "advanced": true
     },
     "retainQueueEnabled": {
@@ -94,21 +152,6 @@
       "help": "off: the cleaned message, first 800 characters. strip: remove OpenClaw internal-context blocks (the subagent task envelope) before the cap",
       "advanced": true
     },
-    "retainMission": {
-      "label": "Retain Mission",
-      "help": "Applied to each bank before its first write: what Hindsight should extract",
-      "advanced": true
-    },
-    "retainTags": {
-      "label": "Retain Tags",
-      "help": "Tags added to every retained memory (for example source:openclaw)",
-      "advanced": true
-    },
-    "knowledgeReadTools": {
-      "label": "Knowledge Base Read Tools",
-      "help": "Offer hindsight_get_knowledge_base_tree, hindsight_search_knowledge_base and hindsight_get_knowledge_page on the same bank as hindsight_recall",
-      "advanced": true
-    },
     "recallTopK": {
       "label": "Recall Top K",
       "help": "Cap on memories injected per turn by auto-recall; unset injects every result",
@@ -126,12 +169,95 @@
     },
     "recallHistoryPattern": {
       "label": "Recall History Pattern",
-      "help": "Queries matching this regex recall without the tag filter",
+      "help": "Queries matching this pattern recall without the tag filter. Words, \\b \\s \\d \\w, ^ $, | and one (?:a|b) group per | alternative; no quantifiers",
       "advanced": true
     },
     "recallTimeoutMs": {
       "label": "Recall Timeout (ms)",
       "help": "Longest a turn waits for auto-recall; lower it for interactive agents",
+      "advanced": true
+    },
+    "memoryPromptSection": {
+      "label": "Memory Prompt Section",
+      "help": "Add a short static section (under 80 words) on when to use hindsight_recall and hindsight_reflect and how to cite memories",
+      "advanced": true
+    },
+    "promptDirectives": {
+      "label": "Prompt Directives",
+      "help": "List the owner bank's active global Hindsight directives in the system prompt; read at startup and refreshed every 10 minutes in the background",
+      "advanced": true
+    },
+    "privateTranscriptRecall": {
+      "label": "Private Transcript Recall",
+      "help": "Let Active Memory's Remember across conversations read earlier private run transcripts of the same agent through hindsight_conversation_recall; needs a gateway restart",
+      "advanced": true
+    },
+    "knowledgeReadTools": {
+      "label": "Knowledge Base Read Tools",
+      "help": "Offer hindsight_get_knowledge_base_tree, hindsight_search_knowledge_base and hindsight_get_knowledge_page on the same bank as hindsight_recall",
+      "advanced": true
+    },
+    "listToolsWithoutAudience": {
+      "label": "List Tools Without Audience (deprecated)",
+      "help": "Ignored since 0.6.0; accepted so an old config still loads",
+      "advanced": true
+    },
+    "agentBankMap": {
+      "label": "Agent Bank Map",
+      "help": "Agent id to owner bank id, so several agents share one private bank (for example wb-dev and wb-dev2 to wb)",
+      "advanced": true
+    },
+    "agents": {
+      "label": "Per-agent recall overrides",
+      "help": "Agent id to auto-recall keys (autoRecall, recallTimeoutMs, recallTopK, recallMinScore, recallQueryShaping, recallTypes); unlisted agents use the global keys",
+      "advanced": true
+    },
+    "recallEarlyStart": {
+      "label": "Start Recall Early (Experimental)",
+      "help": "Experimental: start auto-recall at message arrival to hide part of its latency; needs a gateway restart",
+      "advanced": true
+    },
+    "recallStaleOnTimeout": {
+      "label": "Stale Block On Timeout (ms)",
+      "help": "On a recall timeout or while the breaker is open, reuse the session's last block if younger than this; 0 = off",
+      "advanced": true
+    },
+    "recallSkipEntities": {
+      "label": "Skip Entity Observations",
+      "help": "On by default: ask Hindsight not to build entity observations on auto-recall; false sends no include",
+      "advanced": true
+    },
+    "slotMode": {
+      "label": "Slot Mode",
+      "help": "replace memory-core, run beside it (sidecar), or auto from plugins.slots.memory"
+    },
+    "activeMemoryYield": {
+      "label": "Yield to Active Memory",
+      "help": "Sidecar: skip auto-recall when Active Memory recalls from Hindsight on the turn",
+      "advanced": true
+    },
+    "corpusSupplement": {
+      "label": "Corpus Supplement",
+      "help": "Sidecar: Hindsight hits in memory_search corpus=wiki|all for matching sessions",
+      "advanced": true
+    },
+    "corpusSupplementSessionPatterns": {
+      "label": "Corpus Supplement Sessions",
+      "help": "Session-key globs allowed to read the owner bank through memory_search",
+      "advanced": true
+    },
+    "memoryFileSync": {
+      "label": "Memory File Sync",
+      "help": "Retain workspace MEMORY.md, USER.md and memory/*.md into Hindsight on change"
+    },
+    "memoryFileSyncAgents": {
+      "label": "Memory File Sync Agents",
+      "help": "Agents whose memory files are synced; empty = default agent",
+      "advanced": true
+    },
+    "memoryFileSyncIntervalMs": {
+      "label": "Memory File Sync Interval",
+      "help": "Scan interval in milliseconds (1 minute to 1 day)",
       "advanced": true
     }
   },
@@ -277,7 +403,7 @@
       "recallHistoryPattern": {
         "type": "string",
         "maxLength": 500,
-        "description": "Case-insensitive regular expression; a recall query that matches it runs without recallTagGroups (for history or status questions). Needs recallTagGroups"
+        "description": "Case-insensitive pattern; a recall query that matches it runs without recallTagGroups (for history or status questions). Needs recallTagGroups. Runs on the first 800 characters of every query. 0.9.0 narrows it to a grammar that cannot backtrack: literal text, escaped punctuation, \\b \\s \\d \\w, ^, $, | and one unquantified (?:a|b) group per | alternative. A 0.8.0 pattern with a quantifier (* + ? {n}), a character class, ., a capture group, a backreference, a lookaround or a nested group now fails to load with an error naming the first bad token"
       },
       "recallTimeoutMs": {
         "type": "integer",
@@ -285,6 +411,21 @@
         "maximum": 30000,
         "default": 10000,
         "description": "Auto-recall request timeout in milliseconds. After 3 timeouts, network errors or HTTP 5xx in a row, auto-recall skips for 60 s, then probes once"
+      },
+      "memoryPromptSection": {
+        "type": "boolean",
+        "default": false,
+        "description": "Add a short static memory section to the system prompt: recalled memories are data, when to call hindsight_recall and hindsight_reflect, and how to cite them. Read at startup"
+      },
+      "promptDirectives": {
+        "type": "boolean",
+        "default": false,
+        "description": "List the owner bank's active global directives (hard rules, highest priority first, at most 20) in the system prompt, so the agent follows them outside reflect too. Fetched at startup and refreshed every 10 minutes in the background, never per turn. Shown in every session of the agent, group chats included. Needs a gateway restart"
+      },
+      "privateTranscriptRecall": {
+        "type": "boolean",
+        "default": false,
+        "description": "Declare protected private transcript recall to Active Memory and offer hindsight_conversation_recall. It returns raw transcript chunks of earlier private runs of the same agent that pass OpenClaw's same-agent private rules. Sessions forgotten with openclaw memory forget are not seen; use openclaw hindsight forget. Read at startup"
       },
       "knowledgeReadTools": {
         "type": "boolean",
@@ -302,6 +443,106 @@
           "type": "string",
           "minLength": 1
         }
+      },
+      "agents": {
+        "type": "object",
+        "description": "Per-agent auto-recall settings, keyed by agent id (normalized like agentBankMap keys). An entry replaces these global keys on that agent's turns: autoRecall, recallTimeoutMs, recallTopK, recallMinScore, recallQueryShaping, recallTypes. An agent without an entry uses the global keys. Bank selection is not allowed here",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "autoRecall": {
+              "type": "boolean"
+            },
+            "recallTimeoutMs": {
+              "type": "integer",
+              "minimum": 250,
+              "maximum": 30000
+            },
+            "recallTopK": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            },
+            "recallMinScore": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "recallQueryShaping": {
+              "type": "string",
+              "enum": ["off", "strip"]
+            },
+            "recallTypes": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["world", "experience", "observation"]
+              }
+            }
+          }
+        }
+      },
+      "recallEarlyStart": {
+        "type": "boolean",
+        "default": false,
+        "description": "Experimental. Start auto-recall when the message arrives (message_received) and await it in before_prompt_build, so part of the recall overlaps host work. Used only when the turn's bank and request match (and the run, when both hooks carry a run id), the early request answered and it is younger than recallTimeoutMs plus 5 s; otherwise recalled again. A timed-out early request is not sent again (the turn counts the timeout and gets the stale block or nothing); a fast failure is sent again once. An early request no turn takes never counts toward the recall breaker. The first turn of a session after a restart is not started early. Needs a gateway restart to turn on"
+      },
+      "recallStaleOnTimeout": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 3600000,
+        "default": 0,
+        "description": "On an auto-recall timeout, or a turn skipped while the recall breaker is open, inject the session's last recalled block from the same bank and request settings if it is younger than this many milliseconds; forgotten at session_end; 0 = off"
+      },
+      "recallSkipEntities": {
+        "type": "boolean",
+        "default": true,
+        "description": "Send include.entities = null on auto-recall, so Hindsight does not build entity observations the plugin never reads. On by default since a recall A/B on 139 queries returned the same results in the same order either way; set false to send no include"
+      },
+      "slotMode": {
+        "type": "string",
+        "enum": ["auto", "replace", "sidecar"],
+        "default": "auto",
+        "description": "replace: own plugins.slots.memory and replace memory-core. sidecar: run beside the slot owner (memory-core) with hooks and hindsight_* tools only; never registers the memory runtime and never shadows memory_search. auto: replace when plugins.slots.memory names this plugin, else sidecar. Read at startup"
+      },
+      "activeMemoryYield": {
+        "type": "boolean",
+        "default": false,
+        "description": "Sidecar only: skip the auto-recall block on a turn where Active Memory will recall from Hindsight (enabled, mode always, agent targeted, hindsight_recall in its toolsAllow, chat type and chat id allowed). Active Memory's per-session toggle is not visible to this plugin, so a session toggled off with it gets no memory block; off by default"
+      },
+      "corpusSupplement": {
+        "type": "boolean",
+        "default": false,
+        "description": "Sidecar only: add owner-bank Hindsight hits to memory_search with corpus=wiki or corpus=all, and let memory_get read them by their hindsight/<id> path. The host passes supplements no memory audience, so only sessions matching corpusSupplementSessionPatterns get results. Read at startup"
+      },
+      "corpusSupplementSessionPatterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": ["agent:*:main"],
+        "description": "Session-key globs whose memory_search may read the owner bank through the corpus supplement. Default: each agent's main session. Sandboxed, incognito and excluded sessions never get results"
+      },
+      "memoryFileSync": {
+        "type": "boolean",
+        "default": false,
+        "description": "Retain MEMORY.md, USER.md and memory/**/*.md of the synced agents' workspaces into their owner bank, one document per file (document id = workspace-relative path, update_mode replace), and delete the document when the file goes. Same ids as hindsight-memory-sync.sh. Runs in the gateway"
+      },
+      "memoryFileSyncAgents": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "description": "Agents whose workspace memory files memoryFileSync sends; empty = the default agent"
+      },
+      "memoryFileSyncIntervalMs": {
+        "type": "integer",
+        "minimum": 60000,
+        "maximum": 86400000,
+        "default": 600000,
+        "description": "How often memoryFileSync scans the workspaces for changed files, in milliseconds"
       }
     }
   }

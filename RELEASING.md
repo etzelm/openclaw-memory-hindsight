@@ -104,7 +104,8 @@ does not exist until this is on. Enable it before you push the release commit th
    `npm version X.Y.Z --no-git-tag-version`. Add a `## X.Y.Z (YYYY-MM-DD)` section to
    `CHANGELOG.md`, with an upgrade note for a minor release. Update the version in the
    `SECURITY.md` table ("Latest release (X.Y.Z today)"). Open an MR, wait for the pipeline,
-   merge to `develop`.
+   merge to `develop`. The date is the tag day: on the tag build, `src/release-metadata.test.ts`
+   fails when it is more than a day off, so after a soak update it before step 2.
 2. In a local clone with both remotes (`origin` = GitLab, `github` = GitHub):
 
    ```bash

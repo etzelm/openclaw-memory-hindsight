@@ -8,6 +8,8 @@ import { boundedSignal, type HindsightKnowledgeNode, isBankNotFound } from "./cl
 import {
   GET_TIMEOUT_MS,
   RECALL_MAX_TOKENS,
+  RECALL_TYPES,
+  type RecallType,
   recallFilterFor,
   RECALL_TIMEOUT_MS,
   REFLECT_TIMEOUT_MS,
@@ -43,6 +45,93 @@ function requiredString(params: Record<string, unknown>, name: string): string {
     throw new Error(`Missing required parameter: ${name}`);
   }
   return value.trim();
+}
+
+/** An optional parameter the model left out: absent, `null` or a blank string. */
+function isUnset(value: unknown): boolean {
+  return value === undefined || value === null || (typeof value === "string" && !value.trim());
+}
+
+/** `types` from a tool call: undefined when unset, else a non-empty list of known types. */
+function optionalTypes(params: Record<string, unknown>): RecallType[] | undefined {
+  const value = params.types;
+  if (isUnset(value)) {
+    return undefined;
+  }
+  const types = Array.isArray(value)
+    ? value.map((entry) => RECALL_TYPES.find((type) => type === entry))
+    : [];
+  if (types.length === 0 || types.some((type) => type === undefined)) {
+    throw new Error(`types must be a list of ${RECALL_TYPES.join(", ")}`);
+  }
+  return [...new Set(types as RecallType[])];
+}
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const ISO_DATE_TIME =
+  /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|[+-](\d{2}):?(\d{2}))?$/i;
+const DAY_MS = 86_400_000;
+
+/** Midnight UTC of a YYYY-MM-DD day, or NaN for a day the calendar does not have. */
+function calendarDay(text: string): number {
+  const ms = Date.parse(`${text}T00:00:00Z`);
+  // Date.parse rolls 2026-02-31 over to March; refuse it.
+  return Number.isNaN(ms) || new Date(ms).toISOString().slice(0, 10) !== text ? Number.NaN : ms;
+}
+
+/** A date-time whose day, hour (0-23), minute, second (0-59) and offset all exist, else NaN. */
+function dateTime(text: string): number {
+  const m = ISO_DATE_TIME.exec(text);
+  if (
+    !m ||
+    Number.isNaN(calendarDay(m[1]!)) ||
+    Number(m[2]) > 23 ||
+    Number(m[3]) > 59 ||
+    Number(m[4] ?? 0) > 59 ||
+    Number(m[6] ?? 0) > 23 ||
+    Number(m[7] ?? 0) > 59
+  ) {
+    return Number.NaN;
+  }
+  return Date.parse(m[5] ? text : `${text}Z`);
+}
+
+/**
+ * `since` or `until` as an ISO instant. A time without an offset is UTC (as Hindsight reads it);
+ * a date-only `until` is the end of that day.
+ */
+function optionalInstant(params: Record<string, unknown>, name: "since" | "until") {
+  const value = params[name];
+  if (isUnset(value)) {
+    return undefined;
+  }
+  const text = typeof value === "string" ? value.trim() : "";
+  const dateOnly = ISO_DATE.test(text);
+  const ms = dateOnly ? calendarDay(text) : dateTime(text);
+  if (Number.isNaN(ms)) {
+    throw new Error(
+      `${name} must be an ISO 8601 date or date-time, like 2026-11-01 or 2026-11-01T09:00:00Z`,
+    );
+  }
+  return dateOnly && name === "until" ? ms + DAY_MS - 1 : ms;
+}
+
+/** Hindsight's temporal_window from `since` and `until`; an open end is the epoch or now. */
+function temporalWindow(params: Record<string, unknown>) {
+  const since = optionalInstant(params, "since");
+  const until = optionalInstant(params, "until");
+  if (since === undefined && until === undefined) {
+    return undefined;
+  }
+  const start = since ?? 0;
+  const end = until ?? Date.now();
+  if (until === undefined && end < start) {
+    throw new Error("since must not be in the future");
+  }
+  if (end < start) {
+    throw new Error("until must not be earlier than since");
+  }
+  return { start: new Date(start).toISOString(), end: new Date(end).toISOString() };
 }
 
 /**
@@ -207,9 +296,31 @@ export function createRecallTool(
       "Search long-term memory. Returns memories ranked by relevance using semantic search, keyword matching, entity graph traversal, and reranking.",
     parameters: Type.Object({
       query: Type.String({ description: "What to search for." }),
+      types: Type.Optional(
+        Type.Array(Type.Union(RECALL_TYPES.map((type) => Type.Literal(type))), {
+          minItems: 1,
+          description:
+            "Only these memory types: world (facts), experience (what the agent did), observation (consolidated). Default: all.",
+        }),
+      ),
+      since: Type.Optional(
+        Type.String({
+          description:
+            "ISO date or date-time. Memories dated from then on rank higher; this ranks, it does not filter, so older memories can still appear.",
+        }),
+      ),
+      until: Type.Optional(
+        Type.String({
+          description:
+            "ISO date (whole day) or date-time. Memories dated up to then rank higher; it does not filter.",
+        }),
+      ),
     }),
     async execute(_toolCallId, rawParams, signal) {
-      const query = requiredString(asOptionalRecord(rawParams) ?? {}, "query");
+      const params = asOptionalRecord(rawParams) ?? {};
+      const query = requiredString(params, "query");
+      const types = optionalTypes(params);
+      const window = temporalWindow(params);
       const config = service.config();
       assertCurrent(ctx, signal);
       let results;
@@ -217,11 +328,12 @@ export function createRecallTool(
         results = await service.client.recall(bank.bankId, query, {
           budget: config.recallBudget,
           maxTokens: RECALL_MAX_TOKENS,
-          ...(config.recallTypes ? { types: config.recallTypes } : {}),
+          ...((types ?? config.recallTypes) ? { types: types ?? config.recallTypes } : {}),
           ...(config.preferObservations === undefined
             ? {}
             : { preferObservations: config.preferObservations }),
           ...recallFilterFor(config, query),
+          ...(window ? { temporalWindow: window } : {}),
           // README promises a 10 s recall timeout; the host signal alone may wait far longer.
           signal: boundedSignal(RECALL_TIMEOUT_MS, signal),
         });
@@ -261,14 +373,24 @@ export function createReflectTool(
       "Synthesize a reasoned answer from long-term memories. Unlike recall, this reasons across all stored memories to produce a coherent response.",
     parameters: Type.Object({
       query: Type.String({ description: "The question to reflect on." }),
+      types: Type.Optional(
+        Type.Array(Type.Union(RECALL_TYPES.map((type) => Type.Literal(type))), {
+          minItems: 1,
+          description:
+            "Only reason over these memory types: world (facts), experience (what the agent did), observation (consolidated). Default: all.",
+        }),
+      ),
     }),
     async execute(_toolCallId, rawParams, signal) {
-      const query = requiredString(asOptionalRecord(rawParams) ?? {}, "query");
+      const params = asOptionalRecord(rawParams) ?? {};
+      const query = requiredString(params, "query");
+      const types = optionalTypes(params);
       assertCurrent(ctx, signal);
       let text: string;
       try {
         text = await service.client.reflect(bank.bankId, query, {
           budget: service.config().recallBudget,
+          ...(types ? { types } : {}),
           signal: boundedSignal(REFLECT_TIMEOUT_MS, signal),
         });
       } catch (error) {

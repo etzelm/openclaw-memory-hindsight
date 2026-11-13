@@ -167,6 +167,24 @@ first release with the fix. `CLI_AUDIENCE_FIXED_IN=main` is for the time between
 upstream main (closed 2026-11-09) but in no release yet (2026.11.3 and 2026.11.5-beta.2 still
 give CLI hooks no audience), so main must pass and every release still fails as expected.
 
+### Sidecar lane
+
+`--slots owner,sidecar` runs each host and runtime twice: once with the plugin in the memory slot
+(owner) and once as a sidecar beside memory-core (`live-proof.sh --slot sidecar`). The sidecar
+cell installs the kind-less test build from `scripts/sidecar-variant.mjs` (released hosts load
+no non-owner memory plugin until openclaw#198445; the build is for this lane only, not an install
+route), keeps
+`plugins.slots.memory` on `memory-core` and sets `slotMode: sidecar`. H2 checks that the build
+loads beside memory-core and H3 that `memory.status` comes from memory-core, not Hindsight. The
+hook checks (A1 to A3, B1 to B4, C1) run as in the owner cell. S1, S2, A4, M1, M2 and C2 call the
+host memory provider, which memory-core owns in a sidecar cell, so they are SKIP with
+"sidecar: memory-core owns the host memory provider" and the cell reads
+"PASS 14/20, 6 provider checks n/a (sidecar)". The matrix shows the lane as its own column
+(`embedded sidecar`, `claude-cli sidecar`).
+
+The nightly job runs the latest release tag, so the lane is in nightly runs from the first release
+that has it; add `--slots owner,sidecar` to `HS_COMPAT_ARGS` then.
+
 ## Offline checks: host types, API contract, retain queue model
 
 Three checks that need no Hindsight, model or Gateway:

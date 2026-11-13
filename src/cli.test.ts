@@ -83,6 +83,7 @@ function boot(params: {
   slot?: string;
   tty?: boolean;
   confirm?: boolean;
+  hasMemoryKind?: boolean;
 }) {
   const pluginConfig = params.pluginConfig ?? {
     hindsightApiUrl: "http://hindsight.test",
@@ -126,7 +127,10 @@ function boot(params: {
       return params.confirm ?? false;
     },
   };
-  registerHindsightCli(api, { runtime });
+  registerHindsightCli(api, {
+    runtime,
+    ...(params.hasMemoryKind === undefined ? {} : { hasMemoryKind: () => params.hasMemoryKind! }),
+  });
   const [registrar, opts] = registerCli.mock.calls[0]!;
   const program = new FakeCommand("openclaw");
   registrar({ program, parentPath: [], config, logger: api.logger });
@@ -164,12 +168,25 @@ describe("openclaw hindsight: registration", () => {
       descriptors: [
         {
           name: "hindsight",
-          description: "Inspect and maintain Hindsight memory (status, doctor, forget)",
+          description:
+            "Inspect and maintain Hindsight memory (status, doctor, recall, queue, forget, directives, memory, consolidate, export, sync-memory-files)",
           hasSubcommands: true,
         },
       ],
     });
-    expect([...root.children.keys()]).toEqual(["status", "doctor", "forget"]);
+    expect([...root.children.keys()]).toEqual([
+      "status",
+      "doctor",
+      "recall",
+      "queue",
+      "forget",
+      "directives",
+      "memory",
+      "consolidate",
+      "export",
+      "sync-memory-files",
+    ]);
+    expect([...root.children.get("directives")!.children.keys()]).toEqual(["list", "add", "rm"]);
     const { readFileSync } = await import("node:fs");
     const manifest = JSON.parse(
       readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
@@ -302,11 +319,23 @@ describe("openclaw hindsight doctor", () => {
     expect(calls).toEqual([]);
   });
 
-  it("warns when another plugin owns the slot, and fails a rejected token", async () => {
+  it("fails the slot check when a build without manifest kind owns the slot", async () => {
+    serve(healthy);
+    const { run } = boot({ hasMemoryKind: false });
+    const res = await run("doctor");
+    expect(res.out).toContain(
+      "FAIL memory slot: this build has no manifest kind memory, so the host refuses its memory runtime while plugins.slots.memory names it",
+    );
+    expect(res.exit).toBe(1);
+    const ok = boot({ hasMemoryKind: true });
+    expect((await ok.run("doctor")).out).toContain("PASS memory slot: owner");
+  });
+
+  it("passes a sidecar beside the slot owner, and fails a rejected token", async () => {
     serve({ ...healthy, "GET /v1/default/banks": () => ({ status: 401, json: {} }) });
     const { run } = boot({ slot: "memory-core" });
     const res = await run("doctor");
-    expect(res.out).toContain("WARN memory slot: memory-core owns plugins.slots.memory");
+    expect(res.out).toContain('PASS memory slot: sidecar beside "memory-core" (mode auto)');
     expect(res.out).toContain("FAIL auth: Hindsight answered HTTP 401");
     expect(res.exit).toBe(1);
   });
@@ -337,6 +366,18 @@ describe("openclaw hindsight doctor", () => {
     });
     expect(unreadable.err).toContain("cannot read --token-file (ENOENT)");
     expect(unreadable.exit).toBe(1);
+  });
+
+  it("fails an empty --token-file instead of sending no token (G5)", async () => {
+    serve(healthy);
+    const tokenFile = join(stateDir, "token");
+    writeFileSync(tokenFile, "  \n", { mode: 0o600 });
+    const { run } = boot({});
+    const res = await run("doctor", { tokenFile });
+    expect(res.out).not.toContain("PASS token source");
+    expect(`${res.out}${res.err}`).toContain("--token-file is empty");
+    expect(res.exit).toBe(1);
+    expect(calls).toEqual([]);
   });
 
   it("warns about an unresolved SecretRef, an old server and queued retains", async () => {
@@ -482,6 +523,47 @@ describe("openclaw hindsight forget", () => {
     expect(res.err).toContain("1 retain of this session is still queued");
     expect(res.exit).toBe(1);
     expect(calls).toEqual([]);
+  });
+
+  it("refuses when the retain queue cannot be read (G4)", async () => {
+    serve(forgetRoutes());
+    // A directory where the queue file should be: reading it fails with EISDIR.
+    mkdirSync(retainQueuePath(stateDir), { recursive: true });
+    const { run } = boot({ confirm: true });
+    const res = await run("forget", { session: SESSION, yes: true });
+    expect(res.err).toContain("forget: cannot read the retain queue");
+    expect(res.err).toContain("a queued copy could bring the text back after the delete");
+    expect(res.exit).toBe(1);
+    expect(calls).toEqual([]);
+  });
+
+  it("refuses a bank id of . or .. (G8)", async () => {
+    serve(forgetRoutes());
+    const { run } = boot({});
+    for (const bank of [".", "..", " "]) {
+      const res = await run("forget", { session: SESSION, bank, dryRun: true });
+      expect(res.err).toContain("forget: --bank must be a bank id");
+      expect(res.exit).toBe(1);
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it("says when it stops listing at the page limit (G8)", async () => {
+    serve({
+      [`GET ${documentsPath("dev")}`]: (url) => {
+        const offset = Number(url.searchParams.get("offset") ?? 0);
+        return docs(
+          "dev",
+          Array.from({ length: 100 }, (_, i) => runDocumentId(SESSION, `r${offset + i}`)),
+        )(url);
+      },
+      [`GET ${documentsPath(CONV_BANK)}`]: docs(CONV_BANK, []),
+    });
+    const { run } = boot({});
+    const res = await run("forget", { session: SESSION, dryRun: true });
+    expect(res.err).toContain(
+      "forget: stopped listing dev after 10000 documents; run forget again after this one to find the rest",
+    );
   });
 
   it("uses --bank and --agent when given, and needs an agent for a non-agent key", async () => {

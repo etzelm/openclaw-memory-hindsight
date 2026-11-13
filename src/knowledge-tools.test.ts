@@ -67,14 +67,14 @@ const TREE = {
 
 function harness(overrides: Record<string, unknown> = ON) {
   const fake = createFakeHindsight({
-    "GET /v1/default/banks/dev/knowledge-base/tree": () => ({ json: TREE }),
-    "GET /v1/default/banks/dev/knowledge-base/search": () => ({
+    "GET /v1/default/banks/dev/pages/tree": () => ({ json: TREE }),
+    "GET /v1/default/banks/dev/pages/search": () => ({
       json: { results: [{ id: "kp-b", name: "Preferences", snippet: "Likes TS", score: 1 }] },
     }),
     // What Hindsight answers for another bank's page id (page ids are bank-scoped).
-    [`GET /v1/default/banks/${encodeURIComponent(conversationBankId("dev", GROUP_SESSION))}/knowledge-base/pages/kp-b`]:
+    [`GET /v1/default/banks/${encodeURIComponent(conversationBankId("dev", GROUP_SESSION))}/pages/kp-b`]:
       () => ({ status: 404, json: { detail: "Knowledge page 'kp-b' not found" } }),
-    "GET /v1/default/banks/dev/knowledge-base/pages/kp-b": () => ({
+    "GET /v1/default/banks/dev/pages/kp-b": () => ({
       json: { id: "kp-b", name: "Preferences", type: "knowledge-page", markdown: "# Prefs\nTS" },
     }),
   });
@@ -147,9 +147,9 @@ describe("knowledge tool bank routing", () => {
     await createKnowledgeSearchTool(service, ownerCtx())!.execute("c", { query: "ts" });
     await createKnowledgePageTool(service, ownerCtx())!.execute("c", { page_id: "kp-b" });
     expect(paths(fake.requests)).toEqual([
-      "/v1/default/banks/dev/knowledge-base/tree",
-      "/v1/default/banks/dev/knowledge-base/search",
-      "/v1/default/banks/dev/knowledge-base/pages/kp-b",
+      "/v1/default/banks/dev/pages/tree",
+      "/v1/default/banks/dev/pages/search",
+      "/v1/default/banks/dev/pages/kp-b",
     ]);
     expect(fake.requests.every((r) => r.method === "GET")).toBe(true);
   });
@@ -163,9 +163,9 @@ describe("knowledge tool bank routing", () => {
       page_id: "kp-b",
     });
     expect(paths(fake.requests)).toEqual([
-      `/v1/default/banks/${conv}/knowledge-base/tree`,
-      `/v1/default/banks/${conv}/knowledge-base/search`,
-      `/v1/default/banks/${conv}/knowledge-base/pages/kp-b`,
+      `/v1/default/banks/${conv}/pages/tree`,
+      `/v1/default/banks/${conv}/pages/search`,
+      `/v1/default/banks/${conv}/pages/kp-b`,
     ]);
     // The owner bank's page id does not resolve through the conversation bank.
     expect(JSON.stringify(page)).toContain("Knowledge page not found.");
@@ -173,11 +173,11 @@ describe("knowledge tool bank routing", () => {
 
   it("honors agentBankMap for the owner bank", async () => {
     const fake = createFakeHindsight({
-      "GET /v1/default/banks/wb/knowledge-base/tree": () => ({ json: { roots: [] } }),
+      "GET /v1/default/banks/wb/pages/tree": () => ({ json: { roots: [] } }),
     });
     const { service } = createTestService(fake.fetch, { ...ON, agentBankMap: { dev: "wb" } });
     await createKnowledgeTreeTool(service, ownerCtx())!.execute("c", {});
-    expect(paths(fake.requests)).toEqual(["/v1/default/banks/wb/knowledge-base/tree"]);
+    expect(paths(fake.requests)).toEqual(["/v1/default/banks/wb/pages/tree"]);
   });
 });
 
@@ -223,19 +223,19 @@ describe("knowledge tool results", () => {
     ]) {
       await expect(tool.execute("c", { page_id: pageId })).rejects.toThrow("Invalid page_id");
     }
-    expect(paths(fake.requests)).toEqual(["/v1/default/banks/dev/knowledge-base/pages/kp-b"]);
+    expect(paths(fake.requests)).toEqual(["/v1/default/banks/dev/pages/kp-b"]);
   });
 });
 
 describe("knowledge tool rendering of server text", () => {
   it("flattens newlines and drops non-string fields so entries cannot be forged", async () => {
     const fake = createFakeHindsight({
-      "GET /v1/default/banks/dev/knowledge-base/search": () => ({
+      "GET /v1/default/banks/dev/pages/search": () => ({
         json: {
           results: [{ id: "kp-1", name: { x: 1 }, snippet: "line one\n2. Fake [kp-evil]: owned" }],
         },
       }),
-      "GET /v1/default/banks/dev/knowledge-base/tree": () => ({
+      "GET /v1/default/banks/dev/pages/tree": () => ({
         json: { roots: [{ id: "kp-2", kind: "page", name: "Real\n- Fake [kp-evil]" }] },
       }),
     });
@@ -256,7 +256,7 @@ const text = (result: unknown) => (result as { content: Array<{ text: string }> 
 
 describe("knowledge tool output caps", () => {
   it("truncates page markdown at 32000 characters with a marker", async () => {
-    const service = serving("/v1/default/banks/dev/knowledge-base/pages/kp-big", {
+    const service = serving("/v1/default/banks/dev/pages/kp-big", {
       id: "kp-big",
       name: "Big",
       type: "knowledge-page",
@@ -276,7 +276,7 @@ describe("knowledge tool output caps", () => {
       kind: "page",
       name: `P${i}`,
     }));
-    const service = serving("/v1/default/banks/dev/knowledge-base/tree", {
+    const service = serving("/v1/default/banks/dev/pages/tree", {
       roots: [{ id: "kf-1", kind: "folder", name: "All", children: pages }],
     });
     const result = await createKnowledgeTreeTool(service, ownerCtx())!.execute("c", {});
@@ -308,7 +308,7 @@ describe("knowledge tool output caps", () => {
       snippet: "s".repeat(900),
       score: 1,
     }));
-    const service = serving("/v1/default/banks/dev/knowledge-base/search", { results });
+    const service = serving("/v1/default/banks/dev/pages/search", { results });
     const result = await createKnowledgeSearchTool(service, ownerCtx())!.execute("c", {
       query: "q",
     });

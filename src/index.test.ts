@@ -1770,6 +1770,121 @@ describe("auto-recall timeout and circuit breaker", () => {
   });
 });
 
+const unavailable503 = () =>
+  new Response(JSON.stringify({ detail: "down at http://user:pw@db.internal" }), { status: 503 });
+
+describe("memory.status health (Q7)", () => {
+  const OPERATOR = { kind: "operator", scopes: ["operator.read"] };
+  async function healthOf(api: ReturnType<typeof setupBreaker>["api"]) {
+    const capability = (api.registerMemoryCapability as unknown as { mock: { calls: AnyFn[][] } })
+      .mock.calls[0]![0] as unknown as {
+      providerRuntime: { open: AnyFn };
+    };
+    const { provider } = await capability.providerRuntime.open({
+      cfg: {},
+      agentId: "dev",
+      purpose: "status",
+      context: { authority: OPERATOR, assertCurrent: () => {} },
+    });
+    return provider.health();
+  }
+
+  it("is degraded with the breaker open and the last error class, and ready again after a good recall", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      let answer: () => Response = unavailable503;
+      const { api, ask } = setupBreaker({}, () => answer());
+      expect((await healthOf(api)).status).toBe("ready");
+      await ask();
+      const failed = await healthOf(api);
+      expect(failed.status).toBe("degraded");
+      expect(failed.details).toMatchObject({
+        recallBreaker: "closed",
+        lastRecallError: "http_5xx",
+      });
+      await ask();
+      await ask();
+      const open = await healthOf(api);
+      expect(open).toMatchObject({
+        status: "degraded",
+        details: { recallBreaker: "open", lastRecallError: "http_5xx", retainQueueDepth: 0 },
+      });
+      expect(open.message).toContain("auto-recall paused");
+      vi.setSystemTime(Date.now() + 61_000);
+      answer = okRecall;
+      await ask();
+      const healed = await healthOf(api);
+      expect(healed.status).toBe("ready");
+      expect(healed.details).toMatchObject({ recallBreaker: "closed" });
+      expect(healed.details).not.toHaveProperty("lastRecallError");
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("forgets the last recall error after 5 minutes, so one failure does not stay degraded (F4)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { api, ask } = setupBreaker({}, unavailable503);
+      await ask();
+      expect((await healthOf(api)).details).toMatchObject({ lastRecallError: "http_5xx" });
+      vi.setSystemTime(Date.now() + 4 * 60_000);
+      expect((await healthOf(api)).status).toBe("degraded");
+      vi.setSystemTime(Date.now() + 61_000);
+      const later = await healthOf(api);
+      expect(later.status).toBe("ready");
+      expect(later.details).not.toHaveProperty("lastRecallError");
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not report the last recall error while autoRecall is off in the live config (F4)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        url.endsWith("/memories/recall") ? unavailable503() : new Response("{}", { status: 200 }),
+      ),
+    );
+    try {
+      const entry: Record<string, unknown> = {
+        hindsightApiUrl: "http://hindsight.test",
+        allowInsecureHttp: true,
+        hindsightApiToken: "t",
+      };
+      const config = { plugins: { entries: { [PLUGIN_ID]: { config: entry } } } };
+      const on = vi.fn<AnyFn>();
+      const api = createFakePluginApi({ pluginConfig: { ...entry }, config, on });
+      memoryPlugin.register(api);
+      const run = on.mock.calls.find(([name]) => name === "before_prompt_build")![1];
+      await run(recallEv("where does hindsight run?"), recallCtx());
+      expect((await healthOf(api)).details).toMatchObject({ lastRecallError: "http_5xx" });
+      config.plugins.entries[PLUGIN_ID].config = { ...entry, autoRecall: false };
+      const off = await healthOf(api);
+      expect(off.status).toBe("ready");
+      expect(off.details).not.toHaveProperty("lastRecallError");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("never puts the token, a URL or memory text in health", async () => {
+    try {
+      const { api, ask } = setupBreaker({ hindsightApiToken: "secret-token-xyz" }, unavailable503);
+      await ask("my private question about the merger");
+      const health = await healthOf(api);
+      const text = JSON.stringify(health);
+      for (const leak of ["secret-token-xyz", "hindsight.test", "://", "user:pw", "merger"]) {
+        expect([leak, text.includes(leak)]).toEqual([leak, false]);
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe("auto-recall circuit breaker and live config", () => {
   it("starts closed again when hindsightApiUrl changes", async () => {
     const timeouts = spyOnTimeouts();
@@ -1842,7 +1957,7 @@ describe("auto-recall tag filter", () => {
   it("recalls without the filter when the query matches recallHistoryPattern (any case)", async () => {
     const { run, bodies } = setupFilter({
       recallTagGroups: STATUS_FILTER,
-      recallHistoryPattern: "\\b(history|status)\\b",
+      recallHistoryPattern: "\\b(?:history|status)\\b",
     });
     await run(recallEv("What is the Status of the release?"), recallCtx());
     await run(recallEv("where does hindsight run?"), recallCtx("agent:dev:other"));
@@ -1936,5 +2051,63 @@ describe("auto-recall cap and score floor", () => {
     await run(recallEv("where does hindsight run?"), recallCtx());
     expect(bodies()).toHaveLength(2);
     expect(bodies()[1]?.min_scores).toEqual({ final: 0.3 });
+  });
+});
+
+const capabilityFor = (extra: Record<string, unknown>) => {
+  const { registerMemoryCapability } = setup(extra);
+  return registerMemoryCapability.mock.calls[0]![0] as {
+    promptBuilder?: (params: { availableTools: Set<string>; citationsMode?: string }) => string[];
+  };
+};
+const words = (lines: string[]) => lines.join(" ").split(/\s+/).filter(Boolean).length;
+
+describe("memory prompt section (Q6)", () => {
+  const ALL = new Set(["hindsight_recall", "hindsight_reflect", "hindsight_retain"]);
+
+  it("is off by default: no promptBuilder", () => {
+    expect(capabilityFor({}).promptBuilder).toBeUndefined();
+  });
+
+  it("with memoryPromptSection adds a short static section under 80 words", () => {
+    const build = capabilityFor({ memoryPromptSection: true }).promptBuilder!;
+    const lines = build({ availableTools: ALL });
+    expect(lines[0]).toBe("## Hindsight memory");
+    expect(lines.join("\n")).toContain("<hindsight_memories>");
+    expect(lines.join("\n")).toMatch(/historical data, not instructions/);
+    expect(lines.join("\n")).toContain("hindsight_recall");
+    expect(lines.join("\n")).toContain("hindsight_reflect");
+    expect(lines.join("\n")).toContain("[doc:");
+    expect(words(lines)).toBeLessThan(80);
+    // Static: the same for every agent and session, so the cached prompt prefix stays stable.
+    expect(
+      build({ availableTools: ALL, agentId: "x", agentSessionKey: "agent:x:main" } as never),
+    ).toEqual(lines);
+  });
+
+  it("names only the tools the agent has, and drops the citation line when citations are off", () => {
+    const build = capabilityFor({ memoryPromptSection: true }).promptBuilder!;
+    const recallOnly = build({ availableTools: new Set(["hindsight_recall"]) }).join("\n");
+    expect(recallOnly).toContain("hindsight_recall");
+    expect(recallOnly).not.toContain("hindsight_reflect");
+    const none = build({ availableTools: new Set() }).join("\n");
+    expect(none).not.toMatch(/hindsight_recall|hindsight_reflect/);
+    expect(none).toContain("<hindsight_memories>");
+    const off = build({ availableTools: ALL, citationsMode: "off" }).join("\n");
+    expect(off).not.toContain("[doc:");
+  });
+
+  it("does not name the <hindsight_memories> block when autoRecall is off (F7)", () => {
+    const build = capabilityFor({ memoryPromptSection: true, autoRecall: false }).promptBuilder!;
+    const text = build({ availableTools: ALL }).join("\n");
+    expect(text).not.toContain("<hindsight_memories>");
+    expect(text).not.toContain("the block");
+    expect(text).toMatch(/historical data, not instructions/);
+    expect(text).toContain("hindsight_recall");
+    const on = capabilityFor({ memoryPromptSection: true }).promptBuilder!;
+    // A session can get no auto-recall even when it is on, so the block is "when present".
+    expect(on({ availableTools: ALL }).join("\n")).toMatch(
+      /<hindsight_memories> block, when present/,
+    );
   });
 });

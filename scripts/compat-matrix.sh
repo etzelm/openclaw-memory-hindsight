@@ -25,6 +25,9 @@
 # Options:
 #   --hosts "LIST"            hosts to test, separated by spaces or commas
 #   --runtimes "LIST"         runtimes to test, separated by spaces or commas
+#   --slots "LIST"            owner (default) and/or sidecar: each runtime runs once per slot
+#                             role; a sidecar cell runs live-proof.sh --slot sidecar and shows
+#                             as its own column "<runtime> sidecar"
 #   --plugin SPEC             passed to live-proof.sh (default: this checkout)
 #   --results-dest DEST       copy the run dir here with $RESULTS_PUT (default cp -R), then
 #                             delete the local copy
@@ -44,7 +47,7 @@ umask 077
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 HARNESS=$SCRIPT_DIR/live-proof.sh
-HOSTS="floor latest main"; RUNTIMES="embedded claude-cli"; PLUGIN=""; RESULTS_DEST=""
+HOSTS="floor latest main"; RUNTIMES="embedded claude-cli"; SLOTS="owner"; PLUGIN=""; RESULTS_DEST=""
 RENDER=""; SELF_TEST=0; PASS_ARGS=()
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 need() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 needs a value" >&2; exit 2; }; }
@@ -52,6 +55,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --hosts) need "$@"; HOSTS=$(printf '%s' "$2" | tr ',' ' '); shift 2 ;;
     --runtimes) need "$@"; RUNTIMES=$(printf '%s' "$2" | tr ',' ' '); shift 2 ;;
+    --slots) need "$@"; SLOTS=$(printf '%s' "$2" | tr ',' ' '); shift 2 ;;
     --plugin) need "$@"; PLUGIN=$2; shift 2 ;;
     --results-dest) need "$@"; RESULTS_DEST=$2; shift 2 ;;
     --render) need "$@"; RENDER=$2; shift 2 ;;
@@ -66,6 +70,9 @@ done
 # No word splitting or globbing here: only test that each list holds a non-blank character.
 case "$HOSTS" in *[![:space:]]*) ;; *) echo "--hosts needs at least one entry" >&2; exit 2 ;; esac
 case "$RUNTIMES" in *[![:space:]]*) ;; *) echo "--runtimes needs at least one entry" >&2; exit 2 ;; esac
+for sl in $SLOTS; do
+  case "$sl" in owner|sidecar) ;; *) echo "--slots takes owner and sidecar, not $sl" >&2; exit 2 ;; esac
+done
 
 # render RUN_DIR: classify every cell and write MATRIX.md + matrix.json; exit 1 on an unexpected cell
 render() {
@@ -97,11 +104,15 @@ ALL_IDS = ["H1", "H2", "H3", "S1", "S2", "R1", "A1", "A2", "A3", "A4", "B1", "B2
            "M1", "M2", "C1", "C2", "X1", "X2"]
 # The only SKIP reasons the harness writes on purpose.
 SKIP_OK = ("agent exec shell:", "--setup-only")
+# Sidecar cells skip the host-provider checks on purpose: memory-core owns the provider.
+SIDECAR_SKIP = "sidecar: "
+lane = lambda r: r["runtime"] + (" sidecar" if r.get("slot") == "sidecar" else "")
 
 def classify(r, driver_exit):
     checks = {c["id"]: c for c in r.get("checks", [])}
     failing = sorted(i for i, c in checks.items() if c["result"] == "FAIL")
-    skipped = sorted(i for i, c in checks.items() if c["result"] == "SKIP")
+    skipped = sorted(i for i, c in checks.items() if c["result"] == "SKIP"
+                     and not (r.get("slot") == "sidecar" and c["observed"].startswith(SIDECAR_SKIP)))
     cli_known = r.get("runtime") == "claude-cli" and expect_cli_fail(r.get("openclaw", {}))
     # Only the judged session's part: B1 also lists other sessions' hooks after "; other sessions:",
     # and a heartbeat there with no audience must not make a real B1 failure look expected.
@@ -127,7 +138,8 @@ def classify(r, driver_exit):
         return "partial", f"setup PASS, {len(skipped)} turn checks SKIP"
     if cli_known:
         return "unexpected", "PASS (claude-cli was expected to FAIL; update CLI_AUDIENCE_FIXED_IN)"
-    return "expected", f"PASS {len(checks)}/{len(checks)}"
+    passed = sum(c["result"] == "PASS" for c in checks.values())
+    return "expected", f"PASS {passed}/{len(checks)}" + ("" if passed == len(checks) else f", {len(checks) - passed} provider checks n/a (sidecar)")
 
 meta = {}
 if os.path.exists(os.path.join(run, "run.json")):
@@ -152,12 +164,12 @@ for f in sorted(glob.glob(os.path.join(run, "cells", "*", "results.json"))):
 hosts, runtimes = list(dict.fromkeys(meta.get("hostLabels", {}).values())), [r for r in meta.get("runtimes", [])]
 for c in cells:
     r = c["results"]
-    suffix = "-" + r["runtime"]
+    suffix = "-" + r["runtime"] + ("-sidecar" if r.get("slot") == "sidecar" else "")
     h = r["phase"][: -len(suffix)] if r["phase"].endswith(suffix) else r["phase"]
     c["host"] = meta.get("hostLabels", {}).get(h, h)
     if c["host"] not in hosts: hosts.append(c["host"])
-    if r["runtime"] not in runtimes: runtimes.append(r["runtime"])
-grid = {(c["host"], c["results"]["runtime"]): c for c in cells}
+    if lane(r) not in runtimes: runtimes.append(lane(r))
+grid = {(c["host"], lane(c["results"])): c for c in cells}
 unexpected = [c for c in cells if c["status"] == "unexpected"]
 # A requested cell without results.json (the harness died before writing it) is unexpected too.
 missing = [(h, rt) for h in hosts for rt in runtimes if (h, rt) not in grid] if meta else []
@@ -189,7 +201,7 @@ lines.append("## Cells")
 for c in cells:
     r = c["results"]
     o = r["openclaw"]
-    lines += ["", f"### {c['host']}, {r['runtime']}: {c['text']}", "",
+    lines += ["", f"### {c['host']}, {lane(r)}: {c['text']}", "",
               f"Host {o['kind']} {o['version']}{(' ' + o['commit'][:10]) if o.get('commit') else ''}; "
               f"plugin {r['plugin']['description']}; model {r['model']}; results `{c['dir']}`.", "",
               "| id | check | result | observed |", "|---|---|---|---|"]
@@ -247,7 +259,7 @@ for phase, (rt, v, ch, ec) in cases.items():
     fail = sum(c["result"] == "FAIL" for c in ch)
     code = ec if ec is not None else (1 if fail else 0)
     kind = "git" if phase.startswith("src-") else "npm"
-    json.dump({"phase": phase, "runtime": rt, "model": "m", "openclaw": {"kind": kind, "version": f"OpenClaw {v} (abc)", "commit": ""},
+    json.dump({"phase": phase, "runtime": rt, "slot": "sidecar" if phase.endswith("-sidecar") else "owner", "model": "m", "openclaw": {"kind": kind, "version": f"OpenClaw {v} (abc)", "commit": ""},
                "plugin": {"description": "test"}, "abort": None, "exitCode": code,
                "verdict": "FAIL" if fail or code else "PASS", "checks": ch},
               open(os.path.join(p, "results.json"), "w"))
@@ -327,6 +339,38 @@ json.dump({"runtimes": ["embedded"], "hostLabels": {"main": "main"}}, open(sys.a
   python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); m["setupOnly"]=True; json.dump(m, open(sys.argv[1], "w"))' "$d/run.json"
   render "$d"; p2=$?
   if [ "$p1" = 3 ] && [ "$p2" = 0 ]; then echo "self-test partial exit: PASS"; else echo "self-test partial exit: FAIL ($p1, $p2)"; st=1; fi
+  # Sidecar lane: its own column, provider checks SKIP by design, an extra SKIP still unexpected.
+  rm -rf "$d/cells" "$d/exits.tsv"
+  python3 -c '
+import json, os, sys
+d = sys.argv[1]
+IDS = ["H1","H2","H3","S1","S2","R1","A1","A2","A3","A4","B1","B2","B3","B4","M1","M2","C1","C2","X1","X2"]
+PROVIDER = ("S1", "S2", "A4", "M1", "M2", "C2")
+def cell(phase, slot, odd=False):
+    ch = []
+    for i in IDS:
+        side = slot == "sidecar" and (i in PROVIDER or (odd and i == "A1"))
+        ch.append({"id": i, "check": i, "want": "", "result": "SKIP" if side else "PASS",
+                   "observed": ("sidecar: memory-core owns the host memory provider" if i in PROVIDER else "odd") if side else "ok"})
+    os.makedirs(os.path.join(d, "cells", phase))
+    json.dump({"phase": phase, "runtime": "embedded", "slot": slot, "model": "m",
+               "openclaw": {"kind": "npm", "version": "OpenClaw 2026.11.3", "commit": ""},
+               "plugin": {"description": "t"}, "abort": None, "exitCode": 0, "verdict": "PASS", "checks": ch},
+              open(os.path.join(d, "cells", phase, "results.json"), "w"))
+cell("main-embedded", "owner"); cell("main-embedded-sidecar", "sidecar"); cell("odd-embedded-sidecar", "sidecar", odd=True)
+json.dump({"runtimes": ["embedded", "embedded sidecar"], "hostLabels": {"main": "main", "odd": "odd"}}, open(os.path.join(d, "run.json"), "w"))' "$d"
+  render "$d"
+  python3 -c '
+import json, sys
+m = json.load(open(sys.argv[1]))
+c = {x["dir"].split("/")[-1]: x for x in m["cells"]}
+ok = (c["main-embedded-sidecar"]["status"] == "expected"
+      and c["main-embedded-sidecar"]["text"] == "PASS 14/20, 6 provider checks n/a (sidecar)"
+      and c["main-embedded-sidecar"]["host"] == "main" and c["main-embedded"]["status"] == "expected"
+      and c["odd-embedded-sidecar"]["status"] == "unexpected"
+      and m["missing"] == ["odd embedded"] and "| OpenClaw | embedded | embedded sidecar |" in open(sys.argv[2]).read())
+print("self-test sidecar lane:", "PASS" if ok else "FAIL " + json.dumps({k: (v["status"], v["text"], v["host"]) for k, v in c.items()}) + str(m["missing"]))
+sys.exit(0 if ok else 1)' "$d/matrix.json" "$d/MATRIX.md" || st=1
   rm -rf "$d"
   return "$st"
 }
@@ -387,24 +431,31 @@ for h in $HOSTS; do
   SPECS+=("$spec"); SLUGS+=("$slug")
   LABELS=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d[sys.argv[2]]=sys.argv[3]; print(json.dumps(d))' "$LABELS" "$slug" "$label")
 done
-python3 -c 'import json,sys; json.dump({"startedAt": sys.argv[1], "hosts": sys.argv[2].split(), "runtimes": sys.argv[3].split(), "hostLabels": json.loads(sys.argv[4]), "setupOnly": sys.argv[6] == "true"}, open(sys.argv[5], "w"), indent=1)' \
-  "$STARTED" "$HOSTS" "$RUNTIMES" "$LABELS" "$RUN/run.json" "$SETUP_ONLY"
+# Columns: each runtime once per slot role, "<runtime> sidecar" for the sidecar role.
+LANES=""
+for rt in $RUNTIMES; do for sl in $SLOTS; do
+  if [ "$sl" = sidecar ]; then LANES="$LANES|$rt sidecar"; else LANES="$LANES|$rt"; fi
+done; done
+LANES=${LANES#|}
+python3 -c 'import json,sys; json.dump({"startedAt": sys.argv[1], "hosts": sys.argv[2].split(), "runtimes": sys.argv[3].split("|"), "hostLabels": json.loads(sys.argv[4]), "setupOnly": sys.argv[6] == "true"}, open(sys.argv[5], "w"), indent=1)' \
+  "$STARTED" "$HOSTS" "$LANES" "$LABELS" "$RUN/run.json" "$SETUP_ONLY"
 : > "$RUN/exits.tsv"
 
 for idx in "${!SPECS[@]}"; do
   spec=${SPECS[$idx]}; slug=${SLUGS[$idx]}
-  for rt in $RUNTIMES; do
-    echo "== cell host=$spec runtime=$rt"
-    "$HARNESS" --openclaw "$spec" --runtime "$rt" --phase "$slug-$rt" ${PLUGIN:+--plugin "$PLUGIN"} \
-      --host-dir "$RUN/hosts/$slug" --results-root "$RUN/cells.tmp" "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}" > "$RUN/cell-$slug-$rt.log" 2>&1
+  for rt in $RUNTIMES; do for sl in $SLOTS; do
+    cell=$slug-$rt; [ "$sl" = sidecar ] && cell=$cell-sidecar
+    echo "== cell host=$spec runtime=$rt slot=$sl"
+    "$HARNESS" --openclaw "$spec" --runtime "$rt" --slot "$sl" --phase "$cell" ${PLUGIN:+--plugin "$PLUGIN"} \
+      --host-dir "$RUN/hosts/$slug" --results-root "$RUN/cells.tmp" "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}" > "$RUN/cell-$cell.log" 2>&1
     ec=$?
     echo "exit=$ec"
-    printf '%s\t%s\n' "$slug-$rt" "$ec" >> "$RUN/exits.tsv"
-    for d in "$RUN"/cells.tmp/*; do [ -d "$d" ] && mv "$d" "$RUN/cells/$slug-$rt"; done
+    printf '%s\t%s\n' "$cell" "$ec" >> "$RUN/exits.tsv"
+    for d in "$RUN"/cells.tmp/*; do [ -d "$d" ] && mv "$d" "$RUN/cells/$cell"; done
     rmdir "$RUN/cells.tmp" 2>/dev/null
-    sed -n '/^== phase=/,$p' "$RUN/cell-$slug-$rt.log" | grep -v '^results: ' | head -30
-    echo "results: $RUN/cells/$slug-$rt"
-  done
+    sed -n '/^== phase=/,$p' "$RUN/cell-$cell.log" | grep -v '^results: ' | head -30
+    echo "results: $RUN/cells/$cell"
+  done; done
   rm -rf "$RUN/hosts/$slug"
 done
 render "$RUN"; st=$?

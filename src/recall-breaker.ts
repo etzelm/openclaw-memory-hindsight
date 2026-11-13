@@ -25,6 +25,24 @@ export function countsAsRecallOutage(error: unknown): boolean {
   return isTransportFailure(error);
 }
 
+/** The kind of failure of the last auto-recall: fixed words, never server text or URLs. */
+export type RecallErrorClass = "timeout" | "unreachable" | "http_4xx" | "http_5xx" | "error";
+
+/** Classifies a failed auto-recall for health. A host abort is not a failure: undefined. */
+export function recallErrorClass(error: unknown): RecallErrorClass | undefined {
+  const name = (error as { name?: unknown } | null)?.name;
+  if (name === "AbortError") {
+    return undefined;
+  }
+  if (name === "TimeoutError") {
+    return "timeout";
+  }
+  if (error instanceof HindsightHttpError) {
+    return error.status >= 500 ? "http_5xx" : "http_4xx";
+  }
+  return isTransportFailure(error) ? "unreachable" : "error";
+}
+
 /**
  * One breaker for auto-recall against the one configured server. After `threshold` outages in a
  * row it opens: auto-recall skips without a request for `cooldownMs`, then one probe goes out
@@ -37,6 +55,7 @@ export class RecallBreaker {
   private failures = 0;
   private openedAt: number | undefined;
   private probing = false;
+  private outages = 0;
 
   constructor(options: { now?: () => number; threshold?: number; cooldownMs?: number } = {}) {
     this.now = options.now ?? (() => Date.now());
@@ -54,6 +73,22 @@ export class RecallBreaker {
 
   state(): BreakerState {
     return this.openedAt === undefined ? "closed" : "open";
+  }
+
+  /**
+   * How many outages were recorded so far (never reset). An answer that arrived before the count
+   * moved says nothing about the server after that outage, so it must not close the breaker.
+   */
+  outageCount(): number {
+    return this.outages;
+  }
+
+  /**
+   * Frees the probe slot without recording an outcome or starting a new cool-down: the probe
+   * failed for a reason that says nothing about the server, so the next turn probes again.
+   */
+  releaseProbe(): void {
+    this.probing = false;
   }
 
   admit(): BreakerDecision {
@@ -75,6 +110,7 @@ export class RecallBreaker {
       this.reset();
       return wasOpen ? "closed" : "none";
     }
+    this.outages += 1;
     if (this.openedAt !== undefined) {
       // Open already: only the probe's answer counts; a late failure of an older request does not.
       if (!probe) {

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_RECALL_PROMPT_PREAMBLE,
@@ -492,7 +492,7 @@ describe("recallTagGroups and recallHistoryPattern", () => {
   const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
   const STAGED = [{ not: { tags: ["kind:status"], match: "any_strict" } }];
   const HISTORY =
-    "\\b(history|timeline|status|progress|what happened|when did|so far|previous|earlier|changed|still)\\b";
+    "\\b(?:history|timeline|status|progress|what happened|when did|so far|previous|earlier|changed|still)\\b";
 
   it("are unset by default", () => {
     const cfg = hindsightConfigSchema.parse(base);
@@ -557,6 +557,79 @@ describe("recallTagGroups and recallHistoryPattern", () => {
     expect(() =>
       hindsightConfigSchema.parse({ ...base, recallTagGroups: [(group as { not: unknown }).not] }),
     ).not.toThrow();
+  });
+
+  it("reject an empty history pattern, which would match every query (G3)", () => {
+    for (const value of ["", "   "]) {
+      expect(() =>
+        hindsightConfigSchema.parse({
+          ...base,
+          recallTagGroups: STAGED,
+          recallHistoryPattern: value,
+        }),
+      ).toThrow(/recallHistoryPattern must not be empty/);
+    }
+  });
+
+  // Spec change in 0.9.0 (allowlist grammar): still refused, by the first token outside the grammar.
+  it("reject a history pattern with nested quantifiers (G3)", () => {
+    for (const value of [
+      "(a+)+$",
+      "(\\w+\\s?)*$",
+      "((ab)+c)*x",
+      "(?:x{2,})+y",
+      "(a*){2,}b",
+      "^(\\d+)+$",
+    ]) {
+      expect(() =>
+        hindsightConfigSchema.parse({
+          ...base,
+          recallTagGroups: STAGED,
+          recallHistoryPattern: value,
+        }),
+      ).toThrow(/recallHistoryPattern: ".+" at character \d+ is /);
+    }
+  });
+
+  // Spec change in 0.9.0 (F3, F5, then the allowlist grammar): the vm timing probe is gone; these
+  // shapes are refused by the first token outside the grammar.
+  it("reject a history pattern that backtracks for too long on a worst-case query (G3)", () => {
+    for (const value of ["(a|a)*$", "(\\w|\\d)+$", "(.|a)*\\n"]) {
+      expect(() =>
+        hindsightConfigSchema.parse({
+          ...base,
+          recallTagGroups: STAGED,
+          recallHistoryPattern: value,
+        }),
+      ).toThrow(/recallHistoryPattern: ".+" at character \d+ is /);
+    }
+  });
+
+  it("tests the history pattern on the first 800 characters of a query only (G3)", () => {
+    const cfg = hindsightConfigSchema.parse({
+      ...base,
+      recallTagGroups: STAGED,
+      recallHistoryPattern: "zzz",
+    });
+    expect(recallFilterFor(cfg, `${"a".repeat(790)}zzz`)).toEqual({});
+    expect(recallFilterFor(cfg, `${"a".repeat(800)}zzz`)).toEqual({ tagGroups: STAGED });
+  });
+
+  // Spec change in 0.9.0 (allowlist grammar): no quantifiers, classes or capture groups.
+  it("accept the README pattern and other plain patterns (G3)", () => {
+    for (const value of [
+      HISTORY,
+      "(?:status|progress)\\sreport",
+      "\\b(?:when|since)\\b",
+      "\\+\\*",
+    ]) {
+      const cfg = hindsightConfigSchema.parse({
+        ...base,
+        recallTagGroups: STAGED,
+        recallHistoryPattern: value,
+      });
+      expect(cfg.recallHistoryPattern?.source).toBe(value);
+    }
   });
 
   it("reject a history pattern without groups, a bad regex, or one over 500 characters", () => {
@@ -646,5 +719,282 @@ describe("recallTopK and recallMinScore", () => {
     expect(props.recallMinScore).toMatchObject({ type: "number", minimum: 0, maximum: 1 });
     expect(props.recallTopK).not.toHaveProperty("default");
     expect(props.recallMinScore).not.toHaveProperty("default");
+  });
+});
+
+describe("memoryPromptSection (Q6)", () => {
+  const base = { hindsightApiUrl: "http://h", allowInsecureHttp: true };
+  it("defaults to false, accepts a boolean and is in the manifest", () => {
+    expect(hindsightConfigSchema.parse(base).memoryPromptSection).toBe(false);
+    expect(
+      hindsightConfigSchema.parse({ ...base, memoryPromptSection: true }).memoryPromptSection,
+    ).toBe(true);
+    expect(() => hindsightConfigSchema.parse({ ...base, memoryPromptSection: "yes" })).toThrow(
+      /memoryPromptSection/,
+    );
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ) as { configSchema: { properties: Record<string, unknown> } };
+    expect(manifest.configSchema.properties.memoryPromptSection).toMatchObject({
+      type: "boolean",
+      default: false,
+    });
+  });
+});
+
+const parseHistory = (recallHistoryPattern: string) =>
+  hindsightConfigSchema.parse({
+    hindsightApiUrl: "http://h",
+    allowInsecureHttp: true,
+    recallTagGroups: [{ tags: ["a"] }],
+    recallHistoryPattern,
+  });
+
+/** The refusal message for `token` at 1-based `at`, as a RegExp. */
+const refusal = (token: string, at: number, what: string) =>
+  new RegExp(
+    `recallHistoryPattern: "${token.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}" at character ${at} is ${what}`,
+  );
+
+const ANY_REFUSAL = /recallHistoryPattern: ".+" at character \d+ is .+; 0\.9\.0 accepts only/;
+
+/** 16 alternatives of \w{n} in one capture group: a refused shape (capture group, quantifier). */
+const wGroup = (n: number) => `(${Array.from({ length: 16 }, () => `\\w{${n}}`).join("|")})`;
+const alternatives = (branches: string[]) => `(?:${branches.join("|")})`;
+const a = (n: number) => Array.from({ length: n }, () => "a");
+
+describe("recallHistoryPattern allowlist grammar (0.9.0)", () => {
+  // Refused examples: every N1, N2 and N3 pattern from the 0.9.0 review, and slow shapes an
+  // earlier quantifier-counting guard let through. The grammar refuses each at its first bad token.
+  it("refuses every pattern from the review and the slow ones the denylist accepted", () => {
+    const a60 = "a".repeat(60);
+    const a200 = "a".repeat(200);
+    const slow = [
+      // N1
+      `${"(a|aa)".repeat(14)}c`,
+      `${"(a|aa)".repeat(18)}c`,
+      `${"(a|aa)".repeat(22)}c`,
+      `${"(a|aa)".repeat(26)}c`,
+      `${"(|a)".repeat(60)}${"a".repeat(60)}`,
+      `${"(a|b|ab)".repeat(28)}!`,
+      `${"(?:(a)|(aa))".repeat(24)}c`,
+      `${"(a|aa){1}".repeat(26)}c`,
+      `${"(?:a|aa)".repeat(22)}c`,
+      // N2
+      "[^]*[^]*[^]*[^]*=",
+      "([^]+[^])+x",
+      "(?:[^]*[^])*x",
+      "([]|[^]+[^])+x",
+      // N3
+      "a*a*b",
+      "a+a+b",
+      ".*.*=",
+      "\\w*\\w*=",
+      "(a)*(a)*b",
+      "(\\w)*(\\w)*=",
+      "(a*)(a*)\\1b",
+      "(.*)(.*)\\1\\2x",
+      "(\\w*)(\\w*)\\1\\2\\1\\2=",
+      `(?:(?=${a60})a)*(?:(?=${a60})a)*b`,
+      `(?:(?=${a200})a)*(?:(?=${a200})a)*b`,
+      `(?:(?<=${a60})a)*(?:(?<=${a60})a)*b`,
+      // Refused: two quantified capture groups, two 110-branch groups, nested optional captures
+      `\\w{0,800}${wGroup(4)}${wGroup(4)}=`,
+      `\\w{0,800}${wGroup(8)}${wGroup(8)}=`,
+      `\\w{0,800}${wGroup(40)}${wGroup(40)}=`,
+      `${alternatives(a(110))}${alternatives(a(110))}a*b`,
+      `\\w{0,800}${"((((a?))))".repeat(8)}=`,
+    ];
+    for (const value of slow) {
+      expect(value.length).toBeLessThanOrEqual(500);
+      expect(() => parseHistory(value)).toThrow(ANY_REFUSAL);
+    }
+  });
+
+  it("names the first token outside the grammar and where it is", () => {
+    const cases: Array<[string, string, number, string]> = [
+      ["a*a*b", "*", 2, "a quantifier"],
+      ["ab+", "+", 3, "a quantifier"],
+      ["colou?r", "?", 6, "a quantifier"],
+      ["\\w{0,800}=", "{0,800}", 3, "a quantifier"],
+      ["a{3}", "{3}", 2, "a quantifier"],
+      ["(?:a|b)?", "?", 8, "a quantifier"],
+      ["(?:a|b){2}", "{2}", 8, "a quantifier"],
+      ["(a|aa)c", "(", 1, "a capture group"],
+      ["x(?<n>a)", "(?<n>", 2, "a named capture group"],
+      ["status(?!es)", "(?!", 7, "a lookahead"],
+      ["(?=a)", "(?=", 1, "a lookahead"],
+      ["(?<!no )history", "(?<!", 1, "a lookbehind"],
+      ["(?<=the )timeline", "(?<=", 1, "a lookbehind"],
+      ["[^]*=", "[^]", 1, "a character class"],
+      ["x[a-z]", "[a-z]", 2, "a character class"],
+      ["[]x", "[]", 1, "a character class"],
+      ["(?:(a)|(aa))", "(", 4, "a capture group"],
+      ["(?:a|(?:b|c))", "(?:", 6, "a nested group"],
+      ["(?:a|aa)(?:a|aa)c", "(?:", 9, "a second group in one | alternative"],
+      ["a.b", ".", 2, "the any-character dot"],
+      ["(a)\\1", "(", 1, "a capture group"],
+      ["a\\1", "\\1", 2, "a backreference"],
+      ["a\\k<n>", "\\k", 2, "a backreference"],
+      ["\\B", "\\B", 1, "an escape outside the allowlist"],
+      ["a\\n", "\\n", 2, "an escape outside the allowlist"],
+      ["\\u0041", "\\u", 1, "an escape outside the allowlist"],
+      ["a}", "}", 2, "a literal brace"],
+      ["a{", "{", 2, "a literal brace"],
+      ["a]", "]", 2, "a literal bracket"],
+    ];
+    for (const [value, token, at, what] of cases) {
+      expect(() => parseHistory(value)).toThrow(refusal(token, at, what));
+    }
+  });
+
+  it("names a modifier group as one, not as a capture group, and refuses it", () => {
+    const cases: Array<[string, string, number]> = [
+      ["(?i:a)", "(?i:", 1],
+      ["x(?-i:a)", "(?-i:", 2],
+      ["(?im-s:history)", "(?im-s:", 1],
+    ];
+    for (const [value, token, at] of cases) {
+      expect(() => parseHistory(value)).toThrow(refusal(token, at, "a modifier group"));
+      expect(() => parseHistory(value)).not.toThrow(/capture group/);
+    }
+  });
+
+  it("refuses a pattern that matches the empty string, since it would match every query", () => {
+    for (const value of [
+      "history|timeline|",
+      "|history",
+      "history||timeline",
+      "(?:history|)",
+      "(?:)",
+      "^",
+      "$",
+      "^$",
+      "status(?:|es)|",
+    ]) {
+      expect(new RegExp(value, "i").test("")).toBe(true);
+      expect(() => parseHistory(value)).toThrow(
+        /recallHistoryPattern matches the empty string, so it would match every query and turn recallTagGroups off/,
+      );
+    }
+    // Patterns that need at least one character still load.
+    for (const value of ["(?:)a", "history|timeline", "^status$", "(?:history|timeline)\\b"]) {
+      expect(parseHistory(value).recallHistoryPattern?.source).toBe(value);
+    }
+  });
+
+  it("accepts a realistic status pattern, and it matches in any case", () => {
+    const cfg = parseHistory("\\b(?:waiting on|pending review|pipeline running)\\b");
+    const test = (q: string) => cfg.recallHistoryPattern?.test(q);
+    expect(test("still WAITING ON the reviewer?")).toBe(true);
+    expect(test("is !70 pending review")).toBe(true);
+    expect(test("Pipeline Running since noon")).toBe(true);
+    expect(test("where does hindsight run?")).toBe(false);
+    expect(test("pipeline runningx")).toBe(false);
+  });
+
+  it("accepts the README example and other patterns inside the grammar", () => {
+    for (const value of [
+      "\\b(?:history|timeline|status|progress|what happened|when did|so far|previous|earlier|changed|still)\\b",
+      "^status$",
+      "history|timeline|so far",
+      "\\bv\\d\\.\\d\\b",
+      "\\(draft\\)|\\[wip\\]|a\\|b|\\$\\^\\*\\+\\?\\{\\}\\.",
+      "x(?:a|b)|y(?:c|d)\\s\\w",
+      "(?:)a",
+      "a-b_c,d:e=f!g'h\"i#j%k&l~m<n>o@p",
+    ]) {
+      expect(parseHistory(value).recallHistoryPattern?.source).toBe(value);
+    }
+  });
+
+  it("keeps the 500-character cap", () => {
+    expect(() => parseHistory("a".repeat(500))).not.toThrow();
+    expect(() => parseHistory("a".repeat(501))).toThrow(
+      /recallHistoryPattern must be at most 500 characters/,
+    );
+  });
+
+  it("generates no code at runtime: no node:vm, eval or Function in the shipped sources", () => {
+    const dir = new URL("./", import.meta.url);
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".ts") || name.endsWith(".test.ts") || name === "test-helpers.ts") {
+        continue;
+      }
+      const source = readFileSync(new URL(name, dir), "utf8");
+      expect([name, /node:vm|\beval\(|new Function\(/.test(source)]).toEqual([name, false]);
+    }
+  });
+});
+
+/** mulberry32, as in retain-queue-model.test.ts: seeded, so a failure is reproducible. */
+function prng(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
+
+// Atoms biased toward what the adversarial queries hold, so matches run long before they fail.
+const ATOMS = ["a", "a", "a", "b", " ", "1", "\\w", "\\w", "\\d", "\\s", "\\b", "\\.", "^", "$"];
+
+/** A random pattern inside the grammar, at most 500 characters. */
+function randomPattern(next: () => number): string {
+  const pick = <T>(list: T[]) => list[Math.floor(next() * list.length)]!;
+  const atoms = (n: number) => Array.from({ length: n }, () => pick(ATOMS)).join("");
+  const branchLen = 1 + Math.floor(next() * (next() < 0.3 ? 120 : 12));
+  const branch = () => {
+    const before = atoms(Math.floor(next() * branchLen));
+    if (next() < 0.5) {
+      return `${before}${atoms(1)}`;
+    }
+    const inner = Array.from({ length: 1 + Math.floor(next() * 40) }, () =>
+      atoms(1 + Math.floor(next() * 6)),
+    );
+    return `${before}(?:${inner.join("|")})${atoms(Math.floor(next() * branchLen))}!`;
+  };
+  for (;;) {
+    const value = Array.from({ length: 1 + Math.floor(next() * 8) }, branch).join("|");
+    // A pattern that matches "" is refused at load, so the generator skips it.
+    if (value.length <= 500 && !new RegExp(value, "i").test("")) {
+      return value;
+    }
+  }
+}
+
+describe("recallHistoryPattern allowlist grammar: property", () => {
+  const QUERIES = [
+    "a".repeat(800),
+    "a ".repeat(400),
+    "a1".repeat(400),
+    "ab".repeat(400),
+    `${"a".repeat(799)}!`,
+  ];
+
+  it("400 random accepted patterns each run under 5 ms on 800-character adversarial queries", () => {
+    const next = prng(0x090);
+    let slowest = { ms: 0, pattern: "", query: 0 };
+    for (let n = 0; n < 400; n++) {
+      const value = randomPattern(next);
+      const cfg = parseHistory(value);
+      QUERIES.forEach((query, q) => {
+        expect(query).toHaveLength(800);
+        // Best of 3, so one GC pause on a busy runner does not fail the test.
+        let best = Infinity;
+        for (let r = 0; r < 3; r++) {
+          const started = performance.now();
+          recallFilterFor(cfg, query);
+          best = Math.min(best, performance.now() - started);
+        }
+        if (best > slowest.ms) {
+          slowest = { ms: best, pattern: value, query: q };
+        }
+      });
+    }
+    expect({ ...slowest, fast: slowest.ms < 5 }).toMatchObject({ fast: true });
   });
 });

@@ -510,3 +510,127 @@ describe("hindsight_recall and the auto-recall cap and floor", () => {
     expect(JSON.stringify(result)).toContain("2. second");
   });
 });
+
+/** The recall request body exactly as the client sent it. */
+const rawBody = (fake: ReturnType<typeof harness>["fake"], index = 0) =>
+  fake.fetch.mock.calls.filter(([url]) => url.endsWith("/memories/recall"))[index]![1]!.body;
+
+describe("hindsight_recall types, since and until (Q5)", () => {
+  it("sends an old call's body byte for byte as 0.8.0 did", async () => {
+    const { fake, service } = harness();
+    const tool = createRecallTool(service, ownerCtx())!;
+    await tool.execute("c1", { query: "which host runs hindsight" });
+    expect(rawBody(fake)).toBe(
+      '{"query":"which host runs hindsight","budget":"mid","max_tokens":1024}',
+    );
+    const typed = harness({ recallTypes: ["world"] });
+    await createRecallTool(typed.service, ownerCtx())!.execute("c2", { query: "q" });
+    expect(rawBody(typed.fake)).toBe(
+      '{"query":"q","budget":"mid","max_tokens":1024,"types":["world"]}',
+    );
+  });
+
+  it("declares the three parameters as optional, and says the window ranks without filtering", () => {
+    const { service } = harness();
+    const tool = createRecallTool(service, ownerCtx())!;
+    const schema = tool.parameters as {
+      properties: Record<string, { description?: string }>;
+      required?: string[];
+    };
+    expect(Object.keys(schema.properties)).toEqual(["query", "types", "since", "until"]);
+    expect(schema.required).toEqual(["query"]);
+    expect(schema.properties.since?.description).toMatch(/ranks.*does not filter/i);
+  });
+
+  it("types replaces recallTypes for this call", async () => {
+    const { fake, service } = harness({ recallTypes: ["world", "experience"] });
+    const tool = createRecallTool(service, ownerCtx())!;
+    await tool.execute("c1", { query: "q", types: ["observation"] });
+    expect((fake.requests[0]!.body as Record<string, unknown>).types).toEqual(["observation"]);
+  });
+
+  it("maps since and until to temporal_window, filling an open end", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-11T12:00:00Z"));
+    try {
+      const { fake, service } = harness();
+      const tool = createRecallTool(service, ownerCtx())!;
+      await tool.execute("c1", { query: "q", since: "2026-11-01", until: "2026-11-07" });
+      await tool.execute("c2", { query: "q", since: "2026-11-04T08:30:00+02:00" });
+      await tool.execute("c3", { query: "q", until: "2026-11-02T10:00:00" });
+      const windows = fake.requests.map((r) => (r.body as Record<string, unknown>).temporal_window);
+      expect(windows).toEqual([
+        // A date-only until covers that whole day.
+        { start: "2026-11-01T00:00:00.000Z", end: "2026-11-07T23:59:59.999Z" },
+        { start: "2026-11-04T06:30:00.000Z", end: "2026-11-11T12:00:00.000Z" },
+        // A time without an offset is UTC, as Hindsight reads it.
+        { start: "1970-01-01T00:00:00.000Z", end: "2026-11-02T10:00:00.000Z" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses a bad type, an empty list, a date it cannot read and an inverted window", async () => {
+    const { fake, service } = harness();
+    const tool = createRecallTool(service, ownerCtx())!;
+    for (const [params, message] of [
+      [{ types: ["fact"] }, /types must be a list of world, experience, observation/],
+      [{ types: [] }, /types must be a list of world, experience, observation/],
+      [{ types: "world" }, /types must be a list of world, experience, observation/],
+      [{ since: "last week" }, /since must be an ISO 8601 date or date-time/],
+      [{ until: "2026-13-40" }, /until must be an ISO 8601 date or date-time/],
+      [{ since: 20261101 }, /since must be an ISO 8601 date or date-time/],
+      [{ since: "2026-11-08", until: "2026-11-01" }, /until must not be earlier than since/],
+    ] as const) {
+      await expect(tool.execute("c", { query: "q", ...params })).rejects.toThrow(message);
+    }
+    expect(fake.requests).toEqual([]);
+  });
+});
+
+describe("hindsight_recall optional parameters and dates (F6, F7)", () => {
+  it("treats null and a blank string as an unset parameter", async () => {
+    for (const params of [
+      { types: null, since: null, until: null },
+      { types: "", since: "", until: "  " },
+    ]) {
+      const { fake, service } = harness();
+      await createRecallTool(service, ownerCtx())!.execute("c", { query: "q", ...params });
+      expect(rawBody(fake)).toBe('{"query":"q","budget":"mid","max_tokens":1024}');
+    }
+  });
+
+  it("refuses a date-time with a day, hour, minute or offset the calendar does not have", async () => {
+    const { fake, service } = harness();
+    const tool = createRecallTool(service, ownerCtx())!;
+    for (const since of [
+      "2026-02-31T00:00:00Z",
+      "2026-11-01T24:00:00Z",
+      "2026-11-01T23:60Z",
+      "2026-11-01T23:00:61Z",
+      "2026-11-01T10:00:00+25:00",
+    ]) {
+      await expect(tool.execute("c", { query: "q", since })).rejects.toThrow(
+        /since must be an ISO 8601 date or date-time/,
+      );
+    }
+    expect(fake.requests).toEqual([]);
+    await tool.execute("c", { query: "q", since: "2026-02-28T23:59:59.999Z" });
+    expect(fake.requests).toHaveLength(1);
+  });
+
+  it("says since is in the future when no until was sent", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-11T12:00:00Z"));
+    try {
+      const { service } = harness();
+      const tool = createRecallTool(service, ownerCtx())!;
+      const call = tool.execute("c", { query: "q", since: "2026-12-01" });
+      await expect(call).rejects.toThrow(/since must not be in the future/);
+      await expect(call).rejects.not.toThrow(/until/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

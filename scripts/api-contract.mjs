@@ -51,6 +51,9 @@ export const OPERATIONS = [
       "prefer_observations",
       "min_scores.final",
       "tag_groups",
+      "temporal_window.start",
+      "temporal_window.end",
+      "include.entities",
     ],
     reads: [
       "results[].id",
@@ -66,12 +69,32 @@ export const OPERATIONS = [
   {
     method: "POST",
     path: "/v1/default/banks/{bank_id}/reflect",
-    sends: ["query", "budget"],
+    sends: ["query", "budget", "fact_types"],
     reads: ["text"],
   },
   // Hindsight 1.2.1 declares no response schema here; the client checks `text` itself.
   { method: "GET", path: "/v1/default/banks/{bank_id}/memories/{memory_id}", sends: [], reads: [] },
   { method: "PUT", path: "/v1/default/banks/{bank_id}", sends: ["retain_mission"], reads: [] },
+  // Page reads use /pages/*; the deprecated /knowledge-base/* routes are the fallback for servers
+  // that answer the new route with a route 404.
+  {
+    method: "GET",
+    path: "/v1/default/banks/{bank_id}/pages/tree",
+    sends: [],
+    reads: ["roots[].id", "roots[].kind", "roots[].name", "roots[].is_stale", "roots[].children"],
+  },
+  {
+    method: "GET",
+    path: "/v1/default/banks/{bank_id}/pages/search",
+    sends: [],
+    reads: ["results[].id", "results[].name", "results[].snippet"],
+  },
+  {
+    method: "GET",
+    path: "/v1/default/banks/{bank_id}/pages/{page_id}",
+    sends: [],
+    reads: ["name", "markdown"],
+  },
   {
     method: "GET",
     path: "/v1/default/banks/{bank_id}/knowledge-base/tree",
@@ -89,6 +112,72 @@ export const OPERATIONS = [
     path: "/v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}",
     sends: [],
     reads: ["name", "markdown"],
+  },
+  // promptDirectives and openclaw hindsight directives.
+  {
+    method: "GET",
+    path: "/v1/default/banks/{bank_id}/directives",
+    sends: [],
+    reads: [
+      "items[].id",
+      "items[].name",
+      "items[].content",
+      "items[].priority",
+      "items[].is_active",
+      "items[].tags",
+    ],
+  },
+  {
+    method: "POST",
+    path: "/v1/default/banks/{bank_id}/directives",
+    sends: ["name", "content", "priority", "tags"],
+    reads: ["id", "name", "content", "priority", "is_active", "tags"],
+  },
+  {
+    method: "GET",
+    path: "/v1/default/banks/{bank_id}/directives/{directive_id}",
+    sends: [],
+    reads: ["id", "name", "content", "priority", "is_active", "tags"],
+  },
+  {
+    method: "DELETE",
+    path: "/v1/default/banks/{bank_id}/directives/{directive_id}",
+    sends: [],
+    reads: [],
+  },
+  // openclaw hindsight memory curate | invalidate. 1.2.1 declares no PATCH response schema.
+  {
+    method: "PATCH",
+    path: "/v1/default/banks/{bank_id}/memories/{memory_id}",
+    sends: ["text", "state", "reason"],
+    reads: [],
+  },
+  {
+    method: "DELETE",
+    path: "/v1/default/banks/{bank_id}/memories/{memory_id}/observations",
+    sends: [],
+    reads: ["deleted_count"],
+  },
+  // openclaw hindsight consolidate [--wait].
+  {
+    method: "POST",
+    path: "/v1/default/banks/{bank_id}/consolidate",
+    sends: [],
+    reads: ["operation_id", "deduplicated"],
+  },
+  {
+    method: "GET",
+    path: "/v1/default/banks/{bank_id}/operations/{operation_id}",
+    sends: [],
+    reads: [
+      "status",
+      "operation_type",
+      "error_message",
+      "progress.stage",
+      "progress.processed",
+      "progress.total",
+      "progress.detail",
+    ],
   },
   { method: "GET", path: "/health", sends: [], reads: [] },
   // openclaw hindsight status, doctor and forget.

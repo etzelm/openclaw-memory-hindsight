@@ -127,6 +127,54 @@ describe("memory-hindsight provider runtime", () => {
     expect(JSON.stringify(health)).not.toMatch(/token|hindsight\.test/);
   });
 
+  it("is degraded while the retain queue holds items, with the depth and no content (Q7)", async () => {
+    const fake = createFakeHindsight({ "GET /health": () => ({ json: { status: "ok" } }) });
+    const { service } = createTestService(fake.fetch);
+    const runtime = createHindsightProviderRuntime({
+      providerId: "memory-hindsight",
+      service: {
+        ...service,
+        retainQueueDepth: () =>
+          new Map([
+            ["dev", 2],
+            ["dev::conv", 1],
+          ]),
+      },
+    });
+    const { provider } = await runtime.open({
+      cfg: {},
+      agentId: "dev",
+      purpose: "default",
+      context: { authority: HOST, assertCurrent: () => {} },
+    } as OpenParams);
+    const health = await provider!.health();
+    expect(health).toMatchObject({
+      status: "degraded",
+      details: { retainQueueDepth: 3, recallBreaker: "closed" },
+    });
+    expect(health.message).toContain("3 retains queued for replay");
+    expect(JSON.stringify(health)).not.toMatch(/token|hindsight\.test|dev::conv/);
+  });
+
+  it("keeps unavailable when /health fails, and reports the queue depth there too (Q7)", async () => {
+    const fake = createFakeHindsight({ "GET /health": () => ({ status: 503, json: {} }) });
+    const { service } = createTestService(fake.fetch);
+    const runtime = createHindsightProviderRuntime({
+      providerId: "memory-hindsight",
+      service: { ...service, retainQueueDepth: () => new Map([["dev", 4]]) },
+    });
+    const { provider } = await runtime.open({
+      cfg: {},
+      agentId: "dev",
+      purpose: "default",
+      context: { authority: HOST, assertCurrent: () => {} },
+    } as OpenParams);
+    expect(await provider!.health()).toMatchObject({
+      status: "unavailable",
+      details: { retainQueueDepth: 4 },
+    });
+  });
+
   it("refuses to read after the caller goes stale", async () => {
     const { fake, open } = harness();
     let current = true;

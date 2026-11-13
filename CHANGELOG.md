@@ -1,5 +1,283 @@
 # Changelog
 
+## 0.9.0 (2026-11-13)
+
+### Upgrade notes
+
+- A minor release: it adds fourteen config keys, one agent tool (opt-in), four tool parameters,
+  seven CLI subcommands, two retain metadata keys and a new status value, changes the default
+  auto-recall request (below), and a config 0.8.0 accepted can be refused (below). No 0.8.1 was
+  published; this replaces it. Every new key defaults to the 0.8.0 behavior.
+- New config keys, none removed or renamed:
+  - `memoryPromptSection` (default `false`): a static memory section in the system prompt.
+  - `agents` (default `{}`): per-agent `autoRecall`, `recallTimeoutMs`, `recallTopK`,
+    `recallMinScore`, `recallQueryShaping`, `recallTypes`. An empty map, and an agent without an
+    entry, behave exactly as 0.8.0. Other keys in an entry, bank selection included, fail the load.
+  - `recallEarlyStart` (default `false`, experimental): starts auto-recall at `message_received`.
+    Turning it on needs a Gateway restart. Experimental because it has not yet run on a live
+    Gateway; its behavior may still change.
+  - `recallStaleOnTimeout` (default `0`, off): milliseconds; on a timeout, or while the recall
+    breaker is open, inject the session's last block if it is younger.
+  - `recallSkipEntities` (default `true`): see the next note.
+  - `promptDirectives` (default `false`): lists the owner bank's active untagged directives in the
+    system prompt. Needs a Gateway restart. Shown in every session of the agent, group chats
+    included, so keep private data out of directives.
+  - `slotMode` (default `auto`): `replace`, `sidecar` or `auto`. `auto` is `replace` when
+    `plugins.slots.memory` names `hindsight-native`, which is every working 0.8.0 setup, so
+    nothing changes on upgrade. See the sidecar note below.
+  - `activeMemoryYield` (default `false`, sidecar only), `corpusSupplement` (default `false`,
+    sidecar only) and `corpusSupplementSessionPatterns` (default `["agent:*:main"]`).
+  - `memoryFileSync` (default `false`), `memoryFileSyncAgents` (default `[]`, the default agent)
+    and `memoryFileSyncIntervalMs` (default `600000`, 60000 to 86400000).
+  - `privateTranscriptRecall` (default `false`): see the note below.
+- Sidecar mode (`slotMode: sidecar`) runs the plugin beside memory-core without the memory slot.
+  It needs an OpenClaw host with the memory sidecar setting proposed in
+  [openclaw#198445](https://github.com/openclaw/openclaw/issues/198445). Released hosts (checked on
+  2026.11.3 and on `main` of 2026-11-13) disable every `kind: "memory"` plugin that does not own
+  `plugins.slots.memory` before it registers anything, so on them use replace mode (the 0.8.0
+  setup). `activeMemoryYield`, `corpusSupplement` and its patterns do nothing in replace mode. New
+  error: when the host refuses the memory capability while the slot names this plugin or
+  `slotMode` is `replace`, the Gateway logs `host refused the memory capability ... serves no
+  memory runtime` and `openclaw hindsight doctor` fails the slot check. See
+  `docs/sidecar-mode.md`.
+- `memoryFileSync` replaces the MEMORY.md, USER.md and `memory/` part of the external
+  `hindsight-memory-sync.sh` with the same document ids, tag, metadata and replace mode. Turn it on,
+  run `openclaw hindsight sync-memory-files --import-legacy-state <script state tsv>` once, then
+  remove that part from the script's schedule. Sub-agent folders the script covers are not
+  covered by the plugin unless they are listed in `memoryFileSyncAgents` (see
+  `docs/sidecar-mode.md`).
+- `privateTranscriptRecall` defaults to `false`. When `true` the plugin declares protected private
+  transcript recall to Active Memory and registers `hindsight_conversation_recall`, which returns
+  raw transcript chunks of earlier private runs of the same agent. It is off by default because
+  sessions removed with `openclaw memory forget` are not visible to it: those forget records are
+  internal to Memory Core
+  ([openclaw#197150](https://github.com/openclaw/openclaw/issues/197150)). Turning it on means
+  removing a session from Hindsight with `openclaw hindsight forget --session <key>` instead.
+  Read at startup. See `docs/private-transcript-recall.md`.
+- Auto-retained run documents now carry two metadata keys when the host reports them:
+  `session_id` (the run's session transcript id) and `sandboxed` (`"true"` or `"false"`). Private
+  transcript recall admits only runs with a `session_id` that is still the session's current
+  transcript, so runs retained before 0.9.0 are never returned by it. Document ids, tags and the
+  retain queue format are unchanged.
+- Knowledge page tools now read Hindsight's `/pages/*` routes, which Hindsight 1.2.1 introduced in
+  place of the deprecated `/knowledge-base/*`. Against an older server the first request gets a
+  route 404 and the client uses `/knowledge-base/*` for the rest of the process (one extra
+  request). Nothing to configure.
+- New CLI subcommands, all with `--agent <id>` or `--bank <id>`: `openclaw hindsight directives
+  list | add | rm`, `memory show | curate | invalidate`, `consolidate [--wait] [--timeout <s>]`,
+  `export --out <dir>` and `sync-memory-files [--dry-run]`. `directives add|rm` and `memory
+  curate|invalidate` show the target first and ask; outside a terminal they need `--yes`.
+  `consolidate` starts a server job, `sync-memory-files` retains and deletes memory file
+  documents, and `export`, `directives list` and `memory show` are read only.
+- Auto-recall requests (and `openclaw hindsight recall`) now carry `include: {entities: null}`,
+  so Hindsight skips the entity observations the plugin never reads. A recall A/B on 139 queries
+  against Hindsight 1.2.1 returned the same results in the same order either way; responses were
+  about 23% smaller and latency did not change measurably. `recallSkipEntities: false` sends the
+  0.8.0 request. `hindsight_recall` is unchanged.
+- `hindsight_reflect` has a new optional `types` parameter (Hindsight's `fact_types`); a call
+  without it, or with `null` or an empty string, sends the same request as 0.8.0.
+- `openclaw hindsight queue --drop` appends a tombstone line to the retain queue file (the same
+  line the Gateway already writes), and a running Gateway now re-reads the file when its size
+  changed under it, to forget a dropped item before replay.
+- The README now covers install, minimal config and operations. Queue edge cases, host API
+  evidence, per-key details and design notes moved to `docs/` (see Documentation).
+- 0.9.0 narrows `recallHistoryPattern` to a grammar that cannot backtrack: literal text, escaped
+  punctuation, `\b` `\s` `\d` `\w`, `^`, `$`, `|` and one unquantified `(?:a|b)` group per `|`
+  alternative (see `docs/configuration.md`). A 0.8.0 config whose pattern uses a quantifier (`*`, `+`, `?`,
+  `{n}`), a character class `[...]`, `.`, a capture group like `(a|b)`, a backreference, a
+  lookaround or a nested group now fails to load, with an error naming the first bad token and its
+  position, and the plugin does not start until it is fixed. Write `(a|b)` as `(?:a|b)` and
+  `colou?r` as `colour|color`; the example in `docs/configuration.md` fits. An empty pattern is refused too, and so
+  is one that matches the empty string, like `history|timeline|` with a trailing `|`, since it
+  would match every query. The pattern is now tested on the first 800 characters of a query only.
+  This removes accepted values without the usual deprecation notice, for a security reason: a
+  pattern with nested or overlapping quantifiers can cause catastrophic backtracking, and since
+  the pattern runs on the Gateway's event loop on every auto-recall, one such query could hang
+  every reply. SUPPORT.md (Deprecations) allows a shorter notice when keeping the old behavior is
+  the risk, and asks the upgrade note to say so and why; this is that note.
+- `memory.status` can now be `degraded` (before: `ready` or `unavailable`). A check that treats
+  anything but `ready` as a problem reports one while retains are queued, the recall breaker is
+  open or an auto-recall failed in the past 5 minutes with none answering since (not reported
+  while `autoRecall` is off globally and in every `agents` entry). Health `details` gain `retainQueueDepth`, `recallBreaker` and
+  `lastRecallError`.
+- Retain queue: while Hindsight answers a 5xx with `Retry-After`, the bank gets no request until
+  that time passes (at most 15 minutes), also on turns. With one bank under a `Retry-After` hold,
+  the other banks are retried after the normal backoff instead of waiting for it, also a bank
+  whose first item is queued after the hold began.
+- Retain queue: after a failed rewrite, appends stop one tombstone line earlier, and a tombstone
+  that does not fit the size bound is not written (the existing warning is logged). The Gateway's
+  own writes now keep the file within the bound; a `queue --drop` tombstone from the CLI is always
+  written, so it can take a full file past the bound by one line until the Gateway's next rewrite.
+- `openclaw hindsight forget` refuses when it cannot read the retain queue, and refuses an empty
+  `--bank`, `.` or `..`. `--token-file` with an empty file is an error.
+- `hindsight_recall` has three new optional parameters; calls without them, or with `null` or an
+  empty string for them, send the same request as 0.8.0.
+- Document ids, the retain queue file format and bank routing are unchanged.
+
+### Added
+
+- `promptDirectives`: the owner bank's active global directives (highest priority first, at most
+  20, each cut at 500 characters) in the system prompt, after the memory section when both are on.
+  Fetched at service start and refreshed in the background every 10 minutes; a turn never waits
+  for the request, and a failed refresh keeps the last list.
+- `openclaw hindsight directives list [--all] [--json] | add --name <n> --content <text>
+  [--priority <n>] [--tags <list>] | rm <id>`, with `--dry-run` and `--yes` for the writes.
+- `openclaw hindsight memory show <id> [--json]`, `memory curate <id> --text <text> | --restore |
+  --clear-observations` and `memory invalidate <id> [--reason <text>]`: inspect, rewrite, restore
+  or retire one memory unit (observations cannot be curated).
+- `openclaw hindsight consolidate [--wait] [--timeout <s>]`: starts consolidation now; `--wait`
+  polls every 2 s and exits 0 on completion, 1 on failure, cancellation or timeout (default 600 s,
+  at most 3600; the server job is not cancelled).
+- `slotMode` (`replace`, `sidecar`, `auto`): in sidecar mode the plugin registers auto-recall,
+  auto-retain and the `hindsight_*` tools beside the slot owner, and never the memory runtime, so
+  it never shadows `memory_search` or `memory_get`.
+- `activeMemoryYield` (sidecar only): skips the auto-recall block on a turn where Active Memory
+  will visibly recall from Hindsight (enabled, mode `always`, agent targeted, `hindsight_recall` in
+  its `toolsAllow`, chat type and chat id allowed). Every other turn gets the block.
+- `corpusSupplement` (sidecar only): owner-bank Hindsight hits in `memory_search` with
+  `corpus=wiki` or `corpus=all`, readable with `memory_get` by their `hindsight/<id>` path, only
+  for sessions matching `corpusSupplementSessionPatterns` and never for sandboxed, incognito or
+  excluded sessions.
+- `memoryFileSync`, `memoryFileSyncAgents`, `memoryFileSyncIntervalMs`: the Gateway retains
+  MEMORY.md, USER.md and `memory/**/*.md` into the owner bank, one document per file, sends only
+  changed files and deletes the document of a deleted file. `openclaw hindsight sync-memory-files
+  [--agent <id>] [--dry-run] [--import-legacy-state <tsv>]` runs one pass.
+- `openclaw hindsight export --out <dir> [--types ...] [--mental-models] [--max-items <n>]
+  [--overwrite]`: a bank's memories as markdown (INDEX.md, facts, experiences, observations, and
+  optionally mental models). Read only.
+- `privateTranscriptRecall` and the `hindsight_conversation_recall` tool for Active Memory's
+  "Remember across conversations", following memory-core's same-agent private rules, with the
+  host grant `ctx.conversationRecall`. Runs whose facts Hindsight deduplicated are found through
+  document text search.
+- `session_id` and `sandboxed` metadata on auto-retained run documents.
+- `agents`: per-agent auto-recall settings (`autoRecall`, `recallTimeoutMs`, `recallTopK`,
+  `recallMinScore`, `recallQueryShaping`, `recallTypes`), keyed by agent id like `agentBankMap`.
+  The manifest schema and the config reader are checked against each other by a test (same keys,
+  same per-agent schemas, same accepted and refused values).
+- `recallEarlyStart` (experimental): starts auto-recall when the message arrives and awaits it in
+  `before_prompt_build`. The result is used only when the bank and the request match, it answered
+  and it is younger than `recallTimeoutMs` plus 5 s (the run is compared too when both hooks carry
+  a run id); otherwise it is dropped and the turn recalls as before. Every message of the session
+  is sent as a recall query, group messages the agent does not answer included. Not used on a session's first turn
+  (`message_received` has no memory audience; the route comes from the previous turn).
+- `recallStaleOnTimeout`: on an auto-recall timeout, or a turn skipped while the recall breaker is
+  open, inject the session's last block from the same bank and request settings if it is younger
+  than the value.
+- `recallSkipEntities`: sends `include: {entities: null}` on auto-recall (default on). The API
+  contract fixture records `include.entities`.
+- `hindsight_reflect` takes optional `types` (world, experience, observation), sent as Hindsight's
+  `fact_types` (recorded in the API contract fixture). Hindsight 1.2.1 reflect has no temporal
+  window, so reflect has no `since` / `until`.
+- `openclaw hindsight recall <query> [--agent] [--bank] [--types] [--json] [--token-file]`:
+  read-only; sends the agent's auto-recall request and prints each result with type and score,
+  marking those past `recallTopK`.
+- `openclaw hindsight queue --list | --drop <id> [--yes]`: lists the retain queue by id, bank,
+  document id, time and size (never the memory text), and drops one item after confirmation.
+- `uiHints` for every config key.
+- `hindsight_recall` takes optional `types` (world, experience, observation; replaces
+  `recallTypes` for the call) and `since` / `until` (ISO date or date-time), sent as Hindsight
+  1.2.1's `temporal_window`. An open end is the epoch or now, a date-only `until` covers that
+  day, and a time without an offset is UTC. A date or date-time whose day, hour, minute, second
+  or offset does not exist is refused, as is a `since` in the future without `until`. The window
+  ranks memories dated inside it higher; it does not filter. The API contract fixture records
+  `temporal_window`.
+- `memoryPromptSection`: a static memory section in the system prompt (53 words with both tools):
+  recalled memories are data, when to call `hindsight_recall` and `hindsight_reflect`, and citing
+  by `[doc:...]` id. It names only the tools the agent has, leaves the citation line out when
+  `citationsMode` is `off`, and names the `<hindsight_memories>` block only for an agent whose
+  auto-recall is on (its `agents` entry, else the global key). Read at startup.
+- `memory.status` reports `degraded` with the retain queue depth, the breaker state and the class
+  of the last auto-recall failure (`timeout`, `unreachable`, `http_4xx`, `http_5xx`, `error`),
+  for 5 minutes. No memory text, bank ids, URLs or tokens.
+
+### Changed
+
+- Knowledge page tools read `/pages/*` first and fall back to `/knowledge-base/*` once per process
+  on a route 404. A missing bank or page does not trigger the fallback.
+- `recallHistoryPattern` accepts only the grammar in the upgrade notes, checked at config load;
+  the 0.8.0 checks for nested quantifiers are gone with it. Each alternative is tried once per
+  start position, so the slowest accepted pattern we found took about 3.7 ms once warm and 4.6 ms
+  on the first query after load, on an 800-character query (Mac Studio, node 24).
+
+### Fixed
+
+- Retain queue replay: a 5xx with `Retry-After` was handled as a plain outage, so the header was
+  ignored (0.8.0 said otherwise). It now holds that bank like a 429 does, capped at 15 minutes.
+  The client reads `Retry-After` on every 5xx, not only 503.
+- Retain queue replay: a `Retry-After` hold on one bank could set the retry timer for every bank,
+  so a bank with a network error waited up to 15 minutes instead of the backoff. Holds are per
+  bank again, also for a bank queued after the timer was set for a hold.
+- `recallHistoryPattern` could freeze the Gateway with a catastrophic pattern, and `""` silently
+  turned the tag filter off. `""` and any pattern that matches the empty string are refused, and
+  the pattern must fit the grammar under Changed.
+- `openclaw hindsight forget` went ahead when the retain queue could not be read, so a queued copy
+  could bring the text back after the delete. It now exits 1.
+- `--token-file` with an empty file made doctor print PASS and send no token.
+- `forget --bank .` or `..` collapsed the request path; it is refused, as in `agentBankMap`.
+  `forget` now says when it stops listing at 10000 documents.
+- Retain queue: a tombstone written after a failed rewrite could take the file past
+  `retainQueueMaxBytes`.
+- Removed a duplicated plain-http check in the config reader (dead code).
+- `recallEarlyStart` (new in this release, fixed before the tag): an early result had no age
+  bound, so a message queued behind a long run got a recall from long before its turn, and it
+  survived a `hindsight_retain` in the session. It is now used only while younger than
+  `recallTimeoutMs` plus 5 s, and a retain drops it. An early request that failed fast now falls
+  back to a fresh recall instead of leaving the turn without one (a timed-out one: see below).
+- `recallEarlyStart`: early requests for messages that never got a turn (group messages the agent
+  does not answer) counted toward the recall breaker, so three of them could pause auto-recall for
+  every turn. An early request now counts only when a turn takes it, and none is started while the
+  breaker is open, so the probe after a cool-down goes to a real turn.
+- `recallStaleOnTimeout`: the stale block ignored the request settings of the turn it was injected
+  into, so a block recalled without the tag filter (a `recallHistoryPattern` query, or before a
+  live change of `recallTagGroups`, `recallMinScore` or `recallTypes`) could be injected into a
+  filtered turn. It is now used only under the same settings. `session_end` and a service stop
+  now forget it, and the early recall and route of `recallEarlyStart` too, so a reset session no
+  longer gets the old session's block.
+- `recallStaleOnTimeout` stopped working once the recall breaker opened: a turn the breaker
+  skipped injected nothing. It now gets the young stale block as well.
+- One agent's `recallTimeoutMs` (in `agents`) shorter than the global one could open the recall
+  breaker and pause auto-recall for every agent. The breaker stays one per server, and a timeout
+  now counts toward it only when the turn's timeout is at least the global `recallTimeoutMs`
+  (network errors and 5xx answers still count for every agent).
+- `recallEarlyStart`: with Hindsight hung, a turn waited for the timed-out early request and then
+  sent a second one with a full `recallTimeoutMs`, so each turn could wait two timeouts before the
+  breaker opened. A timed-out early request is no longer sent again: the turn counts the timeout
+  and gets the young stale block or nothing.
+- `recallEarlyStart`: an early answer that arrived before an outage closed the open breaker (or
+  reset its failure count) when its turn took it. It now counts only when no outage was recorded
+  after it arrived.
+- An agent with a tighter `recallTimeoutMs` that carried the probe after a cool-down and timed out
+  reopened the breaker for every agent for another 60 s. That probe now frees the probe slot
+  without a new cool-down, so the next turn probes. The global `recallTimeoutMs` the rule compares
+  against is now read when the request is sent, not when it fails.
+- The auto-recall cache was keyed on the query, tag filter and score floor only, so a live change
+  of `recallTypes`, `recallBudget` or `recallSkipEntities` was served from the cache. It is now
+  keyed on the whole request.
+- `memory.status` did not report the last auto-recall error when `autoRecall` was off globally and
+  on for an agent in `agents`. `memoryPromptSection` named the `<hindsight_memories>` block from
+  the global `autoRecall` only; it now follows each agent's own setting.
+- Retain queue: a queue file with bytes that are not valid UTF-8 was re-read on every queue step,
+  because its size was taken from the decoded text. It is now taken from the bytes on disk.
+
+### Documentation
+
+- `docs/sidecar-mode.md`: choosing replace or sidecar, what each mode has and loses, measured token
+  and latency cost, setup, corpus supplement, memory file sync migration and export.
+- `docs/private-transcript-recall.md`: what the tool returns, its rules and its limits.
+- Tests and tooling (not in the package): a sidecar lane in `scripts/live-proof.sh` and
+  `scripts/compat-matrix.sh`, built with `scripts/sidecar-variant.mjs` (a test-only package without
+  the manifest `kind`, never published), and the API contract fixture extended with the
+  directives, memory unit, consolidation, pages and document routes.
+- README split: quick start, a troubleshooting table (log line, cause, fix), install,
+  configuration table and operations. Moved to `docs/`: `docs/offline-retain-queue.md`,
+  `docs/host-api-evidence.md`, `docs/configuration.md` (per-key details, knowledge-base tools,
+  vendor key mapping) and `docs/design.md` (feature details, comparison with the vendor plugin).
+- README: which conversation bank `forget` searches (the memory audience's session key, which can
+  be the root session for a child session's run), the `recallHistoryPattern` grammar, the
+  `degraded` status and the new tool parameters.
+- CHANGELOG 0.8.0: three statements corrected (`Retry-After` on a 503, the root command listing,
+  the fsync cost).
+
 ## 0.8.0 (2026-11-11)
 
 ### Upgrade notes
@@ -18,8 +296,8 @@
   `openclaw_hindsight_recall_injected_memories` and `_chars` histograms. A skipped auto-recall
   turn now records a skip sample (it recorded nothing before); `recall_total` and the latency
   histogram are unchanged.
-- The manifest declares `cliCommands`, so `openclaw hindsight` appears as a root command once the
-  plugin owns the memory slot.
+- The manifest declares `cliCommands`, so `openclaw hindsight` is available as a root command once
+  the plugin owns the memory slot (some hosts do not list it in the root `--help`).
 - Document ids, the retain queue file format and bank routing are unchanged.
 
 ### Added
@@ -70,8 +348,9 @@
 - Retain queue replay: a bank that refuses (auth, rate limit, bank setup) is held for the
   current backoff, and the passes a turn starts (a retain queued behind its bank, a live retain
   delivered while items wait) skip it. Before, every such turn sent one request to each
-  refusing bank with queued items. The startup pass and the backoff timer still try it. A 429 or
-  503 with `Retry-After` holds the bank for that long in every pass, at most 15 minutes.
+  refusing bank with queued items. The startup pass and the backoff timer still try it. A 429
+  with `Retry-After` holds the bank for that long in every pass, at most 15 minutes (a 5xx with
+  `Retry-After` does so from 0.9.0).
 - Retain queue replay: after a pass that delivered every item, a failing save was retried every
   30 s. The wait now grows while the save keeps failing, as 0.7.1 described, and goes back to the
   base after a pass and its save both succeed.
@@ -79,7 +358,7 @@
   queue is at `retainQueueMaxItems` or its size bound. What does not fit is not parked, and one
   warning says how many.
 - Retain queue: appended items are fsynced, so a retain survives a power loss right after it was
-  queued (about 2 ms per queued item, only while Hindsight is unreachable). Every queue write
+  queued (a few ms per queued item, only while Hindsight is unreachable). Every queue write
   loops until all bytes are written and fails on a write that makes no progress.
 - Tests (not in the package): the short-write test now exercises the write loop it guards; before,
   it mocked a call the queue no longer made.

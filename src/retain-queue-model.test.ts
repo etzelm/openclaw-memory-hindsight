@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -197,16 +197,10 @@ function checkQueue(world: World, seed: number, q: Queue, filePath: string, opts
     world.fail(seed, `duplicate documents: ${keys.join(", ")}`),
   );
   must(q.size() <= opts.limits.maxItems, () => world.fail(seed, "maxItems exceeded"));
-  if (existsSync(filePath) && statSync(filePath).size > opts.maxBytes) {
-    // Known and accepted (0.8.0 lane A finding): when a rewrite fails, markStale() appends a
-    // tombstone without the byte check, because dropping it could let a restart replay an
-    // out-of-date copy. So only tombstone lines may take the file past the bound.
-    const queueBytes = readFileSync(filePath, "utf8")
-      .split("\n")
-      .filter((line) => line && !line.startsWith('{"tombstone":'))
-      .reduce((sum, line) => sum + Buffer.byteLength(line, "utf8") + 1, 0);
-    must(queueBytes <= opts.maxBytes, () => world.fail(seed, "queue lines over the byte bound"));
-  }
+  // markStale() tombstones respect the byte bound too (0.9.0): no line may take the file past it.
+  must(!existsSync(filePath) || statSync(filePath).size <= opts.maxBytes, () =>
+    world.fail(seed, `queue file over the byte bound (${statSync(filePath).size})`),
+  );
 }
 
 /** The queue's entries in order (test-only view of its private state). */

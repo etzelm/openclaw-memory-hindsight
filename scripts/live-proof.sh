@@ -30,7 +30,13 @@
 #   --runtime NAME           embedded (default) or claude-cli
 #   --plugin SPEC            checkout dir, git+URL#REF, .tgz, or install spec (default: this
 #                            checkout)
-#   --phase LABEL            label for the bank, results dir and table (default: runtime)
+#   --phase LABEL            label for the bank, results dir and table (default: runtime, plus
+#                            -sidecar with --slot sidecar)
+#   --slot ROLE              owner (default): the plugin owns plugins.slots.memory. sidecar: the
+#                            kind-less sidecar build (scripts/sidecar-variant.mjs) runs beside
+#                            memory-core with slotMode sidecar; the host provider checks (S1, S2,
+#                            A4, M1, M2, C2) are SKIP because memory-core owns the provider, and
+#                            H2/H3 check the sidecar setup instead. Needs a checkout or .tgz.
 #   --model REF              default anthropic/claude-haiku-5-5 (embedded) or
 #                            claude-cli/claude-sonnet-4-6 (claude-cli; a model id the claude
 #                            CLI accepts, so a host that cannot resolve it fails R1)
@@ -58,7 +64,7 @@ umask 077
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 
-OC_SPEC=""; RUNTIME=embedded; PLUGIN_SPEC=""; PHASE=""; MODEL=""
+OC_SPEC=""; RUNTIME=embedded; PLUGIN_SPEC=""; PHASE=""; MODEL=""; SLOT=owner
 TOKEN_FILE=""; TOKEN_ENV_FILE=""; TOKEN_KEY=HINDSIGHT_API_TENANT_API_KEY
 ANTH_ENV_FILE=""; ANTH_KEY=ANTHROPIC_API_KEY
 HOST_DIR=""; RESULTS_ROOT=""; RESULTS_DEST=""; SETUP_ONLY=0; KEEP=0
@@ -70,6 +76,7 @@ while [ $# -gt 0 ]; do
     --runtime) need "$@"; RUNTIME=$2; shift 2 ;;
     --plugin) need "$@"; PLUGIN_SPEC=$2; shift 2 ;;
     --phase) need "$@"; PHASE=$2; shift 2 ;;
+    --slot) need "$@"; SLOT=$2; shift 2 ;;
     --model) need "$@"; MODEL=$2; shift 2 ;;
     --token-file) need "$@"; TOKEN_FILE=$2; shift 2 ;;
     --token-env-file) need "$@"; TOKEN_ENV_FILE=$2; shift 2 ;;
@@ -90,7 +97,11 @@ case "$RUNTIME" in
   claude-cli) MODEL=${MODEL:-claude-cli/claude-sonnet-4-6} ;;
   *) echo "--runtime must be embedded or claude-cli" >&2; exit 2 ;;
 esac
-PHASE=${PHASE:-$RUNTIME}
+case "$SLOT" in
+  owner) PHASE=${PHASE:-$RUNTIME} ;;
+  sidecar) PHASE=${PHASE:-$RUNTIME-sidecar} ;;
+  *) echo "--slot must be owner or sidecar" >&2; exit 2 ;;
+esac
 SLUG=$(printf '%s' "$PHASE" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-24 | sed 's/-*$//')
 [ -n "$SLUG" ] || { echo "--phase needs at least one letter or digit" >&2; exit 2; }
 
@@ -402,7 +413,7 @@ PY
   HOST_KIND="$HOST_KIND" HOST_VERSION="$HOST_VERSION" HOST_COMMIT="$HOST_COMMIT" \
   PLUGIN_SPEC="${PLUGIN_SPEC:-$REPO_DIR}" PLUGIN_DESC="$PLUGIN_DESC" PLUGIN_VERSION="$PLUGIN_VERSION" \
   PLUGIN_COMMIT="$PLUGIN_COMMIT" BANK="$BANK" TURNS="$TURNS" SKIP_REASON="$SKIP_REASON" \
-  ABORT_MSG="$ABORT_MSG" python3 - "$CHECKS" "$OUT/results.json" <<'PY'
+  ABORT_MSG="$ABORT_MSG" SLOT="$SLOT" python3 - "$CHECKS" "$OUT/results.json" <<'PY'
 import datetime, json, os, sys
 e = os.environ
 home = e["HOME"]
@@ -414,6 +425,7 @@ res = {
     "schema": 1,
     "phase": e["PHASE"],
     "runtime": e["RUNTIME"],
+    "slot": e.get("SLOT", "owner"),
     "model": e["MODEL"],
     "openclaw": {"spec": h(e["OC_SPEC"]) or "PATH", "kind": e["HOST_KIND"],
                  "version": e["HOST_VERSION"], "commit": e["HOST_COMMIT"]},
@@ -598,6 +610,17 @@ resolve_plugin() {
     echo "npm ci + npm pack in $src (log: plugin-build.log)" | redact
     ( cd "$src" && npm ci --no-audit --no-fund && npm pack --pack-destination "$L/pack" ) >> "$OUT/plugin-build.log" 2>&1 || return 1
     spec=$(ls "$L"/pack/*.tgz 2>/dev/null | head -1)
+    [ -n "$spec" ] || return 1
+  fi
+  if [ "$SLOT" = sidecar ]; then
+    case "$spec" in *.tgz) ;; *) echo "--slot sidecar needs a checkout or a .tgz, not $spec"; return 1 ;; esac
+    [ -f "$spec" ] || { echo "no such tarball: $spec"; return 1; }
+    rm -rf "$L/variant" && mkdir -p "$L/variant/pack" || return 1
+    { tar -xzf "$spec" -C "$L/variant" \
+      && node "$REPO_DIR/scripts/sidecar-variant.mjs" "$L/variant/package" \
+      && ( cd "$L/variant/package" && npm pack --ignore-scripts --pack-destination "$L/variant/pack" ); } \
+      >> "$OUT/plugin-build.log" 2>&1 || return 1
+    spec=$(ls "$L"/variant/pack/*.tgz 2>/dev/null | head -1)
     [ -n "$spec" ] || return 1
   fi
   case "$spec" in
@@ -846,13 +869,14 @@ echo "== install $PLUGIN_DESC" | redact
 oc plugins install "$PLUGIN_INSTALL" --force --accept-capabilities > "$L/install.log" 2>&1 \
   || { tail -20 "$L/install.log" | redact; abort 3 H2 "plugin installed in the memory slot" "plugins install failed: $(tail -1 "$L/install.log" | redact)"; }
 grep -iE "installed plugin|hindsight" "$L/install.log" | redact | tail -3
-CONF="$CONF" BANK="$BANK" HS="$HS" python3 - <<'PY'
+CONF="$CONF" BANK="$BANK" HS="$HS" SLOT="$SLOT" python3 - <<'PY'
 import json, os
 e = os.environ
+sidecar = e["SLOT"] == "sidecar"
 c = json.load(open(e["CONF"]))
 p = c.setdefault("plugins", {})
-p["allow"] = sorted(set(p.get("allow") or []) | {"audience-probe", "hindsight-native", "anthropic"})
-p.setdefault("slots", {})["memory"] = "hindsight-native"
+p["allow"] = sorted(set(p.get("allow") or []) | {"audience-probe", "hindsight-native", "anthropic"} | ({"memory-core"} if sidecar else set()))
+p.setdefault("slots", {})["memory"] = "memory-core" if sidecar else "hindsight-native"
 ent = p.setdefault("entries", {})
 ent["audience-probe"] = {"enabled": True, "hooks": {"allowConversationAccess": True}}
 h = ent.setdefault("hindsight-native", {})
@@ -865,12 +889,21 @@ h["config"] = {
   "memoryMode": "context",
   "retainMission": "Extract durable facts the user states about themselves.",
 }
+if sidecar:
+    h["config"]["slotMode"] = "sidecar"
+    ent.setdefault("memory-core", {})["enabled"] = True
 json.dump(c, open(e["CONF"], "w"), indent=2)
 PY
 oc config validate > "$L/validate.log" 2>&1 \
   || { redact < "$L/validate.log" | tail -20; abort 3 H2 "plugin installed in the memory slot" "config validate failed"; }
 slot=$(oc config get plugins.slots.memory 2>/dev/null | tail -1)
-[ "$slot" = hindsight-native ] || abort 3 H2 "plugin installed in the memory slot" "memory slot is '$slot'"
+WANT_SLOT=hindsight-native; [ "$SLOT" = sidecar ] && WANT_SLOT=memory-core
+[ "$slot" = "$WANT_SLOT" ] || abort 3 H2 "plugin installed in the memory slot" "memory slot is '$slot', want $WANT_SLOT"
+if [ "$SLOT" = sidecar ]; then
+  oc plugins inspect hindsight-native > "$L/inspect.log" 2>&1
+  inspect_status=$(sed -n 's/^Status: *//p' "$L/inspect.log" | head -1)
+  case "$inspect_status" in disabled*|error*|"") abort 3 H2 "plugin installed in the memory slot" "sidecar build not loadable beside memory-core: status=${inspect_status:-none} $(sed -n 's/^Reason: *//p' "$L/inspect.log" | head -1 | redact)" ;; esac
+fi
 [ -n "$PLUGIN_VERSION" ] || PLUGIN_VERSION=$(python3 - "$OPENCLAW_STATE_DIR" <<'PY'
 import json, os, sys
 for root, dirs, files in os.walk(sys.argv[1]):
@@ -883,8 +916,13 @@ for root, dirs, files in os.walk(sys.argv[1]):
             pass
 PY
 )
-row H2 "plugin installed in the memory slot" "hindsight-native in plugins.slots.memory" \
-  "${PLUGIN_VERSION:-unknown version}, slot=$slot" PASS
+if [ "$SLOT" = sidecar ]; then
+  row H2 "plugin installed in the memory slot" "sidecar build loads beside memory-core" \
+    "${PLUGIN_VERSION:-unknown version}, slot=$slot, status=$inspect_status" PASS
+else
+  row H2 "plugin installed in the memory slot" "hindsight-native in plugins.slots.memory" \
+    "${PLUGIN_VERSION:-unknown version}, slot=$slot" PASS
+fi
 
 # ---- gateway --------------------------------------------------------------------------------
 call() { oc gateway call "$1" --json --timeout "${3:-60000}" --params "$2" 2>>"$L/calls.err"; }
@@ -918,8 +956,13 @@ keys = [k for k in ("provider", "backend", "status", "state", "ready") if isinst
 print(("hindsight " if "hindsight" in s.lower() else "no-hindsight ") + ",".join(f"{k}={j[k]}" for k in keys))
 PY
 )
-case "$ms" in hindsight*) ms_ok=PASS ;; *) ms_ok=FAIL ;; esac
-row H3 "gateway up, memory.status from the plugin" "status names hindsight" "$ms" "$ms_ok"
+if [ "$SLOT" = sidecar ]; then
+  case "$ms" in no-hindsight*) ms_ok=PASS ;; *) ms_ok=FAIL ;; esac
+  row H3 "gateway up, memory.status from the plugin" "sidecar: status from memory-core, not hindsight" "$ms" "$ms_ok"
+else
+  case "$ms" in hindsight*) ms_ok=PASS ;; *) ms_ok=FAIL ;; esac
+  row H3 "gateway up, memory.status from the plugin" "status names hindsight" "$ms" "$ms_ok"
+fi
 grep -a -E "memory-hindsight|audience-probe" "$L/gateway.log" | REDACT_DELTAS=1 redact | cut -c1-220 | tail -4
 sleep 5
 echo "== probe startup self-test"
@@ -950,8 +993,8 @@ PY
 echo "== gateway metrics before turns"
 m0=$(metrics "$L/metrics-0.prom"); mu=$(metrics /dev/null noauth)
 fams=$(cat "$L/metrics-0.prom" 2>/dev/null | grep -c -E '^# TYPE openclaw_hindsight_')
-mok=FAIL; [ "$m0" = 200 ] && [ "$fams" = 7 ] && case "$mu" in 401|403) mok=PASS ;; esac
-row G1 "metrics route on the gateway port" "200 with 7 families; 401/403 without auth" "status=$m0 families=$fams noauth=$mu" "$mok"
+mok=FAIL; [ "$m0" = 200 ] && [ "$fams" = 10 ] && case "$mu" in 401|403) mok=PASS ;; esac
+row G1 "metrics route on the gateway port" "200 with 10 families; 401/403 without auth" "status=$m0 families=$fams noauth=$mu" "$mok"
 sed "s/$BANK/<bank>/g" "$L/metrics-0.prom" > "$OUT/metrics-before.prom" 2>/dev/null
 
 # ---- turns ----------------------------------------------------------------------------------
@@ -1099,7 +1142,7 @@ cat "$OUT/documents.md"
 
 # ---- checks ---------------------------------------------------------------------------------
 OWNER_KEY="$(printf '%s' "${KEY_A:-}" | redact)" CONV_KEY="$(printf '%s' "${KEY_B:-}" | redact)" OUT="$OUT" BANK="$BANK" CODE="$CODE" TURNS="$TURNS" SKIP_REASON="$SKIP_REASON" MODEL="$MODEL" \
-RUNTIME="$RUNTIME" python3 - <<'PY' >> "$CHECKS"
+RUNTIME="$RUNTIME" SLOT="$SLOT" python3 - <<'PY' >> "$CHECKS"
 import json, os, re
 e = os.environ
 OUT, BANK, CODE = e["OUT"], e["BANK"], e["CODE"]
@@ -1114,6 +1157,15 @@ def row(i, check, want, observed, ok):
     rows.append((i, check, want, str(observed), "PASS" if ok else "FAIL"))
 def skip(i, check, want):
     rows.append((i, check, want, e["SKIP_REASON"], "SKIP"))
+SIDECAR = e.get("SLOT") == "sidecar"
+PROVIDER_ROWS = {"S1", "S2", "A4", "M1", "M2", "C2"}
+_row = row
+def row(i, check, want, observed, ok):
+    # Sidecar: memory-core owns the host memory provider, so the provider checks do not apply.
+    if SIDECAR and i in PROVIDER_ROWS:
+        rows.append((i, check, want, "sidecar: memory-core owns the host memory provider", "SKIP"))
+        return
+    _row(i, check, want, observed, ok)
 
 hooks = [p for p in probe if p.get("kind") == "hook"]
 ops = [p for p in probe if p.get("kind") == "provider_op"]

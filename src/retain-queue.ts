@@ -10,6 +10,7 @@ import {
   readSync,
   renameSync,
   rmSync,
+  statSync,
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -154,6 +155,32 @@ function tombstoneKey(value: unknown): { bankId: string; documentId: string } | 
 
 function tombstoneLine(key: { bankId: string; documentId: string }): string {
   return JSON.stringify({ tombstone: { bankId: key.bankId, documentId: key.documentId } });
+}
+
+/**
+ * Bytes a later tombstone for this document takes, line and newline. An appended copy keeps that
+ * much room free, so marking it out of date (after a failed rewrite) stays within the size bound.
+ */
+function tombstoneBytes(key: { bankId: string; documentId: string }): number {
+  return Buffer.byteLength(tombstoneLine(key), "utf8") + 1;
+}
+
+/**
+ * Drops one queued item from outside the Gateway (`openclaw hindsight queue --drop`): appends a
+ * tombstone line, which `load()` and a running queue's next step both honor.
+ */
+export function appendQueueTombstone(
+  filePath: string,
+  key: { bankId: string; documentId: string },
+): void {
+  const text = `${endsWithNewline(filePath) ? "" : "\n"}${tombstoneLine(key)}\n`;
+  const fd = openSync(filePath, "a", 0o600);
+  try {
+    writeAll(fd, text);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** Makes a rename durable. Best effort: some file systems refuse fsync on a directory. */
@@ -343,9 +370,9 @@ export class RetainQueue {
   load(): void {
     // The file is the source of truth again; any copy it still holds is loaded below.
     this.unsaved.clear();
-    let text: string;
+    let raw: Buffer;
     try {
-      text = readFileSync(this.filePath, "utf8");
+      raw = readFileSync(this.filePath);
     } catch (error) {
       if ((error as { code?: unknown }).code === "ENOENT") {
         this.stored = [];
@@ -354,7 +381,10 @@ export class RetainQueue {
       }
       throw error;
     }
-    this.fileBytes = Buffer.byteLength(text, "utf8");
+    // The size on disk, not of the decoded text: invalid UTF-8 decodes to longer U+FFFD, and the
+    // size check in absorbExternalDrops would then re-read the file on every queue step.
+    this.fileBytes = raw.length;
+    const text = raw.toString("utf8");
     const { entries, skipped, tombstones, duplicates } = parseQueueText(text);
     this.stored = entries.map(({ entry, line }) => stored(entry, line));
     if (skipped > 0) {
@@ -380,8 +410,14 @@ export class RetainQueue {
     return this.stored.some((s) => s.entry.bankId === bankId);
   }
 
+  /** The banks that have queued items. */
+  banks(): Set<string> {
+    return new Set(this.stored.map((s) => s.entry.bankId));
+  }
+
   /** The oldest item, skipping banks in `skipBanks` (replay passes over a bank that refused). */
   peek(skipBanks?: ReadonlySet<string>): QueuedRetain | undefined {
+    this.absorbExternalDrops();
     if (!skipBanks?.size) {
       return this.stored[0]?.entry;
     }
@@ -421,6 +457,7 @@ export class RetainQueue {
       evict?: boolean;
     } = {},
   ): boolean {
+    this.absorbExternalDrops();
     const next = stored({
       bankId: entry.bankId,
       documentId: entry.documentId,
@@ -468,7 +505,7 @@ export class RetainQueue {
         pruned.length === 0 &&
         index < 0 &&
         existsSync(this.filePath) &&
-        this.canAppend(next.size)
+        this.canAppend(next.size + tombstoneBytes(next.entry))
       ) {
         this.append(next.line);
         return true;
@@ -499,8 +536,13 @@ export class RetainQueue {
       lines.push(next.line);
     }
     const text = lines.join("\n");
-    // One more byte for the trailing newline, as Stored.size counts it.
-    if (existsSync(this.filePath) && this.canAppend(Buffer.byteLength(text, "utf8") + 1)) {
+    // One more byte for the trailing newline, as Stored.size counts it, and room for a later
+    // tombstone of the new copy.
+    const reserve = keepsNext ? tombstoneBytes(next.entry) : 0;
+    if (
+      existsSync(this.filePath) &&
+      this.canAppend(Buffer.byteLength(text, "utf8") + 1 + reserve)
+    ) {
       try {
         if (text) {
           this.append(text);
@@ -528,6 +570,7 @@ export class RetainQueue {
    * re-sends items that replace themselves on the server (same document id, update_mode replace).
    */
   remove(entry: QueuedRetain, options: { persist?: boolean } = {}): void {
+    this.absorbExternalDrops();
     const index = this.stored.findIndex((s) => s.entry === entry);
     if (index < 0) {
       return;
@@ -548,6 +591,7 @@ export class RetainQueue {
    * live write or replaces itself on replay.
    */
   supersede(key: { bankId: string; documentId: string }): void {
+    this.absorbExternalDrops();
     const k = queueKey(key);
     const copy = this.unsaved.get(k);
     if (copy && !this.stored.some((s) => queueKey(s.entry) === k) && this.markStale(copy)) {
@@ -562,6 +606,7 @@ export class RetainQueue {
 
   /** Writes batched removals, if any. */
   save(): void {
+    this.absorbExternalDrops();
     if (this.dirty) {
       this.persist();
     }
@@ -573,6 +618,7 @@ export class RetainQueue {
    * copy is left alone. Best effort: a failed rewrite keeps the copy, which replays as a replace.
    */
   discard(key: { bankId: string; documentId: string }, item: HindsightRetainItem): void {
+    this.absorbExternalDrops();
     const index = this.stored.findIndex(
       (s) =>
         s.entry.bankId === key.bankId &&
@@ -596,6 +642,9 @@ export class RetainQueue {
    * stays quiet until the queue is empty again.
    */
   prune(persist = true): number {
+    if (persist) {
+      this.absorbExternalDrops();
+    }
     const dropped = this.pruneStored();
     this.reportDrops(dropped);
     if (dropped.length > 0 && persist) {
@@ -647,6 +696,37 @@ export class RetainQueue {
     chmodSync(dir, 0o700);
   }
 
+  /**
+   * `openclaw hindsight queue --drop` appends a tombstone to the file from another process. When
+   * the file is not the size this queue last read or wrote, read it and forget every item the file
+   * no longer holds, before a replay could send it or a rewrite could put it back. Every queued
+   * item is in the file before enqueue returns, so an item missing there was dropped outside.
+   */
+  private absorbExternalDrops(): void {
+    let raw: Buffer;
+    try {
+      if (statSync(this.filePath).size === this.fileBytes) {
+        return;
+      }
+      raw = readFileSync(this.filePath);
+    } catch {
+      // No file (nothing queued, or removed by hand) or unreadable: keep the queue as it is.
+      return;
+    }
+    // Bytes on disk, as in load().
+    this.fileBytes = raw.length;
+    const text = raw.toString("utf8");
+    const present = new Set(parseQueueText(text).entries.map(({ entry }) => queueKey(entry)));
+    const before = this.stored.length;
+    this.stored = this.stored.filter((s) => present.has(queueKey(s.entry)));
+    const dropped = before - this.stored.length;
+    if (dropped > 0) {
+      this.logger.info?.(
+        `memory-hindsight: retain queue: ${dropped} item(s) dropped outside the Gateway (openclaw hindsight queue --drop)`,
+      );
+    }
+  }
+
   /** No append that would take the file past the size bound (one byte for a torn line's newline). */
   private canAppend(size: number): boolean {
     return this.fileBytes + size + 1 <= this.maxBytes();
@@ -676,8 +756,16 @@ export class RetainQueue {
    * in the file, so `load()` drops it after a restart instead of replaying it.
    */
   private markStale(entry: QueuedRetain): boolean {
+    const line = tombstoneLine(entry);
+    // Appends keep room for this; a file at its bound (say, rewritten full) gets no tombstone.
+    if (!this.canAppend(tombstoneBytes(entry))) {
+      this.logger.warn?.(
+        `memory-hindsight: could not mark an out-of-date queued retain (the queue file is at its ${this.maxBytes()}-byte bound); a restart may replay it before the newer copy is written again`,
+      );
+      return false;
+    }
     try {
-      this.append(tombstoneLine(entry));
+      this.append(line);
       return true;
     } catch (error) {
       this.logger.warn?.(
@@ -754,16 +842,27 @@ const SAVE_EVERY = 25;
 /** A full pass (start, timer) or one a turn started (a queued or a delivered live retain). */
 type PassKind = "full" | "turn";
 
+/** True when the server said how long to wait (a parsed Retry-After on a 429 or 5xx). */
+function hasRetryAfter(error: unknown): error is { retryAfterMs: number } {
+  const retryAfter = (error as { retryAfterMs?: unknown } | null)?.retryAfterMs;
+  return typeof retryAfter === "number" && retryAfter > 0;
+}
+
 /**
- * A bank that refused (auth, rate limit, bank setup): not before `until`. A turn-triggered pass
- * skips it until then, so a wrong token or a rate limit costs no request per turn. A full pass
- * still tries it, unless the server asked for the wait itself (`strict`, from Retry-After).
+ * A bank that refused (auth, rate limit, bank setup), or answered a 5xx with Retry-After: not
+ * before `until`. A turn-triggered pass skips it until then, so a wrong token or a rate limit
+ * costs no request per turn. A full pass still tries it, unless the server asked for the wait
+ * itself (`strict`, from Retry-After). Holds are per bank: one bank's hold never times another
+ * bank's retry, also for a bank queued after the timer was set for a hold (`schedule()` moves
+ * the timer earlier).
  */
 type BankHold = { until: number; strict: boolean };
 
 /** Replays the queue in order on a backoff timer. Stops at the first transport failure. */
 export class RetainQueueRunner {
   private timer: ReturnType<typeof setTimeout> | undefined;
+  // When the timer fires (ms since epoch), so a request for an earlier pass can move it.
+  private timerDue = 0;
   private delayMs: number;
   private running: Promise<void> | undefined;
   private readonly holds = new Map<string, BankHold>();
@@ -824,12 +923,24 @@ export class RetainQueueRunner {
     return this.running;
   }
 
-  /** Schedules a pass after the current backoff unless one is already scheduled. */
+  /**
+   * Schedules a pass after the current backoff unless one is already scheduled for that time or
+   * earlier. A timer set for a long Retry-After hold moves earlier when a bank without a hold
+   * queues an item, so that bank is retried after the backoff.
+   */
   schedule(delayMs = this.delayMs): void {
     // An empty queue with unsaved removals still needs a pass, to write them.
-    if (this.stopped() || this.timer || (this.queue.size() === 0 && !this.queue.hasUnsaved())) {
+    if (this.stopped() || (this.queue.size() === 0 && !this.queue.hasUnsaved())) {
       return;
     }
+    const due = Date.now() + delayMs;
+    if (this.timer) {
+      if (due >= this.timerDue) {
+        return;
+      }
+      clearTimeout(this.timer);
+    }
+    this.timerDue = due;
     this.timer = setTimeout(() => {
       this.timer = undefined;
       void this.flush();
@@ -858,25 +969,25 @@ export class RetainQueueRunner {
     this.delayMs = Math.min(this.delayMs * 2, this.maxDelay());
   }
 
-  /** Ms until the first held bank with items is due, if every such bank is held strictly; else 0. */
+  /**
+   * Ms until the first strict hold ends, if every bank with queued items is under a strict hold;
+   * else 0, so a bank without one is retried after the normal backoff.
+   */
   private strictWait(now = Date.now()): number {
     let wait = Number.POSITIVE_INFINITY;
-    for (const [bankId, hold] of this.holds) {
-      if (!this.queue.hasBank(bankId)) {
-        continue;
-      }
-      if (!hold.strict) {
+    for (const bankId of this.queue.banks()) {
+      const hold = this.holds.get(bankId);
+      if (!hold?.strict || hold.until <= now) {
         return 0;
       }
       wait = Math.min(wait, hold.until - now);
     }
-    return Number.isFinite(wait) ? Math.max(0, wait) : 0;
+    return Number.isFinite(wait) ? wait : 0;
   }
 
   private hold(bankId: string, error: unknown): void {
-    const retryAfter = (error as { retryAfterMs?: unknown } | null)?.retryAfterMs;
-    const strict = typeof retryAfter === "number" && retryAfter > 0;
-    const wait = strict ? Math.min(retryAfter, this.maxDelay()) : this.delayMs;
+    const strict = hasRetryAfter(error);
+    const wait = strict ? Math.min(error.retryAfterMs, this.maxDelay()) : this.delayMs;
     this.holds.set(bankId, { until: Date.now() + wait, strict });
   }
 
@@ -933,7 +1044,11 @@ export class RetainQueueRunner {
             `memory-hindsight: retain queue replay deferred (${this.queue.size()} pending): ${formatErrorMessage(error)}`,
           );
           if (isTransportFailure(error)) {
-            // Hindsight is unreachable for everyone: end the pass and back off.
+            // Hindsight is unreachable for everyone: end the pass and back off. A 5xx that says
+            // when to come back (Retry-After) holds this bank for that long, like a 429.
+            if (hasRetryAfter(error)) {
+              this.hold(entry.bankId, error);
+            }
             this.backOff();
             return { delivered, clean: false };
           }

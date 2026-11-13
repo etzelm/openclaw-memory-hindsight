@@ -2,6 +2,7 @@ import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import { boundedSignal, isBankNotFound } from "./client.js";
 import { GET_TIMEOUT_MS, RECALL_MAX_TOKENS, RECALL_TIMEOUT_MS } from "./config.js";
+import type { BreakerState, RecallErrorClass } from "./recall-breaker.js";
 import { type AgentBankMap, ownerBankId, routeAudience } from "./routing.js";
 import type { MemoryPluginCapability } from "./sdk-types.js";
 import type { HindsightService } from "./service.js";
@@ -54,9 +55,28 @@ function sliceLines(text: string, from: number | undefined, lines: number | unde
   };
 }
 
+/** Auto-recall state for health: the breaker and how the last auto-recall failed, if it did. */
+export type RecallHealth = { breaker: BreakerState; lastError?: RecallErrorClass };
+
+/** Why a reachable Hindsight is reported as degraded; empty when it is ready. */
+function degradedReasons(queueDepth: number, recall: RecallHealth | undefined): string[] {
+  const reasons: string[] = [];
+  if (queueDepth > 0) {
+    reasons.push(`${queueDepth} ${queueDepth === 1 ? "retain" : "retains"} queued for replay`);
+  }
+  if (recall?.breaker === "open") {
+    reasons.push("auto-recall paused by the circuit breaker");
+  }
+  if (recall?.lastError) {
+    reasons.push(`last auto-recall failed (${recall.lastError})`);
+  }
+  return reasons;
+}
+
 export function createHindsightProviderRuntime(params: {
   providerId: string;
   service: HindsightService;
+  recallHealth?: () => RecallHealth;
 }): MemoryProviderRuntime {
   const { providerId, service } = params;
   const reference = (id: string) => ({ providerId, id });
@@ -184,17 +204,39 @@ export function createHindsightProviderRuntime(params: {
         async health() {
           assertCurrent();
           const { autoRecall, autoRetain, memoryMode } = service.config();
-          // Health reaches every authenticated caller: no memory text, URLs or tokens.
-          const details = { backend: "hindsight", autoRecall, autoRetain, memoryMode };
           const healthy = await service.client.healthy();
           assertCurrent();
-          return healthy
-            ? { status: "ready", details }
-            : {
-                status: "unavailable",
-                message: "The Hindsight API is not reachable. Check the Gateway log.",
+          // Health reaches every authenticated caller: counts and fixed words only, no memory
+          // text, bank ids, URLs, error messages or tokens.
+          let queueDepth = 0;
+          for (const depth of service.retainQueueDepth()?.values() ?? []) {
+            queueDepth += depth;
+          }
+          const recall = params.recallHealth?.();
+          const details = {
+            backend: "hindsight",
+            autoRecall,
+            autoRetain,
+            memoryMode,
+            retainQueueDepth: queueDepth,
+            recallBreaker: recall?.breaker ?? "closed",
+            ...(recall?.lastError ? { lastRecallError: recall.lastError } : {}),
+          };
+          if (!healthy) {
+            return {
+              status: "unavailable",
+              message: "The Hindsight API is not reachable. Check the Gateway log.",
+              details,
+            };
+          }
+          const reasons = degradedReasons(queueDepth, recall);
+          return reasons.length > 0
+            ? {
+                status: "degraded",
+                message: `Hindsight answers, but ${reasons.join("; ")}. Check the Gateway log.`,
                 details,
-              };
+              }
+            : { status: "ready", details };
         },
         // The HTTP client is shared with hooks and tools; nothing is leased per caller.
         async close() {},

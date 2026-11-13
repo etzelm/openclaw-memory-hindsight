@@ -70,10 +70,33 @@ function everyRequest() {
     "POST /v1/default/banks/dev/reflect": () => ({ json: { text: "" } }),
     "GET /v1/default/banks/dev/memories/m1": () => ({ json: { id: "m1", text: "x" } }),
     "PUT /v1/default/banks/dev": () => ({ json: {} }),
-    "GET /v1/default/banks/dev/knowledge-base/tree": () => ({ json: { roots: [] } }),
-    "GET /v1/default/banks/dev/knowledge-base/search": () => ({ json: { results: [] } }),
-    "GET /v1/default/banks/dev/knowledge-base/pages/p1": () => ({
+    "GET /v1/default/banks/dev/pages/tree": () => ({ json: { roots: [] } }),
+    "GET /v1/default/banks/dev/pages/search": () => ({ json: { results: [] } }),
+    "GET /v1/default/banks/dev/pages/p1": () => ({ json: { name: "p", markdown: "m" } }),
+    // Bank "old" plays a server without /pages/*: the client falls back to /knowledge-base/*.
+    "GET /v1/default/banks/old/pages/tree": () => ({ status: 404, json: { detail: "Not Found" } }),
+    "GET /v1/default/banks/old/knowledge-base/tree": () => ({ json: { roots: [] } }),
+    "GET /v1/default/banks/old/knowledge-base/search": () => ({ json: { results: [] } }),
+    "GET /v1/default/banks/old/knowledge-base/pages/p1": () => ({
       json: { name: "p", markdown: "m" },
+    }),
+    "GET /v1/default/banks/dev/directives": () => ({
+      json: { items: [], total: 0, limit: 100, offset: 0 },
+    }),
+    "POST /v1/default/banks/dev/directives": () => ({
+      json: { id: "d1", bank_id: "dev", name: "n", content: "c" },
+    }),
+    "GET /v1/default/banks/dev/directives/d1": () => ({
+      json: { id: "d1", bank_id: "dev", name: "n", content: "c" },
+    }),
+    "DELETE /v1/default/banks/dev/directives/d1": () => ({ json: { success: true } }),
+    "PATCH /v1/default/banks/dev/memories/m1": () => ({ json: {} }),
+    "DELETE /v1/default/banks/dev/memories/m1/observations": () => ({
+      json: { deleted_count: 0 },
+    }),
+    "POST /v1/default/banks/dev/consolidate": () => ({ json: { operation_id: "o1" } }),
+    "GET /v1/default/banks/dev/operations/o1": () => ({
+      json: { operation_id: "o1", status: "completed" },
     }),
     "GET /health": () => ({ json: {} }),
     "GET /version": () => ({ json: { api_version: "1.2.1", features: {} } }),
@@ -113,6 +136,10 @@ describe("Hindsight API contract (recorded from 1.2.1)", () => {
       preferObservations: true,
       minScores: { final: 0.1 },
       ...({ tagGroups: [{ not: { tags: ["kind:status"] } }] } as object),
+      // hindsight_recall since/until (0.9.0); cast in like tagGroups above.
+      ...({
+        temporalWindow: { start: "2026-11-01T00:00:00.000Z", end: "2026-11-07T23:59:59.999Z" },
+      } as object),
     });
     await client.reflect("dev", "q", { budget: "low" });
     await client.getMemory("dev", "m1");
@@ -120,6 +147,19 @@ describe("Hindsight API contract (recorded from 1.2.1)", () => {
     await client.getKnowledgeBaseTree("dev");
     await client.searchKnowledgeBase("dev", "q", { limit: 5 });
     await client.getKnowledgePage("dev", "p1");
+    // The fallback routes: once a route 404 is seen, this client reads /knowledge-base/*.
+    await client.getKnowledgeBaseTree("old");
+    await client.searchKnowledgeBase("old", "q", { limit: 5 });
+    await client.getKnowledgePage("old", "p1");
+    await client.listDirectives("dev", { activeOnly: true });
+    await client.createDirective("dev", { name: "n", content: "c", priority: 1, tags: ["t"] });
+    await client.getDirective("dev", "d1");
+    await client.deleteDirective("dev", "d1");
+    await client.getMemoryDetail("dev", "m1");
+    await client.updateMemory("dev", "m1", { text: "t", state: "invalidated", reason: "r" });
+    await client.clearMemoryObservations("dev", "m1");
+    await client.consolidate("dev");
+    await client.operationStatus("dev", "o1");
     await client.healthy();
     // The openclaw hindsight CLI's requests.
     await client.version();
@@ -169,10 +209,23 @@ describe("Hindsight API contract (recorded from 1.2.1)", () => {
       ["POST /v1/default/banks/{bank_id}/memories/recall", ["results", "[]", "type"]],
       ["POST /v1/default/banks/{bank_id}/memories/recall", ["results", "[]", "scores", "final"]],
       ["POST /v1/default/banks/{bank_id}/reflect", ["text"]],
+      ["GET /v1/default/banks/{bank_id}/pages/tree", ["roots", "[]", "children"]],
+      ["GET /v1/default/banks/{bank_id}/pages/tree", ["roots", "[]", "kind"]],
+      ["GET /v1/default/banks/{bank_id}/pages/search", ["results", "[]", "snippet"]],
+      ["GET /v1/default/banks/{bank_id}/pages/{page_id}", ["markdown"]],
       ["GET /v1/default/banks/{bank_id}/knowledge-base/tree", ["roots", "[]", "children"]],
       ["GET /v1/default/banks/{bank_id}/knowledge-base/tree", ["roots", "[]", "kind"]],
       ["GET /v1/default/banks/{bank_id}/knowledge-base/search", ["results", "[]", "snippet"]],
       ["GET /v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}", ["markdown"]],
+      ["GET /v1/default/banks/{bank_id}/directives", ["items", "[]", "content"]],
+      ["GET /v1/default/banks/{bank_id}/directives", ["items", "[]", "is_active"]],
+      ["GET /v1/default/banks/{bank_id}/directives", ["items", "[]", "tags"]],
+      ["POST /v1/default/banks/{bank_id}/directives", ["id"]],
+      ["GET /v1/default/banks/{bank_id}/directives/{directive_id}", ["content"]],
+      ["DELETE /v1/default/banks/{bank_id}/memories/{memory_id}/observations", ["deleted_count"]],
+      ["POST /v1/default/banks/{bank_id}/consolidate", ["operation_id"]],
+      ["GET /v1/default/banks/{bank_id}/operations/{operation_id}", ["status"]],
+      ["GET /v1/default/banks/{bank_id}/operations/{operation_id}", ["progress", "processed"]],
       ["GET /version", ["api_version"]],
       ["GET /v1/default/banks/{bank_id}/documents", ["items", "[]", "id"]],
       ["GET /v1/default/banks/{bank_id}/documents", ["items", "[]", "memory_unit_count"]],
@@ -183,5 +236,29 @@ describe("Hindsight API contract (recorded from 1.2.1)", () => {
       .map(([k, p]) => `${k} ${p.join(".")}`);
     expect(missing).toEqual([]);
     expect(contract.hindsight).toBe("1.2.1");
+  });
+});
+
+describe("Hindsight API contract: 0.9.0 request fields (0.9.0 review P2-7)", () => {
+  it("records include.entities on recall and fact_types on reflect", async () => {
+    const { fake, client } = everyRequest();
+    await client.recall("dev", "q", { budget: "mid", skipEntities: true });
+    await client.reflect("dev", "q", { budget: "low", types: ["world"] });
+    const problems: string[] = [];
+    for (const request of fake.requests) {
+      const [key, op] = operationFor(request);
+      problems.push(...unknownFields(request.body, op.request, "body").map((f) => `${key}: ${f}`));
+    }
+    expect(fake.requests.map((r) => r.body)).toEqual([
+      { query: "q", budget: "mid", include: { entities: null } },
+      { query: "q", budget: "low", fact_types: ["world"] },
+    ]);
+    expect(problems).toEqual([]);
+    const recall = contract.operations["POST /v1/default/banks/{bank_id}/memories/recall"]!;
+    const entities = recall.request?.properties?.include?.properties?.entities;
+    // Sent as null to turn entities off, so the recorded field must allow null.
+    expect(entities?.anyOf?.some((s) => s.type === "null") || entities?.nullable).toBe(true);
+    const reflect = contract.operations["POST /v1/default/banks/{bank_id}/reflect"]!;
+    expect(reflect.request?.properties?.fact_types).toBeTruthy();
   });
 });
