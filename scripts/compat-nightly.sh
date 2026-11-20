@@ -115,7 +115,8 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 echo "$$" > "$LOCK/pid"
 D=$(mktemp -d "$WORK_ROOT/hs-compat-nightly.XXXXXX") || { rm -rf "$LOCK"; write_status 4; exit 4; }
-trap 'st=$?; rm -rf "$D" "$LOCK"; write_status "$st"; exit "$st"' EXIT
+# Remove the lock only while it is still ours: a later run may have judged it stale and taken it.
+trap 'st=$?; rm -rf "$D"; [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"; write_status "$st"; exit "$st"' EXIT
 echo "== $(now_utc) nightly ref=$REF"
 if [ -n "${HS_COMPAT_PRE:-}" ]; then
   bash -c "$HS_COMPAT_PRE" || echo "warning: HS_COMPAT_PRE failed; testing the last fetched $REF"

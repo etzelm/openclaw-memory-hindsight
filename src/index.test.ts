@@ -603,6 +603,82 @@ describe("auto-retain across one run's agent_end calls", () => {
     const [, second] = retained(fake.requests);
     expect(second!.texts).toEqual(["later ask", resumed.content]);
   });
+
+  // A continued run (a second user message inside the run) shows whether agent_end had a start
+  // marker: with one the document starts at `ask`, without one at the last user message.
+  const continued = [...prior, ask, reply, { role: "user", content: "later ask" }, resumed];
+  const withMarker = [ask.content, reply.content, "later ask", resumed.content];
+  const fallback = ["later ask", resumed.content];
+  const ctxOf = (i: number) => ctxFor(`run-${i}`, { sessionKey: `agent:dev:s${i}` });
+
+  it("uses and then drops the run start on hosts that send no runId", async () => {
+    const { fake, hook } = setup({ autoRecall: false });
+    const noRun = ctxFor("unused", { runId: undefined });
+    await hook("before_prompt_build")!(
+      { prompt: ask.content, currentUserMessage: ask.content, messages: [...prior, ask] },
+      noRun,
+    );
+    await hook("agent_end")!({ success: true, messages: continued }, noRun);
+    // The next run on the same host marks its own start instead of reusing the first one.
+    const next = { role: "user", content: "what was the code word?" };
+    const answer = { role: "assistant", content: "heron" };
+    await hook("before_prompt_build")!(
+      {
+        prompt: next.content,
+        currentUserMessage: next.content,
+        messages: [...continued, next],
+      },
+      noRun,
+    );
+    await hook("agent_end")!(
+      { success: true, messages: [...continued, next, answer, { role: "user", content: "x" }] },
+      noRun,
+    );
+    const [first, second] = retained(fake.requests);
+    expect(first!.texts).toEqual(withMarker);
+    expect(second!.texts).toEqual([next.content, answer.content, "x"]);
+  });
+
+  it("keeps at most 1000 run starts and evicts the oldest session first", async () => {
+    const { fake, hook } = setup({ autoRecall: false });
+    for (let i = 0; i <= 1000; i += 1) {
+      await hook("before_prompt_build")!(
+        { prompt: ask.content, currentUserMessage: ask.content, messages: [...prior, ask] },
+        ctxOf(i),
+      );
+    }
+    for (const i of [0, 1, 1000]) {
+      await hook("agent_end")!({ success: true, runId: `run-${i}`, messages: continued }, ctxOf(i));
+    }
+    const [evicted, oldestKept, newest] = retained(fake.requests);
+    expect(evicted!.texts).toEqual(fallback);
+    expect(oldestKept!.texts).toEqual(withMarker);
+    expect(newest!.texts).toEqual(withMarker);
+  });
+
+  it("drops every run start when the service stops", async () => {
+    const { api, fake, hook } = setup({ autoRecall: false });
+    const service = (api.registerService as ReturnType<typeof vi.fn<AnyFn>>).mock.calls[0]![0];
+    service.start();
+    await hook("before_prompt_build")!(
+      { prompt: ask.content, currentUserMessage: ask.content, messages: [...prior, ask] },
+      ctxFor("run-1"),
+    );
+    service.stop();
+    // A stopped service retains nothing.
+    await hook("agent_end")!(
+      { success: true, runId: "run-1", messages: continued },
+      ctxFor("run-1"),
+    );
+    expect(retained(fake.requests)).toHaveLength(0);
+    service.start();
+    await hook("agent_end")!(
+      { success: true, runId: "run-1", messages: continued },
+      ctxFor("run-1"),
+    );
+    service.stop();
+    expect(retained(fake.requests).map((p) => p.texts)).toEqual([fallback]);
+  });
 });
 
 describe("document ids", () => {

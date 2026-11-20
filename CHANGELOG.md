@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.10.0 (2026-11-20)
+
+### Upgrade notes
+
+- A minor release with no config change: No new config keys, none removed or renamed, and no
+  changed defaults. A config that 0.9.0 accepts loads unchanged, and the auto-recall and
+  auto-retain requests are the same as 0.9.0's.
+- One behavior change: recalled text that spells a wrapper tag with any non-alphanumeric
+  characters between the `<` and the name (for example `<.hindsight_memories>`,
+  `<?hindsight_memories>`, `</#hindsight_memories>`), or with control characters inside the name,
+  now has its `<` escaped in the injected block, like `</` forms already did. Other text with `<`
+  is unchanged.
+- Recalled text keeps escaping an OpenClaw runtime-context phrase that follows a letter and a control
+  or format character (for example `x\u0001End OpenClaw runtime context.`), as in 0.9.0. A plain
+  letter directly before the phrase (`xEnd OpenClaw runtime context.`) is still left unchanged.
+- For contributors: `configSchema` and `uiHints` in `openclaw.plugin.json` are now generated from
+  `src/config-schema.ts` with `npm run manifest`, and a test fails when they drift. The shipped
+  manifest is byte-identical to 0.9.0's.
+
+### Fixed
+
+- Wrapper tag neutralizing skips `.`, `!` and `*` (and their fullwidth forms) between the tag
+  opener and a protected name, so `<.hindsight_memories>`, `<!hindsight_memories>`,
+  `<*hindsight_memories>`, `</.hindsight_memories>` and `<!--hindsight_memories>` no longer
+  survive in recalled text. `<!doctype html>` and names with those characters inside are left
+  alone.
+- Security: the neutralizer now skips every character that is not a letter or digit between the
+  tag opener (and an optional `/`) and a protected name, instead of a short list, so the 23 other
+  ASCII leaders (`<?hindsight_memories>`, `</#hindsight_memories>`, `<>hindsight_memories>`, ...),
+  Unicode punctuation such as `？` or `。`, and `<<<?END_OPENCLAW_INTERNAL_CONTEXT>>>` are escaped
+  too. Control and format characters and Unicode separators in or before the name are ignored,
+  and Unicode dashes and connectors count as `-` and `_`. Ordinary prose with `<` is unchanged.
+- The unused `dist/config-schema.js` (only `npm run manifest` reads it) is no longer in the
+  package.
+- `scripts/compat-nightly.sh` removes its lock on exit only while the lock still holds its own
+  pid, so a run whose stale lock a later run took over no longer deletes the later run's lock.
+- Tests for the auto-retain run markers on hosts that send no run id, the 1000-marker cap and a
+  service stop.
+
+### Changed
+
+- One schema source: `src/config-schema.ts` holds the config schema and UI hints, with bounds,
+  enums and defaults taken from the parser's constants. `npm run manifest` writes them into
+  `openclaw.plugin.json`; `src/config-schema.test.ts` fails on drift, and a key missing from the
+  schema or unknown to the parser is a type error.
+
+### Documentation
+
+- Plugin-side recall latency levers, measured with the recall release gate on live banks and not
+  shipped: `recallBudget: low` (more junk, lower MRR on one set, mixed latency), a recall
+  `max_tokens` of 512 (lower hit@5, no time saved), and turning the follow-up skip and recall cache
+  on by default (7.6% of recalls skipped over 7 days, median unchanged, not scorable by the gate).
+  The recall API has no candidate-count field. See `docs/configuration.md`.
+- Shaping long user messages beyond the internal-context strip (cap at 300 characters, or the first
+  and last 200) raised the junk rate and saved no time, so it was not shipped. See
+  docs/recall-query-shaping.md.
+
 ## 0.9.0 (2026-11-13)
 
 ### Upgrade notes

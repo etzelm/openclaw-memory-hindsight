@@ -375,7 +375,11 @@ describe("docs (0.9.0 review P2-3, N1, N4, P3)", () => {
     expect(manifest.uiHints.recallEarlyStart!.help).toMatch(/^Experimental/);
     expect(manifest.configSchema.properties.recallEarlyStart!.description).toMatch(/^Experimental/);
     const changelog = read("CHANGELOG.md");
-    const notes = changelog.split("### Upgrade notes")[1]!.split("### Added")[0]!;
+    // The 0.9.0 section, wherever newer releases put it.
+    const notes = changelog
+      .split("## 0.9.0 (")[1]!
+      .split("### Upgrade notes")[1]!
+      .split("### Added")[0]!;
     expect(notes).toMatch(/`recallEarlyStart` \(default `false`, experimental\)/);
   });
 

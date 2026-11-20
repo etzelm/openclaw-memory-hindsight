@@ -286,11 +286,22 @@ const PROTECTED_NAMES = [
 ];
 /**
  * Characters a reader does not see as letters, skipped when spelling the wrapper name:
- * default-ignorables, whitespace, combining marks (after NFKD, so precomposed accents too)
- * and blanks that are neither (Hangul fillers, braille blank).
+ * default-ignorables, whitespace, controls, format characters, separators, combining marks
+ * (after NFKD, so precomposed accents too) and blanks that are none of these (Hangul fillers,
+ * braille blank).
  */
 const INVISIBLE_CHAR_RE =
-  /^[\p{Default_Ignorable_Code_Point}\p{White_Space}\p{Mn}\p{Me}\u115F\u1160\u2800\u3164\uFFA0]$/u;
+  /^[\p{Default_Ignorable_Code_Point}\p{White_Space}\p{Cc}\p{Cf}\p{Z}\p{Mn}\p{Me}\u115F\u1160\u2800\u3164\uFFA0]$/u;
+/**
+ * Controls and format characters that are not default-ignorable. They are invisible to the tag
+ * matcher but still end a word for the host-phrase check, as they did before 0.10.0.
+ */
+const BOUNDARY_CONTROL_RE = /^(?![\p{Default_Ignorable_Code_Point}])[\p{Cc}\p{Cf}]$/u;
+/** Dashes (and the minus sign) fold to `-`, connector punctuation to `_`. */
+const DASH_RE = /^[\p{Pd}\u2212]$/u;
+const CONNECTOR_RE = /^\p{Pc}$/u;
+/** A folded character that can start a protected name; anything else before the name is skipped. */
+const NAME_START_RE = /^[\p{L}\p{N}]$/u;
 /**
  * Common Cyrillic, Greek and Latin lookalikes of the wrapper name's letters, upper and lower
  * case (looked up both before and after lowercasing).
@@ -348,8 +359,6 @@ const TAG_OPENERS = new Set([
   "\u2770",
   "\u29FC",
 ]);
-/** Slash and backslash plus the division and fraction slashes, skipped before the name. */
-const SLASHES = new Set(["/", "\\", "\u2215", "\u2044"]);
 /** OpenClaw's internal-context markers and the escaped forms the host uses for untrusted text. */
 const HOST_MARKERS: ReadonlyArray<readonly [string, string]> = [
   ["<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>", "[[OPENCLAW_INTERNAL_CONTEXT_BEGIN]]"],
@@ -390,13 +399,18 @@ const HOST_PHRASES: ReadonlyArray<readonly [string, string]> = [
 /** One character as the wrapper-name matcher sees it: NFKD, lowercase, marks and lookalikes folded. */
 function foldNameChar(ch: string): string {
   if (ch.length === 1 && ch < "\x80") {
-    return /\s/.test(ch) ? "" : ch.toLowerCase();
+    // ASCII whitespace, C0 controls and DEL are invisible.
+    return ch <= " " || ch === "\x7F" ? "" : ch.toLowerCase();
   }
   let out = "";
   for (const base of ch.normalize("NFKD")) {
     const lower = (NAME_CONFUSABLES.get(base) ?? base).toLowerCase().normalize("NFKD");
     for (const part of lower) {
-      if (!INVISIBLE_CHAR_RE.test(part)) {
+      if (DASH_RE.test(part)) {
+        out += "-";
+      } else if (CONNECTOR_RE.test(part)) {
+        out += "_";
+      } else if (!INVISIBLE_CHAR_RE.test(part)) {
         out += NAME_CONFUSABLES.get(part) ?? part;
       }
     }
@@ -405,20 +419,41 @@ function foldNameChar(ch: string): string {
 }
 
 /**
- * True when the text after a tag opener spells a protected name: leading slashes, case,
- * accents, `_`/`-`, invisible characters and common lookalike letters are ignored.
- * Attributes, `>` and anything after the name do not matter, so opening, closing and
- * self-closing forms all match.
+ * Index of the first character at or after `from` whose folded form has a letter or digit (or
+ * the text length), or -1 when another tag opener comes first (that opener is the one escaped).
+ * Every character before it is a leader: slashes, punctuation, symbols and invisible characters,
+ * all skipped between a tag opener and a protected name.
  */
-function spellsProtectedName(text: string, from: number): boolean {
+function skipNameLeaders(text: string, from: number): number {
+  let i = from;
+  while (i < text.length) {
+    const ch = String.fromCodePoint(text.codePointAt(i) ?? 0);
+    if (TAG_OPENERS.has(ch)) {
+      return -1;
+    }
+    if ([...foldNameChar(ch)].some((part) => NAME_START_RE.test(part))) {
+      return i;
+    }
+    i += ch.length;
+  }
+  return i;
+}
+
+/**
+ * True when the text from `start` (see skipNameLeaders) spells a protected name: case, accents,
+ * `_`/`-` (and other dashes and connectors), invisible characters and common lookalike letters
+ * are ignored, as are non-letters before the first letter. Attributes, `>` and anything after
+ * the name do not matter, so opening, closing and self-closing forms all match.
+ */
+function spellsProtectedName(text: string, start: number): boolean {
   let name = "";
   let leading = true;
-  let i = from;
+  let i = start;
   while (i < text.length) {
     const ch = String.fromCodePoint(text.codePointAt(i) ?? 0);
     i += ch.length;
     for (const folded of foldNameChar(ch)) {
-      if (folded === "_" || folded === "-" || (leading && SLASHES.has(folded))) {
+      if (folded === "_" || folded === "-" || (leading && !NAME_START_RE.test(folded))) {
         continue;
       }
       leading = false;
@@ -471,7 +506,7 @@ function startsAtWordBoundary(text: string, index: number): boolean {
     const low = text.charCodeAt(i - 1);
     const size = low >= 0xdc00 && low <= 0xdfff && i > 1 ? 2 : 1;
     const ch = text.slice(i - size, i);
-    if (/\s/u.test(ch)) {
+    if (/\s/u.test(ch) || BOUNDARY_CONTROL_RE.test(ch)) {
       return true;
     }
     const folded = foldNameChar(ch);
@@ -527,7 +562,9 @@ export function neutralizeMemoryTags(text: string): string {
   for (let i = 0; i < source.length;) {
     const ch = String.fromCodePoint(source.codePointAt(i) ?? 0);
     const next = i + ch.length;
-    if (TAG_OPENERS.has(ch) && spellsProtectedName(source, next)) {
+    // A leader scan stops at the next opener, so the scans stay linear in the text length.
+    const start = TAG_OPENERS.has(ch) ? skipNameLeaders(source, next) : -1;
+    if (start !== -1 && spellsProtectedName(source, start)) {
       out += `${source.slice(last, i)}&lt;`;
       last = next;
     }

@@ -35,6 +35,16 @@ availability: a turn that timed out, or that the open breaker skipped, gets the 
 block if it is younger than the value and was recalled from the same bank with the same request
 settings (tag filter, score floor, types, budget). `session_end` and a service stop forget it.
 
+Measured and not shipped (0.10.0, recall release gate on live banks, 2026-11-14): `recallBudget:
+low` (a smaller candidate pool) raised the junk rate of injected memories (0.278 to 0.298 and
+0.588 to 0.619) and lowered MRR@10 on one question set (0.285 to 0.236), with mixed latency, so
+the default stays `mid`. A recall `max_tokens` of 512 instead of 1024 lost hit@5 (88 to 86) and
+saved no time, so it stays fixed. The recall API has no candidate-count field: the pool follows
+`budget`, and the reranker's cap is a server setting. `recallFollowupMaxWords` with
+`recallCacheTtlMs` (for example 6 and 900000) skipped 7.6% of recalls on a busy Gateway over 7 days
+(mean recall 2.9 s), but the median is unchanged and the gate cannot score a skipped turn, so both
+stay off by default. Most recall time is on the server (reranking, retrieval, embedding).
+
 Session patterns: `*` matches any run of characters except `:`, `**` matches anything including
 `:`, everything else is literal. Patterns match the trimmed session key. `ignoreSessionPatterns`
 sessions get no auto-recall, no auto-retain and no `hindsight_*` tools. `recallOnlySessionPatterns`

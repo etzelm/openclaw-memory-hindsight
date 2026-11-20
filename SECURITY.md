@@ -20,12 +20,12 @@ Please include:
 
 ## Supported versions
 
-| Version                      | Supported                                                                                                      |
-| ---------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Latest release (0.9.0 today) | Yes                                                                                                            |
-| Older releases               | No. Upgrade to the latest release.                                                                             |
-| 0.1.1                        | No. Deprecated on npm: sends the bearer token and conversation text over plain http to remote hosts (CWE-319). |
-| 0.1.0, 0.0.0-stage           | No. 0.1.0 was never published; 0.0.0-stage is an empty placeholder on npm with no code.                        |
+| Version                       | Supported                                                                                                      |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Latest release (0.10.0 today) | Yes                                                                                                            |
+| Older releases                | No. Upgrade to the latest release.                                                                             |
+| 0.1.1                         | No. Deprecated on npm: sends the bearer token and conversation text over plain http to remote hosts (CWE-319). |
+| 0.1.0, 0.0.0-stage            | No. 0.1.0 was never published; 0.0.0-stage is an empty placeholder on npm with no code.                        |
 
 Before 1.0, only the latest release gets fixes. Upgrade to it first and check that the
 problem is still there. [SUPPORT.md](SUPPORT.md) has the full policy: release cadence,

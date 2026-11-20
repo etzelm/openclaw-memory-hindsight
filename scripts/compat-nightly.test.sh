@@ -112,5 +112,16 @@ check "ref without the script still passes" "$st" 0
 check "ref without the script says so" "$(grep -c 'API contract check skipped' "$T/log")" 1
 check "no contract check without the script" "$([ -e "$T/drift-arg" ] && echo ran || echo no)" no
 
+# A run whose lock was taken over (a later run judged it stale and wrote its own pid) must not
+# delete the other run's lock on exit.
+L=$T/work/.hs-compat-nightly.lock
+HS_COMPAT_REPO=$R HS_COMPAT_REF=develop HS_COMPAT_RESULTS=$T/results HS_COMPAT_STATUS_FILE=$T/state/nightly.prom \
+  HS_COMPAT_PRE="echo 424242 > '$L/pid'" STUB_EXIT=0 STUB_OUT=$T/ran WORK_ROOT=$T/work \
+  bash "$NIGHTLY" > "$T/log" 2>&1; st=$?
+check "taken-over lock: exit" "$st" 0
+check "taken-over lock: kept" "$(cat "$L/pid" 2>/dev/null)" 424242
+check "taken-over lock: scratch removed" "$(ls -A "$T/work")" ".hs-compat-nightly.lock"
+rm -rf "$L"
+
 echo "compat-nightly tests: $([ "$fails" = 0 ] && echo PASS || echo "FAIL ($fails)")"
 [ "$fails" = 0 ]

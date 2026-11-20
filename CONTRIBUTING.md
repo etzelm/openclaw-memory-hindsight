@@ -44,6 +44,10 @@ self-test (`bash scripts/host-types.sh --self-test`) and the latest OpenClaw rel
 (`bash scripts/host-types.sh --host latest --tests`); see
 [docs/compat-matrix.md](docs/compat-matrix.md#offline-checks-host-types-api-contract-retain-queue-model).
 
+Config keys: the schema and UI hints live in `src/config-schema.ts`, the parser in `src/config.ts`.
+Do not edit `configSchema` or `uiHints` in `openclaw.plugin.json` by hand: run `npm run manifest`,
+which writes both from `src/config-schema.ts`. `src/config-schema.test.ts` fails on drift.
+
 Keep changes small and focused. TypeScript ESM only, no new runtime dependencies without
 discussion, and no secrets, tokens or private hostnames in code, tests or logs.
 

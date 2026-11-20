@@ -50,6 +50,21 @@ Per task, `strip` returned more relevant memories for 23 of 40, fewer for 9, the
 The 99 curated questions and the harvested set contain no envelope, so their queries and
 scores are the same in both modes.
 
+## Shaping beyond the envelope: not shipped (0.10.0)
+
+Two more ways to shorten a long user message after `strip` were tried with the recall release
+gate (live banks, 2026-11-14, same items for both builds) and dropped:
+
+| Variant (after `strip`)         | Real prompts junk | Agent prompts junk | Relevant per agent prompt | p50 (real prompts) |
+| ------------------------------- | ----------------- | ------------------ | ------------------------- | ------------------ |
+| none (0.9.0: cap 800)           | 0.276             | 0.588              | 3.95                      | 1.89 s             |
+| cap at 300 characters           | 0.313             | 0.670              | 3.35                      | 1.86 s             |
+| first 200 + last 200 characters | 0.287             | 0.775              | 2.21                      | 1.94 s             |
+
+The question sets were unchanged (their queries are short). Both variants inject more junk and
+save no measurable time: the query embedding is a small part of a recall (about 0.25 s of 2.2 s
+on the server), and the reranker pairs each candidate with the query either way.
+
 ## Rollout and rollback
 
 Set `"recallQueryShaping": "strip"` in the plugin config; the plugin reads it on the next turn
