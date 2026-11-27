@@ -193,6 +193,17 @@ them on every turn:
 
 Manage directives with `openclaw hindsight directives list | add | rm` (see the README).
 
+## Host entry keys: `allowMetrics`
+
+`allowMetrics` is an OpenClaw key on the plugin's host entry, next to `enabled`, not a plugin
+config key: `plugins.entries.hindsight-native.allowMetrics: true`. Putting it under
+`plugins.entries.hindsight-native.config` is an error: the host's manifest check rejects the
+unknown key (`additionalProperties: false`), and the plugin refuses to start with "config has
+unknown keys". On hosts with `api.metrics` (openclaw#198455) the host entry key makes the plugin publish its metrics
+through the Gateway's Prometheus scrape (`diagnostics-prometheus`) as
+`openclaw_plugin_hindsight_native_*` instead of serving `/plugins/hindsight-native/metrics`. On
+older hosts the key is ignored and the route stays. See [Gateway metrics](metrics.md).
+
 ## Mapping from `@vectorize-io/hindsight-openclaw`
 
 | Vendor key                                                                                                                                                                                                                                                                                                        | Here                                                                                                      |

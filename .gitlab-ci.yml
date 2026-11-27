@@ -68,3 +68,31 @@ host-latest:
     - apk add --no-cache bash
     - npm ci --no-audit --no-fund
     - bash scripts/host-types.sh --host latest --tests
+
+# The plugin on a dev OpenClaw host with api.metrics (openclaw#198455; in no npm release yet, and
+# the released packages ship no diagnostics-prometheus exporter): boots an isolated Gateway with
+# allowMetrics true and asserts the scrape has the hindsight families and the queue depth
+# heartbeat (scripts/dev-host-scrape.sh). The host build needs about 4.7 GB and this runner's
+# containers get about 2.1 GB of heap, so the host is built once elsewhere (the Studio) with
+# scripts/dev-host-pack.sh and kept in this project's generic package registry; the job checks
+# its sha256 and only runs pnpm install. To move the host: build, pack, upload, update both vars.
+dev-host:
+  stage: check
+  image: node:24-bookworm
+  timeout: 30m
+  variables:
+    # Upstream main with #198455 (merge bd1c54cf); the commit the mini's dev host runs.
+    OPENCLAW_DEV_SHA: d7d546f292779a618e6749a4550f3752bab13850
+    OPENCLAW_DEV_TGZ_SHA256: 63293be468dd9c6bd50bcb79ed85e16f7dd62b877135945842f8df41ec71f32e
+  script:
+    - npm ci --no-audit --no-fund
+    - npm run build
+    - >-
+      bash scripts/dev-host-scrape.sh
+      --prebuilt "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/openclaw-dev-host/$OPENCLAW_DEV_SHA/openclaw-dev-host-${OPENCLAW_DEV_SHA:0:11}.tgz"
+      --sha256 "$OPENCLAW_DEV_TGZ_SHA256" --work "$CI_PROJECT_DIR/.dev-host" --out dev-host-out
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - dev-host-out/

@@ -274,7 +274,7 @@ const properties = {
     enum: [...SLOT_MODES],
     default: "auto",
     description:
-      "replace: own plugins.slots.memory and replace memory-core. sidecar: run beside the slot owner (memory-core) with hooks and hindsight_* tools only; never registers the memory runtime and never shadows memory_search. auto: replace when plugins.slots.memory names this plugin, else sidecar. Read at startup",
+      "replace: own plugins.slots.memory and replace memory-core. sidecar: run beside the slot owner (memory-core) with hooks and hindsight_* tools only; never registers the memory runtime and never shadows memory_search. auto: replace when plugins.slots.memory names this plugin, else sidecar. Read at startup. On OpenClaw 2026.11.7+ two more roles need no plugin key: as the owner it fuses memory backends opted in with plugins.entries.<id>.memoryBackend true, and under another owner (memfusion) the host loads it as a backend that only searches, gets and stores",
   },
   activeMemoryYield: {
     type: "boolean",
@@ -519,7 +519,7 @@ export const CONFIG_UI_HINTS = {
   },
   slotMode: {
     label: "Slot Mode",
-    help: "replace memory-core, run beside it (sidecar), or auto from plugins.slots.memory",
+    help: "replace memory-core, run beside it (sidecar), or auto from plugins.slots.memory. Memory backends (OpenClaw 2026.11.7+) are set with plugins.entries.<id>.memoryBackend, not here",
   },
   activeMemoryYield: {
     label: "Yield to Active Memory",

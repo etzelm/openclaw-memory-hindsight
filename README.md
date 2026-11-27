@@ -129,6 +129,20 @@ and `/learn`; memory-core's file index is gone. **Sidecar** (slot `memory-core`)
 those and the plugin adds recall, retain and `hindsight_*` tools (+1265 cached prompt tokens per
 turn, plus indexing); it needs a host with [openclaw#198445](https://github.com/openclaw/openclaw/issues/198445). [docs/sidecar-mode.md](docs/sidecar-mode.md)
 
+### Memory backends (OpenClaw 2026.11.7 and later)
+
+Hosts with [openclaw#201340](https://github.com/openclaw/openclaw/pull/201340) and
+[#202838](https://github.com/openclaw/openclaw/pull/202838) add two roles, set in host config only:
+
+- **Fusion owner** (slot `hindsight-native`, plus `plugins.entries.memory-core.memoryBackend: true`):
+  `memory_search` and `memory_get` merge Hindsight with memory-core (MEMORY.md, `memory/*.md`);
+  hooks, auto-recall, auto-retain and `hindsight_*` tools stay as in replace mode.
+- **Backend** (slot `memfusion`, hindsight-native enabled): the owner searches, reads and stores
+  through Hindsight; auto-recall, auto-retain and `hindsight_*` tools are off in this role.
+
+Older hosts reject `memoryBackend`; without it nothing changes. Setup guides and tradeoffs:
+[docs/memory-backends.md](docs/memory-backends.md)
+
 | Key                               | Default              | Meaning                                                                                                |
 | --------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------ |
 | `hindsightApiUrl`                 | required             | Base URL of the Hindsight API                                                                          |
@@ -257,48 +271,13 @@ are in [docs/offline-retain-queue.md](docs/offline-retain-queue.md).
 
 ### Gateway metrics
 
-The plugin serves Prometheus text at `GET /plugins/hindsight-native/metrics` on the Gateway
-port. The route uses Gateway auth and needs `operator.read` (or `operator.write` /
-`operator.admin`), the same as `diagnostics-prometheus`, so scrape it with the token you use
-for `/api/diagnostics/prometheus`. `diagnostics-prometheus` renders only core diagnostic
-events and has no plugin metric surface, which is why this is a separate path. There is no
-config key; counters live in memory and reset when the Gateway restarts.
-
-| Series (`openclaw_hindsight_` prefix) | Type      | Labels                     |
-| ------------------------------------- | --------- | -------------------------- |
-| `recall_total`                        | counter   | `agent`, `bank`, `outcome` |
-| `recall_duration_seconds`             | histogram | `agent`, `bank`            |
-| `recall_skipped_total`                | counter   | `agent`, `reason`          |
-| `recall_injected_memories`            | histogram | `agent`, `bank`            |
-| `recall_injected_chars`               | histogram | `agent`, `bank`            |
-| `retain_total`                        | counter   | `agent`, `bank`, `outcome` |
-| `retain_duration_seconds`             | histogram | `agent`, `bank`            |
-| `retain_queue_depth`                  | gauge     | `bank`                     |
-| `retain_queue_replays_total`          | counter   | `bank`, `outcome`          |
-| `retain_queue_drops_total`            | counter   | `bank`, `reason`           |
-
-- Recall counts the auto-recall request only: `injected`, `empty` (no results or no bank yet),
-  `timeout`, `error`. A recall the host cancels (audience changed, hook invocation stale) is
-  not counted. Retain counts auto-retain only: `sent`, `queued`, `timeout`, `error`. Tool
-  calls are not counted.
-- Skips count eligible auto-recall turns that sent no request, by `reason`: `filter` (excluded
-  provider, operational session, ignore pattern, incognito), `no_audience`, `empty_query` (no
-  usable text after boilerplate stripping), `followup` (the follow-up rule), `cache_hit` (memories
-  injected from the cache) and `breaker_open` (the recall circuit breaker). Recall turned off and
-  host maintenance turns are not counted.
-- `recall_injected_memories` and `recall_injected_chars` observe each injected block, fresh or
-  from the cache: how many memories and how many characters reached the prompt. Buckets: 1, 2,
-  3, 5, 8, 10, 15, 20, 30, 50 memories; 250 to 32000 characters.
-- The latency histograms cover every outcome, so timeouts and fast `queued` retains are in the
-  same quantiles as successful calls.
-- Replays: `delivered`, or `deferred` (Hindsight unreachable, item kept). Drops count retains
-  that are lost: `limit` (`retainQueueMaxItems`, `retainQueueMaxAgeMs` or the size bound),
-  `too_large` (the live write failed and the item is over the queue's size bound), `rejected`
-  (a 4xx on replay).
-- `agent` is the normalized agent id. `bank` is the owner bank; every conversation bank of
-  that owner shares one `<bank>::conv` label. Values that are not label-safe read `unknown`.
-  Past 200 label sets per metric family, new `agent` and `bank` values fold into `other`;
-  `outcome` and `reason` keep their value. No session ids, document ids or text.
+Recall, retain and retain-queue counters and latencies, labeled by agent, bank and outcome. On
+an OpenClaw host with `api.metrics` (openclaw#198455), set `allowMetrics: true` on the
+`plugins.entries.hindsight-native` host entry (not in `config`) and they go out on the
+`diagnostics-prometheus` scrape as `openclaw_plugin_hindsight_native_*`. Otherwise the plugin
+serves `GET /plugins/hindsight-native/metrics` (Gateway auth, `operator.read`) with the
+`openclaw_hindsight_` prefix. Never both. Families, labels and the rename:
+[docs/metrics.md](docs/metrics.md). Alert triage and rollback: [docs/metrics-runbook.md](docs/metrics-runbook.md).
 
 ### Rollback
 

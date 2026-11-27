@@ -33,6 +33,8 @@ import {
 import { createHindsightCorpusSupplement } from "./corpus-supplement.js";
 import { createDirectiveCache } from "./directives.js";
 import { runDocumentId } from "./document-ids.js";
+import { FUSED_TOOL_NAMES, fusedToolFactory } from "./fusion-tools.js";
+import { configuredBackendIds, isMemoryBackendRegistration } from "./memory-backends.js";
 import {
   createLearnContribution,
   buildMemoryPromptSection,
@@ -46,6 +48,8 @@ import {
   HindsightMetrics,
   isTimeoutError,
   METRICS_ROUTE_PATH,
+  openMetricsSink,
+  QUEUE_DEPTH_PUBLISH_MS,
 } from "./metrics.js";
 import { createHindsightProviderRuntime } from "./provider-runtime.js";
 import {
@@ -199,27 +203,56 @@ export default definePluginEntry({
       }
     };
 
-    const metrics = new HindsightMetrics();
+    // Memory backend (openclaw#201340): another plugin owns the slot and the host keeps only the
+    // provider runtime. Hooks, tools, services, routes, the flush and /learn would be dropped, so
+    // none is registered: no auto-recall or auto-retain in this role. The service is never
+    // started; the client opens lazily and store() writes live, without the offline queue.
+    if (isMemoryBackendRegistration(api)) {
+      const backendService = createHindsightService({ config: currentConfig, logger: api.logger });
+      api.registerMemoryCapability({
+        providerRuntime: createHindsightProviderRuntime({
+          providerId: PLUGIN_ID,
+          service: backendService,
+          store: true,
+        }),
+      });
+      api.logger.info?.(
+        "memory-hindsight: loaded as a memory backend; the slot owner searches and stores through it. Auto-recall, auto-retain and hindsight_* tools are off in this role",
+      );
+      return;
+    }
+
+    // api.metrics (openclaw#198455) exists only when the operator sets
+    // plugins.entries.hindsight-native.allowMetrics; the floor host's type has no such member.
+    const metricsSink = openMetricsSink((api as { metrics?: unknown }).metrics, api.logger);
+    const metrics = new HindsightMetrics({ sink: metricsSink, logger: api.logger });
     const service = createHindsightService({
       config: currentConfig,
       logger: api.logger,
       metrics,
     });
-    // Gateway-side metrics on the gateway port, behind gateway auth (see metrics.ts for why this
-    // is a plugin route and not diagnostics-prometheus). The floor host has the method; the check
-    // only keeps a host or test double without it from failing registration.
-    if (typeof api.registerHttpRoute !== "function") {
-      api.logger.debug?.(
-        "memory-hindsight: host has no registerHttpRoute; metrics route not served",
-      );
+    const queueDepth = () => service.retainQueueDepth();
+    let queueDepthTimer: ReturnType<typeof setInterval> | undefined;
+    if (metricsSink) {
+      // Families go out on the Gateway's Prometheus scrape; no route, so nothing counts twice.
+      api.logger.debug?.("memory-hindsight: metrics published through api.metrics");
+      metrics.trackQueueDepth(queueDepth);
+    } else {
+      // Gateway-side metrics on the gateway port, behind gateway auth. The floor host has the
+      // method; the check only keeps a host or test double without it from failing registration.
+      if (typeof api.registerHttpRoute !== "function") {
+        api.logger.debug?.(
+          "memory-hindsight: host has no registerHttpRoute; metrics route not served",
+        );
+      }
+      api.registerHttpRoute?.({
+        path: METRICS_ROUTE_PATH,
+        auth: "gateway",
+        match: "exact",
+        gatewayRuntimeScopeSurface: "trusted-operator",
+        handler: createMetricsRouteHandler(metrics, queueDepth),
+      });
     }
-    api.registerHttpRoute?.({
-      path: METRICS_ROUTE_PATH,
-      auth: "gateway",
-      match: "exact",
-      gatewayRuntimeScopeSurface: "trusted-operator",
-      handler: createMetricsRouteHandler(metrics, () => service.retainQueueDepth()),
-    });
     const flushDeduper = createFlushDeduper();
     // Per session: where the current run started, kept for the whole run (by runId) so a second
     // agent_end for the run (host continuation after a retry, or a re-delivery) re-sends all of it.
@@ -430,6 +463,17 @@ export default definePluginEntry({
     if (sessionStore) {
       registerTool(CONVERSATION_RECALL_TOOL, (ctx) =>
         createConversationRecallTool(service, ctx, sessionStore),
+      );
+    }
+    // Fusion owner (openclaw#201340): with a memory backend configured, memory_search and
+    // memory_get search Hindsight and the backends together. Without one the tool set is 0.11's.
+    const backendIds = slot.role === "owner" ? configuredBackendIds(hostConfig(), PLUGIN_ID) : [];
+    if (backendIds.length > 0) {
+      const [searchName, getName] = FUSED_TOOL_NAMES;
+      registerTool(searchName, fusedToolFactory(PLUGIN_ID, 0));
+      registerTool(getName, fusedToolFactory(PLUGIN_ID, 1));
+      api.logger.info?.(
+        `memory-hindsight: memory backends configured (${backendIds.join(", ")}); memory_search and memory_get fuse them with Hindsight`,
       );
     }
     // Opt-in: registered only when knowledgeReadTools is on at startup, so the default tool set is
@@ -1086,6 +1130,23 @@ export default definePluginEntry({
       start: (ctx?: { stateDir?: string }) => {
         service.start();
         service.startRetainQueue(ctx?.stateDir);
+        try {
+          // Heartbeat: the owner bank of the default agent always has a depth series (0 when idle).
+          metrics.seedQueueDepth(directiveBank(undefined));
+          // Every counter family starts at 0 for the owner agent and bank, so rates have a baseline.
+          metrics.seedCounters("main", directiveBank(undefined));
+        } catch {
+          // Metrics must never break start.
+        }
+        if (metricsSink) {
+          clearInterval(queueDepthTimer);
+          metrics.publishQueueDepth(queueDepth);
+          queueDepthTimer = setInterval(
+            () => metrics.publishQueueDepth(queueDepth),
+            QUEUE_DEPTH_PUBLISH_MS,
+          );
+          queueDepthTimer.unref?.();
+        }
         if (startupConfig.memoryFileSync) {
           const stateDir = ctx?.stateDir;
           if (!stateDir) {
@@ -1138,6 +1199,8 @@ export default definePluginEntry({
       stop: () => {
         clearTimeout(fileSyncFirst);
         clearInterval(fileSyncTimer);
+        clearInterval(queueDepthTimer);
+        queueDepthTimer = undefined;
         fileSyncFirst = undefined;
         fileSyncTimer = undefined;
         service.stop();

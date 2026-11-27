@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.11.0 (2026-11-27)
+
+### Upgrade notes
+
+- `allowMetrics` needs a newer OpenClaw than the plugin floor. The `api.metrics` path works only on
+  OpenClaw builds that contain openclaw/openclaw#198455 (merge commit `bd1c54cf`). As of
+  2026-11-22 no OpenClaw release contains it (not 2026.11.6, not 2026.11.10-beta.1). On a released
+  host leave `allowMetrics` unset: the plugin serves `/plugins/hindsight-native/metrics` exactly
+  as 0.10.0 does, and nothing changes for you.
+- Released hosts reject the key. On 2026.10.10 and 2026.11.6,
+  `plugins.entries.hindsight-native.allowMetrics` fails config validation with
+  `Unrecognized key: "allowMetrics"`, so the Gateway will not take that config. Add the key only
+  after you upgrade OpenClaw to a release that contains #198455.
+- `allowMetrics: true` with the `diagnostics-prometheus` exporter off exports nothing. The host
+  still grants `api.metrics`, so the plugin stops serving its route, and the samples have no
+  exporter to go to. Enable `diagnostics-prometheus` in the same change and scrape
+  `/api/diagnostics/prometheus`, where the series are named `openclaw_plugin_hindsight_native_*`
+  (docs/metrics.md). To go back, set `allowMetrics: false` and restart the Gateway
+  (docs/metrics-runbook.md).
+- Both memory backend roles need an OpenClaw host with memory backends: 2026.11.7 or later
+  (openclaw/openclaw#201340 and #202838). As of 2026-11-22 no npm release has them (2026.11.6
+  does not). On older hosts nothing changes, and their config schema rejects
+  `plugins.entries.<id>.memoryBackend`. Guide: docs/memory-backends.md.
+- In the backend role the host drops hooks, tools and services, so auto-recall, auto-retain, the
+  `hindsight_*` tools and the metrics route are off. Hindsight then learns only what the model
+  saves with the owner's store tool, and is read only when the model searches. For automatic
+  memory, let hindsight-native own the slot instead. Hosts without memory backends never use this
+  role; replace and sidecar behave exactly as in 0.10.0.
+- The plugin does not set the manifest `memoryBackends` flag, because with it every enabled memory
+  plugin, memory-core included, would become a backend on every replace install as soon as the
+  host supports backends. Opt in per backend with `memoryBackend: true`. memory-core running as
+  the dreaming sidecar never becomes a backend (host rule), so turn dreaming off if you want its
+  MEMORY.md hits fused.
+
+### Security
+
+- Bound every Hindsight success body (ClawHub CWE-400): `retain` and bank setup read at most 64 KiB
+  of acknowledgement, and `request()` now requires an explicit body limit, so no response is read
+  unbounded.
+
+### Added
+
+- Metrics through `api.metrics` (openclaw#198455): with
+  `plugins.entries.hindsight-native.allowMetrics: true` on a host that has the API, the eleven
+  metric families go out on the Gateway's Prometheus scrape as
+  `openclaw_plugin_hindsight_native_*` and the `/plugins/hindsight-native/metrics` route is not
+  served. Without the API, or when registration fails, the route works as in 0.10.0. The peer
+  floor stays `>=2026.10.10`.
+- The queue depth gauge (`retain_queue_depth`) always has a series for the owner bank from start (0
+  when empty), on both the `api.metrics` path and the route, so a metrics-down alert can tell an
+  idle plugin from gone metrics.
+- Every counter family starts at 0 for the owner agent and bank (each outcome and reason) on the
+  route, and the plugin sends the same zero increments through `api.metrics` (the host exporter
+  currently ignores an increment of 0, so there a counter appears with its first event).
+- `metrics_series_folded_total{family}`: samples folded into `other` at the label-set bound (120
+  with `api.metrics`, 200 on the route), plus one warning per family on the first fold, so a fold
+  is never silent. Every family stays at or under 126 label sets, below the host cap of 128.
+- Memory backend role (openclaw/openclaw#201340, #202838; needs an OpenClaw host with memory
+  backends, 2026.11.7 or later). When another plugin such as memfusion owns
+  `plugins.slots.memory` and loads hindsight-native with `registrationMode "memory-backend"`, the
+  plugin registers only its provider runtime: search and get as before, plus a new `store()` that
+  retains to the bank the caller's host-minted audience selects (owner-private or the
+  conversation's bank) under the same rules as `hindsight_retain`. Operator, host and status
+  leases stay read only. A stored memory gets a stable `openclaw-store:` document id with replace
+  semantics, so a retried store does not duplicate, and `get()` reads it back by its `doc:`
+  reference. The service never starts in this role: the client opens lazily and store writes live,
+  without the offline retain queue.
+- Fusion-capable slot owner. When hindsight-native owns `plugins.slots.memory` and the host loads
+  other memory plugins as backends (opt in per entry, for example
+  `plugins.entries.memory-core.memoryBackend: true`), the provider runtime fuses Hindsight with
+  every backend: `memory.search` merges by reciprocal rank (duplicates folded, a failed or slow
+  backend gives partial coverage and a warning instead of an error) and `memory.get` follows
+  references both ways. Hindsight references keep their 0.10.0 shape; backend references are wrapped
+  under `hindsight-native`. With a backend configured the plugin also registers `memory_search`
+  and `memory_get` agent tools over the fused results. Hooks, auto-recall, auto-retain, the flush,
+  `/learn` and every `hindsight_*` tool are unchanged.
+
 ## 0.10.0 (2026-11-20)
 
 ### Upgrade notes

@@ -215,3 +215,53 @@ describe("Retry-After on a refused request", () => {
     }
   });
 });
+
+describe("write acknowledgement body bound", () => {
+  const ACK_LIMIT = 64 * 1024;
+
+  it("rejects a retain whose success body streams past the ack limit without buffering it", async () => {
+    let pulled = 0;
+    let cancelled = false;
+    const chunk = new TextEncoder().encode("x".repeat(16 * 1024));
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += chunk.byteLength;
+        if (pulled > 8 * 1024 * 1024) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const client = new HindsightClient({
+      resolveEndpoint: () => ({ apiUrl: "http://hindsight.test" }),
+      fetch: async () => new Response(body, { status: 200 }),
+    });
+    await expect(client.retain("dev", { content: "hello" })).rejects.toThrow(
+      `Hindsight retain failed: response larger than ${ACK_LIMIT} bytes`,
+    );
+    expect(cancelled).toBe(true);
+    expect(pulled).toBeLessThan(1024 * 1024);
+  });
+
+  it("rejects an oversized bank setup acknowledgement", async () => {
+    const client = new HindsightClient({
+      resolveEndpoint: () => ({ apiUrl: "http://hindsight.test" }),
+      fetch: async () => new Response("x".repeat(ACK_LIMIT + 1), { status: 200 }),
+    });
+    await expect(client.applyBankDefaults("dev", { retainMission: "m" })).rejects.toThrow(
+      /bank setup failed: response larger than/,
+    );
+  });
+
+  it("still accepts a normal small retain acknowledgement", async () => {
+    const client = new HindsightClient({
+      resolveEndpoint: () => ({ apiUrl: "http://hindsight.test" }),
+      fetch: async () => new Response('{"success":true,"items_count":1}', { status: 200 }),
+    });
+    await expect(client.retain("dev", { content: "hello" })).resolves.toBeUndefined();
+  });
+});

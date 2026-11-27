@@ -109,8 +109,12 @@ function boot(
     route.handler({ method } as IncomingMessage, res as unknown as ServerResponse);
     return res;
   };
+  // Counted samples only: the zero series every counter family gets at start are covered in
+  // metrics-hardening.test.ts.
   const samples = () =>
-    (scrape().body ?? "").split("\n").filter((line) => line && !line.startsWith("#"));
+    (scrape().body ?? "")
+      .split("\n")
+      .filter((line) => line && !line.startsWith("#") && !/_total\{[^}]*\} 0$/.test(line));
   return { hook, route, scrape, samples, registerService };
 }
 
@@ -138,6 +142,13 @@ describe("metrics route registration", () => {
     expect(scrape().statusCode).toBe(403);
     scopeState.scopes = ["operator.write"];
     expect(scrape().statusCode).toBe(200);
+  });
+});
+
+describe("queue depth heartbeat", () => {
+  it("serves a zero depth sample for the owner bank on a fresh idle plugin", () => {
+    const { scrape } = boot(createFakeHindsight().fetch);
+    expect(scrape().body).toContain('openclaw_hindsight_retain_queue_depth{bank="main"} 0');
   });
 });
 
@@ -208,7 +219,7 @@ describe("auto-recall metrics", () => {
       hookInvocation: { assertActive: stale },
     });
     expect(fake.requests).toHaveLength(1);
-    expect(samples()).toEqual([]);
+    expect(samples()).toEqual(['openclaw_hindsight_retain_queue_depth{bank="main"} 0']);
   });
 
   it("records no recall outcome or latency for a skipped recall, only the skip", async () => {
@@ -217,6 +228,7 @@ describe("auto-recall metrics", () => {
     await hook("before_prompt_build")(PROMPT, { agentId: "dev", sessionKey: "agent:dev:main" });
     expect(samples()).toEqual([
       'openclaw_hindsight_recall_skipped_total{agent="dev",reason="no_audience"} 1',
+      'openclaw_hindsight_retain_queue_depth{bank="main"} 0',
     ]);
   });
 });

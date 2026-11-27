@@ -148,6 +148,8 @@ export function isExplicitPageMissingBody(text: string): boolean {
 export const KB_MAX_RESPONSE_BYTES = 1024 * 1024;
 /** Largest recall, reflect or memory-lookup body read; far above what max_tokens 1024 returns. */
 export const MEMORY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+/** Largest write acknowledgement body read (retain, bank setup); real acks are a few dozen bytes. */
+export const ACK_MAX_RESPONSE_BYTES = 64 * 1024;
 // Error bodies are only classified, never copied, so a small prefix is enough.
 const ERROR_BODY_MAX_BYTES = 64 * 1024;
 
@@ -370,7 +372,7 @@ export class HindsightClient {
   private async request<T>(
     operation: string,
     url: string,
-    init: { method: string; body?: unknown; signal?: AbortSignal; maxBodyBytes?: number },
+    init: { method: string; body?: unknown; signal?: AbortSignal; maxBodyBytes: number },
   ): Promise<T> {
     const hasBody = init.body !== undefined;
     const response = await this.fetchImpl(url, {
@@ -419,20 +421,16 @@ export class HindsightClient {
       throw error;
     }
     let text: string;
-    if (init.maxBodyBytes === undefined) {
-      text = await response.text();
-    } else {
-      try {
-        text = await readBoundedText(response, init.maxBodyBytes);
-      } catch (error) {
-        if (error instanceof BodyTooLargeError) {
-          throw new Error(
-            `Hindsight ${operation} failed: response larger than ${init.maxBodyBytes} bytes`,
-            { cause: error },
-          );
-        }
-        throw error;
+    try {
+      text = await readBoundedText(response, init.maxBodyBytes);
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        throw new Error(
+          `Hindsight ${operation} failed: response larger than ${init.maxBodyBytes} bytes`,
+          { cause: error },
+        );
       }
+      throw error;
     }
     // SAFETY: T only names optional fields; every caller type-checks each field before use.
     return (text ? JSON.parse(text) : {}) as T;
@@ -447,6 +445,7 @@ export class HindsightClient {
       method: "POST",
       body: { items: [item], async: options.async ?? true },
       signal: options.signal,
+      maxBodyBytes: ACK_MAX_RESPONSE_BYTES,
     });
   }
 
@@ -901,7 +900,12 @@ export class HindsightClient {
     if (Object.keys(body).length === 0) {
       return;
     }
-    await this.request("bank setup", this.bankUrl(bankId), { method: "PUT", body, signal });
+    await this.request("bank setup", this.bankUrl(bankId), {
+      method: "PUT",
+      body,
+      signal,
+      maxBodyBytes: ACK_MAX_RESPONSE_BYTES,
+    });
   }
 
   /** Hindsight's `api_version` from GET /version, or undefined when it does not say. */
